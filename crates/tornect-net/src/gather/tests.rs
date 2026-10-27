@@ -343,6 +343,7 @@ impl Asker {
             hosts,
             deadline: (Instant::now() + budget).into_std(),
             draw: 0,
+            tunnel: None,
         };
         within(ask_stun(&self.socket, &mut self.tees.stun, env, &ask)).await
     }
@@ -355,6 +356,26 @@ impl Asker {
             hosts: &self.hosts,
             deadline: (Instant::now() + GATHER_BUDGET).into_std(),
             draw,
+            tunnel: None,
+        };
+        within(ask_stun(&self.socket, &mut self.tees.stun, env, &ask)).await
+    }
+
+    /// The client over `servers` in VPN mode, `tunnel` being the tunnel's
+    /// IPv4 route source.
+    async fn ask_tunnelled(
+        &mut self,
+        env: &dyn NetEnv,
+        servers: &[String],
+        tunnel: Ipv4Addr,
+    ) -> StunReport {
+        let ask = StunAsk {
+            servers,
+            filter: &self.filter,
+            hosts: &self.hosts,
+            deadline: (Instant::now() + GATHER_BUDGET).into_std(),
+            draw: 0,
+            tunnel: Some(tunnel),
         };
         within(ask_stun(&self.socket, &mut self.tees.stun, env, &ask)).await
     }
@@ -783,6 +804,97 @@ async fn a_cgnat_base_gets_its_srflx() {
     assert_eq!(s1.heard()[0].from.ip(), ip("100.64.0.2"));
 }
 
+/// A machine on a split tunnel: its IPv4 default route is the tunnel
+/// ([`TUNNEL`]), but `excluded` is routed over the physical interface
+/// ([`PHYSICAL`]), as a VPN's excluded prefixes are. Every other call is
+/// the wrapped machine's.
+struct SplitTunnel<E> {
+    inner: E,
+    excluded: IpAddr,
+}
+
+const TUNNEL: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+const PHYSICAL: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 20);
+
+impl<E: NetEnv> NetEnv for SplitTunnel<E> {
+    fn interfaces(&self) -> BoxFuture<'static, Result<Vec<IfaceAddr>, NetError>> {
+        self.inner.interfaces()
+    }
+
+    fn route_sources(&self) -> RouteSources {
+        self.inner.route_sources()
+    }
+
+    fn route_source_to(&self, to: SocketAddr) -> Option<IpAddr> {
+        let source = if to.ip() == self.excluded {
+            PHYSICAL
+        } else {
+            TUNNEL
+        };
+        Some(IpAddr::V4(source))
+    }
+
+    fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp> {
+        self.inner.bind(port)
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        self.inner.resolve(host, port)
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        self.inner.mapper()
+    }
+
+    fn admit_loopback(&self) -> bool {
+        self.inner.admit_loopback()
+    }
+}
+
+/// Design §7.2 ("STUN only if the v4 route source is on the tunnel") and
+/// §9.3 (a VPN user's physical identity), per server (the review of steps
+/// B2 and B3): in VPN mode a server whose own route leaves outside the
+/// tunnel (a split tunnel's excluded prefix) is never sent a request and
+/// counts as unresolved, and the next server, routed through the tunnel,
+/// is asked at once. Outside VPN mode no route is looked up and the first
+/// server is asked.
+#[tokio::test(start_paused = true)]
+async fn in_vpn_mode_a_server_routed_outside_the_tunnel_is_never_asked() {
+    let world = World::new();
+    let outside = world.server("64.0.0.10/24", Answer::Fixed(at(NAT)));
+    let inside = world.server("64.0.0.20/24", Answer::Fixed(at(NAT)));
+    let env = CountingEnv::new(SplitTunnel {
+        inner: world
+            .net
+            .machine(MachineSpec::on(world.home, "192.168.1.20/24")),
+        excluded: outside.addr.ip(),
+    });
+    let mut asker = Asker::new(&*env).await;
+    let servers = [outside.entry(), inside.entry()];
+
+    let t0 = Instant::now();
+    let report = asker.ask_tunnelled(&*env, &servers, TUNNEL).await;
+    assert_eq!(report.outcome, srflx(NAT));
+    assert!(outside.heard().is_empty(), "nothing outside the tunnel");
+    assert_eq!(inside.heard().len(), 1);
+    assert_eq!(
+        world.requests(ip("192.168.1.20"), t0),
+        vec![(Duration::ZERO, inside.addr)]
+    );
+    assert_eq!((report.stats.servers, report.stats.unresolved), (1, 1));
+    assert_eq!(env.calls().route_source_to, 2);
+
+    let report = asker.ask(&*env, &servers).await;
+    assert_eq!(report.outcome, srflx(NAT));
+    assert_eq!(outside.heard().len(), 1, "not in VPN mode: asked first");
+    assert_eq!(env.calls().route_source_to, 2, "no route looked up");
+
+    let report = asker.ask_tunnelled(&*env, &servers[..1], TUNNEL).await;
+    assert_eq!(report.outcome, StunOutcome::Nothing);
+    assert_eq!((report.stats.requests, report.stats.unresolved), (0, 1));
+    assert_eq!(outside.heard().len(), 1);
+}
+
 /// Design §5.3, §7.3: a name is resolved through the environment (which
 /// answers from the cache on the real machine); only its first IPv4
 /// address the filter admits is asked, so DNS cannot aim a request at the
@@ -889,6 +1001,7 @@ async fn no_debug_prints_an_address() {
         hosts: &asker.hosts,
         deadline: Instant::now().into_std(),
         draw: 1,
+        tunnel: Some(Ipv4Addr::new(10, 8, 0, 2)),
     };
     let dns = StunDns::new();
     dns.put("stun.example.org", 3478, vec![s1.addr]);
@@ -897,7 +1010,7 @@ async fn no_debug_prints_an_address() {
         format!("{ask:?}"),
         format!("{dns:?}"),
     ] {
-        for needle in ["81.2", "40000", "64.0", "192.168", "stun.example"] {
+        for needle in ["81.2", "40000", "64.0", "192.168", "10.8", "stun.example"] {
             assert!(!text.contains(needle), "{needle} in {text}");
         }
     }

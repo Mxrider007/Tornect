@@ -39,6 +39,21 @@ pub trait NetEnv: Send + Sync {
     /// The source address of each family's default route; no packet.
     fn route_sources(&self) -> RouteSources;
 
+    /// The source address the OS picks toward `to` (no packet), or `None`
+    /// without a route. It differs from the family's
+    /// [`route_sources`](NetEnv::route_sources) where a more specific route
+    /// serves `to`: a split tunnel that excludes the prefix of a STUN
+    /// server, which the STUN client checks in VPN mode (design §7.2,
+    /// §9.3). The default is the family's route source, for environments
+    /// without such routes.
+    fn route_source_to(&self, to: SocketAddr) -> Option<IpAddr> {
+        let sources = self.route_sources();
+        match to {
+            SocketAddr::V4(_) => sources.v4.map(IpAddr::V4),
+            SocketAddr::V6(_) => sources.v6.map(IpAddr::V6),
+        }
+    }
+
     /// Binds the session's one UDP socket (design §6.3): `port` when it is
     /// free (`network.direct_port`), any port otherwise. Called on the
     /// tokio runtime the link runs on.
@@ -219,6 +234,11 @@ impl NetEnv for RealNet {
         local::route_sources()
     }
 
+    /// [`local::route_source_to`]: the kernel's own route lookup.
+    fn route_source_to(&self, to: SocketAddr) -> Option<IpAddr> {
+        local::route_source_to(to)
+    }
+
     /// [`bind_media_socket`] (dual-stack where the OS has IPv6) under
     /// [`QuietUdp`](crate::QuietUdp).
     fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp> {
@@ -298,6 +318,24 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(env.route_sources(), local::route_sources());
+    }
+
+    /// The real machine asks the kernel for the source toward each address:
+    /// the IPv4 route source toward the probe address of `route_sources`,
+    /// and loopback toward a loopback address (a route more specific than
+    /// the default one), with no packet sent.
+    #[test]
+    fn the_real_machine_reads_the_route_toward_an_address() {
+        let env = RealNet::new();
+        let probe: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        assert_eq!(
+            env.route_source_to(probe),
+            env.route_sources().v4.map(IpAddr::V4)
+        );
+        assert_eq!(
+            env.route_source_to("127.0.0.1:9".parse().unwrap()),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
     }
 
     /// The seam binds the session socket as `bind_media_socket` does, behind

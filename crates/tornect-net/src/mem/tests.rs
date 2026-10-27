@@ -435,6 +435,11 @@ async fn counting_env_counts_every_call() {
     assert_eq!(env.interfaces().await.expect("a read").len(), 1);
     let _ = env.route_sources();
     let _ = env.route_sources();
+    assert_eq!(
+        env.route_source_to("64.0.0.1:3478".parse().unwrap()),
+        Some("192.168.1.10".parse().unwrap()),
+        "a machine without routes of its own: the family's route source"
+    );
     let bound = env.bind(Some(50_000)).expect("a socket");
     assert_eq!(
         bound.inner.local_addr().expect("its address").port(),
@@ -463,13 +468,14 @@ async fn counting_env_counts_every_call() {
         EnvCalls {
             interfaces: 1,
             route_sources: 2,
+            route_source_to: 1,
             binds: 1,
             resolves: 1,
             mappers: 1,
             admit_loopback: 1,
         }
     );
-    assert_eq!(env.calls().total(), 7);
+    assert_eq!(env.calls().total(), 8);
     assert_eq!(env.inner().counters().binds, 1);
     let loopback = CountingEnv::new(LoopbackNet::new(2));
     assert!(loopback.admit_loopback());

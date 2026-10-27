@@ -21,7 +21,10 @@
 //! - **Where to** (§5.3): an address [`StunFilter`] admits: global IPv4,
 //!   none of this computer's, any port but 0. A DNS answer can therefore
 //!   never aim a request at the LAN, and an IP literal in the list is
-//!   checked the same way.
+//!   checked the same way. In VPN mode ([`StunAsk::tunnel`]), only a server
+//!   whose own route leaves from the tunnel's address: a split tunnel that
+//!   excludes a server's prefix would send the request, and show this
+//!   computer's physical public address, outside the tunnel (§7.2, §9.3).
 //! - **What is sent**: the 20-byte Binding request
 //!   ([`stun::binding_request`]) from the session socket, with a fresh
 //!   random transaction ID per server, which its retransmission reuses.
@@ -290,7 +293,8 @@ fn random_u64() -> u64 {
 ///
 /// The rest of the rule (internet scope, `enable_stun`, a non-empty part of
 /// the list, no global router mapping by the head start) is the gathering
-/// plan's (step B6).
+/// plan's (step B6), which in VPN mode also passes this address as
+/// [`StunAsk::tunnel`], so that each server's own route is checked too.
 #[must_use]
 pub fn stun_base(
     addrs: &[IfaceAddr],
@@ -365,6 +369,15 @@ pub struct StunAsk<'a> {
     /// The gathering passes [`draw()`], a random one; tests pass 0 (the
     /// first entry).
     pub draw: u64,
+    /// In VPN mode, the tunnel's IPv4 route source ([`stun_base`]'s
+    /// answer); `None` otherwise. A server is then asked only when the
+    /// route toward it ([`NetEnv::route_source_to`]) leaves from this
+    /// address too: a split tunnel whose default route is the tunnel may
+    /// still exclude the server's prefix, and a request over the physical
+    /// interface would show the server, and the peer through the srflx it
+    /// returns, this computer's physical public address (design §7.2,
+    /// §9.3). Such a server counts as unresolved.
+    pub tunnel: Option<Ipv4Addr>,
 }
 
 impl fmt::Debug for StunAsk<'_> {
@@ -373,6 +386,7 @@ impl fmt::Debug for StunAsk<'_> {
             .field("servers", &self.servers.len())
             .field("filter", self.filter)
             .field("hosts", &self.hosts.len())
+            .field("tunnel", &self.tunnel.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -445,14 +459,22 @@ struct Client<'a> {
 }
 
 impl Client<'_> {
-    /// Takes the first address of `addrs` the filter admits as the next
-    /// server, asked from `now`; without one, the next entry is tried at
-    /// once.
-    fn take(&mut self, addrs: &[SocketAddr], now: Instant, next: &mut Option<Instant>) {
-        let found = addrs
-            .iter()
-            .map(|a| canon(*a))
-            .find(|a| self.ask.filter.admit(*a) && !self.asked.iter().any(|s| s.addr == *a));
+    /// Takes the first address of `addrs` the filter admits (and, in VPN
+    /// mode, that `env` routes through the tunnel) as the next server,
+    /// asked from `now`; without one, the next entry is tried at once.
+    fn take(
+        &mut self,
+        env: &dyn NetEnv,
+        addrs: &[SocketAddr],
+        now: Instant,
+        next: &mut Option<Instant>,
+    ) {
+        let tunnel = self.ask.tunnel;
+        let found = addrs.iter().map(|a| canon(*a)).find(|a| {
+            self.ask.filter.admit(*a)
+                && !self.asked.iter().any(|s| s.addr == *a)
+                && tunnel.is_none_or(|t| env.route_source_to(*a) == Some(IpAddr::V4(t)))
+        });
         let Some(addr) = found else {
             self.stats.unresolved = self.stats.unresolved.saturating_add(1);
             *next = Some(now);
@@ -626,7 +648,7 @@ pub async fn ask_stun(
                 continue;
             };
             if let Ok(ip) = host.parse::<IpAddr>() {
-                client.take(&[SocketAddr::new(ip, port)], now, &mut next_server);
+                client.take(env, &[SocketAddr::new(ip, port)], now, &mut next_server);
             } else {
                 client.stats.resolves = client.stats.resolves.saturating_add(1);
                 let wait = (now + DNS_TIMEOUT).min(deadline);
@@ -656,7 +678,7 @@ pub async fn ask_stun(
             Woke::Reply(teed) => client.on_reply(&teed),
             Woke::Resolved(addrs) => {
                 lookup = None;
-                client.take(&addrs, Instant::now(), &mut next_server);
+                client.take(env, &addrs, Instant::now(), &mut next_server);
             }
             Woke::Timer => {}
         }

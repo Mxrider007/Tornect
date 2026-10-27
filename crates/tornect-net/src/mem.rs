@@ -956,6 +956,8 @@ pub struct EnvCalls {
     pub interfaces: usize,
     /// [`NetEnv::route_sources`].
     pub route_sources: usize,
+    /// [`NetEnv::route_source_to`].
+    pub route_source_to: usize,
     /// [`NetEnv::bind`].
     pub binds: usize,
     /// [`NetEnv::resolve`].
@@ -972,6 +974,7 @@ impl EnvCalls {
     pub fn total(&self) -> usize {
         self.interfaces
             + self.route_sources
+            + self.route_source_to
             + self.binds
             + self.resolves
             + self.mappers
@@ -987,6 +990,7 @@ pub struct CountingEnv<E> {
     inner: E,
     interfaces: AtomicUsize,
     route_sources: AtomicUsize,
+    route_source_to: AtomicUsize,
     binds: AtomicUsize,
     resolves: AtomicUsize,
     mappers: AtomicUsize,
@@ -1001,6 +1005,7 @@ impl<E: NetEnv> CountingEnv<E> {
             inner,
             interfaces: AtomicUsize::new(0),
             route_sources: AtomicUsize::new(0),
+            route_source_to: AtomicUsize::new(0),
             binds: AtomicUsize::new(0),
             resolves: AtomicUsize::new(0),
             mappers: AtomicUsize::new(0),
@@ -1014,6 +1019,7 @@ impl<E: NetEnv> CountingEnv<E> {
         EnvCalls {
             interfaces: self.interfaces.load(Ordering::SeqCst),
             route_sources: self.route_sources.load(Ordering::SeqCst),
+            route_source_to: self.route_source_to.load(Ordering::SeqCst),
             binds: self.binds.load(Ordering::SeqCst),
             resolves: self.resolves.load(Ordering::SeqCst),
             mappers: self.mappers.load(Ordering::SeqCst),
@@ -1037,6 +1043,11 @@ impl<E: NetEnv> NetEnv for CountingEnv<E> {
     fn route_sources(&self) -> RouteSources {
         self.route_sources.fetch_add(1, Ordering::SeqCst);
         self.inner.route_sources()
+    }
+
+    fn route_source_to(&self, to: SocketAddr) -> Option<IpAddr> {
+        self.route_source_to.fetch_add(1, Ordering::SeqCst);
+        self.inner.route_source_to(to)
     }
 
     fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp> {

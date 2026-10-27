@@ -266,31 +266,36 @@ impl fmt::Debug for RouteSources {
 }
 
 /// The route sources, from a UDP `connect()` to `192.0.2.1:9` and
-/// `[2001:db8::1]:9` and the socket's `local_addr()`. A UDP connect sends
-/// nothing; the socket is never bound explicitly (the connect binds it to
-/// the route's source), so no wildcard listener exists even for a moment.
+/// `[2001:db8::1]:9` and the socket's `local_addr()` ([`route_source_to`]).
 #[must_use]
 pub fn route_sources() -> RouteSources {
-    let probe = |to: SocketAddr| -> Option<IpAddr> {
-        let domain = socket2::Domain::for_address(to);
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-                .ok()?;
-        socket.connect(&to.into()).ok()?;
-        let local = socket.local_addr().ok()?.as_socket()?;
-        let ip = canon_ip(local.ip());
-        (!ip.is_unspecified()).then_some(ip)
-    };
     RouteSources {
-        v4: match probe(V4_ROUTE_PROBE) {
+        v4: match route_source_to(V4_ROUTE_PROBE) {
             Some(IpAddr::V4(ip)) => Some(ip),
             _ => None,
         },
-        v6: match probe(V6_ROUTE_PROBE) {
+        v6: match route_source_to(V6_ROUTE_PROBE) {
             Some(IpAddr::V6(ip)) => Some(ip),
             _ => None,
         },
     }
+}
+
+/// The source address the OS picks toward `to`, from a UDP `connect()` and
+/// the socket's `local_addr()`; `None` without a route. A UDP connect
+/// sends nothing; the socket is never bound explicitly (the connect binds
+/// it to the route's source), so no wildcard listener exists even for a
+/// moment. It differs from the family's [`route_sources`] where a more
+/// specific route serves `to`, as a split tunnel's excluded prefix does.
+#[must_use]
+pub fn route_source_to(to: SocketAddr) -> Option<IpAddr> {
+    let domain = socket2::Domain::for_address(to);
+    let socket =
+        socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
+    socket.connect(&to.into()).ok()?;
+    let local = socket.local_addr().ok()?.as_socket()?;
+    let ip = canon_ip(local.ip());
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// The addresses of `iface`, each with `kind`. IPv6 addresses whose flags
