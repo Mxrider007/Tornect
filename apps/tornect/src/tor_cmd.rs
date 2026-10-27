@@ -4619,6 +4619,74 @@ mod tests {
         assert_eq!(log.outcomes(1).await[0], MediaOutcome::Abandoned);
     }
 
+    /// DIRECT-2's pre-open through the caller: a host with no address
+    /// answers the viewer's candidates with `TOR_FALLBACK{NO_ADDRESSES}`,
+    /// and the onion stream opened beside the path phase is the one bound:
+    /// one open in all, `ROUTE tor host-no-addresses`, the host's route
+    /// `tor`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_try_that_ends_on_tor_binds_the_stream_opened_beside_it() {
+        let (viewer_net, _) = lan_pair(13);
+        let media = test_card();
+        let host_net = crate::direct::no_network();
+        let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let session = &mut rig.session;
+        let sid = session.session_token().session_id();
+        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        assert!(matches!(bound.media, MediaPath::Onion(_)));
+        assert_eq!(
+            crate::direct::route_line(&bound.end),
+            "ROUTE tor host-no-addresses"
+        );
+        assert_eq!(bound.winner, None);
+        assert_eq!(media.route(&sid), Some(TransportKind::TorRelay));
+        assert_eq!(
+            log.opens.load(Ordering::SeqCst),
+            1,
+            "the one opened beside the try"
+        );
+    }
+
+    /// The early onion stream (DIRECT-2's pre-open): used while it is
+    /// younger than [`ONION_PREOPEN_MAX`] (still opening counts), replaced
+    /// by one fresh open when it is older or its open failed; with nothing
+    /// opened beside the path phase the fresh open is the only one.
+    #[tokio::test(start_paused = true)]
+    async fn the_early_onion_stream_is_used_young_and_replaced_stale_or_failed() {
+        type Open = std::future::Ready<anyhow::Result<u8>>;
+        let early = |ok: bool| -> Preopen<Open> {
+            let opened = if ok {
+                Ok(1)
+            } else {
+                Err(anyhow::anyhow!("refused"))
+            };
+            Preopen::Opening(Box::pin(std::future::ready(opened)))
+        };
+        let fresh = || -> Open { std::future::ready(Ok(2)) };
+        for (mut preopen, took, bound) in [
+            (early(true), Duration::from_secs(3), 1),
+            (early(true), ONION_PREOPEN_MAX + Duration::from_secs(1), 2),
+            (early(false), Duration::from_secs(1), 2),
+            (Preopen::None, Duration::from_secs(1), 2),
+        ] {
+            preopen.beside(tokio::time::sleep(took)).await;
+            assert!(!matches!(preopen, Preopen::Opening(_)), "{took:?}");
+            assert_eq!(preopen.take(fresh).await.unwrap(), bound, "{took:?}");
+        }
+        // A path phase that ended before the open is still waited for.
+        let mut opening = early(true);
+        opening.beside(std::future::ready(())).await;
+        assert!(matches!(opening, Preopen::Opening(_)));
+        let unused = || -> Open { unreachable!("the early stream is used") };
+        assert_eq!(opening.take(unused).await.unwrap(), 1);
+    }
+
     /// Decision M1-85 at DIRECT-2's exception: a `lan_only` viewer whose
     /// direct connection the host's TLS refused does not fall back; the
     /// session ends `BYE{NO_LAN_PATH}` and no onion stream is ever opened.
