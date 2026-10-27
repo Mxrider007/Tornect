@@ -1,17 +1,22 @@
 //! The direct path in the app (design `direct` §8.6): the knobs both roles
 //! read ([`DirectKnobs`]), the bridge rule after each Tor bootstrap
 //! (decision M1-86), the parts the host's and the viewer's halves are made
-//! of ([`DirectWiring`]), and the lines `doctor` and the CLI print about the
-//! path. No line here ever names an address, a port or a key (decision
-//! M1-83).
+//! of ([`DirectWiring`]), the machine they run on and its router mappings'
+//! lifecycle ([`real_net`], [`router_lifecycle`]), and the lines `doctor`
+//! and the CLI print about the path. No line here ever names an address, a
+//! port or a key (decision M1-83).
 
 use std::fmt::Write as _;
+use std::future::Future;
 use std::sync::Arc;
 
 use tornect_core::config::{self, BridgeMode, Network};
-use tornect_core::session_log::TransportKind;
-use tornect_core::{Config, DeviceIdentity};
-use tornect_net::{AddrClass, CandidateKind, IfaceAddr, IfaceKind, NetEnv, RealNet, RouteSources};
+use tornect_core::session_log::{SessionEvent, SessionLog, SessionRecord, TransportKind};
+use tornect_core::{Config, DeviceIdentity, Paths};
+use tornect_net::{
+    AddrClass, CandidateKind, IfaceAddr, IfaceKind, MapEvent, MapEvents, NetEnv, RealNet,
+    RouteSources, SHUTDOWN_RELEASE_WAIT,
+};
 use tornect_session::{DirectSettings, INTERNET_DIRECT, Mine, PathEnd, ViewerDirect};
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::tor::Rung;
@@ -84,32 +89,103 @@ pub struct DirectWiring {
     pub net: Arc<dyn NetEnv>,
 }
 
-/// This machine's network for direct links. On Windows it reads each
-/// interface's IPv4 gateway with `tornect-platform`'s `GetBestRoute2`
-/// lookup, which sends nothing: netdev's own Windows gateway read may send
-/// ARP and is never compiled (design `direct` §7.1, §8.6). Linux and macOS
-/// read it through netdev.
+/// This machine's network for direct links, built once per process (design
+/// `direct` §8.6, "RealNet lifecycle") and shared by every session of it.
+/// On Windows it reads each interface's IPv4 gateway with
+/// `tornect-platform`'s `GetBestRoute2` lookup, which sends nothing:
+/// netdev's own Windows gateway read may send ARP and is never compiled
+/// (design §7.1). Linux and macOS read it through netdev. Its router
+/// mappings (design §7.4) keep their ledger in `paths`'
+/// `router_ports_dir` and are told to `sessions.log` ([`RouterPortLog`]).
 #[must_use]
-pub fn real_net() -> RealNet {
+pub fn real_net(paths: &Paths) -> Arc<RealNet> {
     #[cfg(windows)]
-    {
-        RealNet::new().with_gateway_lookup(tornect_platform::route::default_gateway_v4)
-    }
+    let net = RealNet::new().with_gateway_lookup(tornect_platform::route::default_gateway_v4);
     #[cfg(not(windows))]
-    {
-        RealNet::new()
+    let net = RealNet::new();
+    Arc::new(net.with_router(
+        paths.router_ports_dir(),
+        Arc::new(RouterPortLog::new(paths)),
+    ))
+}
+
+/// Where this process's router mappings are told (design `direct` §8.1):
+/// one `router_port` line in `sessions.log` for each mapping opened,
+/// released, failed to release, or left by an earlier run and removed. The
+/// line holds the change and the protocol, fixed words only, never an
+/// address or a port.
+pub struct RouterPortLog {
+    log: SessionLog,
+}
+
+impl RouterPortLog {
+    /// The lines go to `paths`' `sessions.log`.
+    #[must_use]
+    pub fn new(paths: &Paths) -> Self {
+        Self {
+            log: SessionLog::new(paths.sessions_log()),
+        }
     }
 }
 
-impl DirectWiring {
-    /// The parts for `device` on this machine, with `knobs`.
-    #[must_use]
-    pub fn real(device: Arc<DeviceIdentity>, knobs: DirectKnobs) -> Self {
-        Self {
-            device,
-            knobs,
-            net: Arc::new(real_net()),
+impl MapEvents for RouterPortLog {
+    fn on_event(&self, ev: MapEvent) {
+        // One short line and its fsync, a few times a session at most:
+        // written in place, as the signalling FSM's own sink writes its
+        // lines from its tasks.
+        let record = SessionRecord::now(SessionEvent::RouterPort).detail(ev.router_port().detail());
+        if let Err(e) = self.log.append(&record) {
+            tracing::warn!(error = %e, "could not append a router_port line to sessions.log");
         }
+    }
+}
+
+impl std::fmt::Debug for RouterPortLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterPortLog").finish_non_exhaustive()
+    }
+}
+
+/// The start of the router mappings' lifecycle (design `direct` §7.4,
+/// §8.6), on the current tokio runtime: the removal of the mappings an
+/// earlier run left begins in the background, bounded by
+/// [`tornect_net::SWEEP_CAP`], whatever the direct-path policy (it only
+/// removes exposure), and never delays the start. Its handle is not kept:
+/// a process that exits first leaves the rest to its next start.
+pub fn sweep_router_leftovers(net: &RealNet) {
+    drop(net.sweep_leftovers());
+}
+
+/// The end of it: waits, at most [`SHUTDOWN_RELEASE_WAIT`], for the
+/// releases of the mappings this process's links held; whether none still
+/// runs. A release unfinished by then lapses with the router's lease, and
+/// its ledger entry is the next start's to sweep.
+pub async fn wait_router_releases(net: &RealNet) -> bool {
+    // A link closed just before this drops its mapping when its aborted
+    // gathering task is next polled, and only then is the release counted:
+    // one yield lets the runtime get there first.
+    tokio::task::yield_now().await;
+    net.releases().wait(SHUTDOWN_RELEASE_WAIT).await
+}
+
+/// `run` inside the router mappings' lifecycle: the sweep starts before it
+/// ([`sweep_router_leftovers`]) and the releases get their wait after it
+/// ([`wait_router_releases`]). The `host` and `connect` commands run in it.
+pub async fn router_lifecycle<T>(net: &RealNet, run: impl Future<Output = T>) -> T {
+    sweep_router_leftovers(net);
+    let out = run.await;
+    if !wait_router_releases(net).await {
+        tracing::debug!("a router mapping's release was still running at exit");
+    }
+    out
+}
+
+impl DirectWiring {
+    /// The parts for `device` on this process's machine ([`real_net`]),
+    /// with `knobs`.
+    #[must_use]
+    pub fn real(device: Arc<DeviceIdentity>, knobs: DirectKnobs, net: Arc<RealNet>) -> Self {
+        Self { device, knobs, net }
     }
 
     /// The device key's public half.
@@ -641,5 +717,76 @@ mod tests {
                 .any(|c| c.is_ascii_digit() && !"46".contains(c)),
             "only IPv4 and IPv6 may carry a digit: {lines:?}"
         );
+    }
+
+    /// Design `direct` §8.1: each router mapping event is one
+    /// `router_port` line holding the change and the protocol, fixed words
+    /// only, with no session, peer, address or port.
+    #[test]
+    fn router_mapping_events_are_router_port_lines_of_fixed_words() {
+        use tornect_net::MapVia;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let sink = RouterPortLog::new(&paths);
+        sink.on_event(MapEvent::Opened(MapVia::Pcp));
+        sink.on_event(MapEvent::Closed(MapVia::Pcp));
+        sink.on_event(MapEvent::CloseFailed(MapVia::NatPmp));
+        sink.on_event(MapEvent::LeftoverRemoved(MapVia::Upnp));
+        let records = SessionLog::new(paths.sessions_log()).read_all().unwrap();
+        let details: Vec<_> = records
+            .iter()
+            .map(|r| {
+                assert_eq!(r.event, SessionEvent::RouterPort);
+                assert!(r.session_id.is_none() && r.peer_device.is_none() && r.peer_name.is_none());
+                assert!(r.transport.is_none());
+                r.detail.clone().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            details,
+            [
+                "opened pcp",
+                "closed pcp",
+                "close-failed nat-pmp",
+                "leftover-removed upnp"
+            ]
+        );
+        assert!(!format!("{sink:?}").contains(&*tmp.path().to_string_lossy()));
+    }
+
+    /// Design `direct` §8.6: the process's machine has the router ledger
+    /// (only a machine with one starts a sweep), and the lifecycle a command
+    /// runs in returns what the command returned only once the releases
+    /// running at its end are done.
+    #[tokio::test]
+    async fn the_router_lifecycle_sweeps_at_start_and_waits_for_releases_at_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let net = real_net(&paths);
+        let sweep = net.sweep_leftovers().expect("a router ledger");
+        assert_eq!(sweep.await.unwrap(), tornect_net::SweepReport::default());
+        assert!(
+            RealNet::new().sweep_leftovers().is_none(),
+            "no ledger, no sweep"
+        );
+
+        let releases = net.releases();
+        let started = std::time::Instant::now();
+        let out = router_lifecycle(&net, async {
+            releases.spawn(
+                &tokio::runtime::Handle::current(),
+                Box::pin(tokio::time::sleep(Duration::from_millis(150))),
+            );
+            7
+        })
+        .await;
+        assert_eq!(out, 7);
+        assert_eq!(releases.running(), 0, "the release ended before the exit");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        // Nothing to release: the wait returns at once.
+        let started = std::time::Instant::now();
+        assert!(wait_router_releases(&net).await);
+        assert!(started.elapsed() < SHUTDOWN_RELEASE_WAIT);
     }
 }

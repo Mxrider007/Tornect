@@ -137,14 +137,14 @@ pub fn host(
     if let Some(mode) = bridges {
         cfg.tor.bridges = mode;
     }
-    let direct = DirectWiring::real(Arc::new(device), DirectKnobs::new(&cfg));
-    block_on(run_host(
-        paths,
-        &cfg,
-        Arc::new(identity),
-        direct,
-        once,
-        source,
+    // One machine for every session of this host; the router mappings an
+    // earlier run left are swept at start and this run's get their release
+    // wait at exit (design `direct` §8.6).
+    let net = crate::direct::real_net(paths);
+    let direct = DirectWiring::real(Arc::new(device), DirectKnobs::new(&cfg), Arc::clone(&net));
+    block_on(crate::direct::router_lifecycle(
+        &net,
+        run_host(paths, &cfg, Arc::new(identity), direct, once, source),
     ))
 }
 
@@ -1021,8 +1021,12 @@ pub fn connect(
         Some(ua) => Some(prepare_unattended(paths, id, &device, &pins, ua)?),
         None => None,
     };
-    let direct = DirectWiring::real(device, DirectKnobs::new(&cfg));
-    block_on(run_connect(paths, &cfg, id, &direct, &pins, opts, prepared))
+    let net = crate::direct::real_net(paths);
+    let direct = DirectWiring::real(device, DirectKnobs::new(&cfg), Arc::clone(&net));
+    block_on(crate::direct::router_lifecycle(
+        &net,
+        run_connect(paths, &cfg, id, &direct, &pins, opts, prepared),
+    ))
 }
 
 async fn run_connect(
