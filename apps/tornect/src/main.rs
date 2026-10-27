@@ -27,6 +27,7 @@ compile_error!(
 mod admin_helper;
 mod demo_cmd;
 mod diagnostics;
+mod direct;
 mod helper_cmd;
 mod history;
 mod host;
@@ -1262,6 +1263,12 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         },
         tor.bridge_lines.len()
     );
+    // The direct path (design `direct` §3.5, Phase A): its state for this
+    // configuration and the kinds of address this computer has; nothing is
+    // sent, and no address is printed.
+    for line in direct::doctor_lines(&loaded, tornect_signal::tor::last_good(paths)) {
+        println!("{line}");
+    }
     let store = FileSecretStore::open(paths.keys_dir())?;
     use tornect_core::SecretStore as _;
     let has_host = store.contains(keystore::HOST_IDENTITY_SEED)?;

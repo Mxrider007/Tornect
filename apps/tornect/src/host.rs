@@ -30,9 +30,9 @@ use tornect_core::unattended::schedule::FixedOffset;
 use tornect_core::{Config, HostIdentity, Paths};
 use tornect_platform::ipc::{Endpoint, IpcError};
 use tornect_session::{
-    CaptureChanged, CaptureStarted, MediaEnd, MediaHost, MediaObserver, MediaOutcome, MediaReport,
+    CaptureChanged, CaptureStarted, DirectHost, MediaEnd, MediaHost, MediaObserver, MediaOutcome,
+    MediaReport,
 };
-use tornect_signal::consent::TransportKnob;
 use tornect_signal::dispatch::{FIRST_FRAME_DEADLINE, FirstFrame, first_frame};
 use tornect_signal::envelope::codes;
 use tornect_signal::fsm::HostAudit;
@@ -47,6 +47,7 @@ use tornect_signal::pairing::{AutoDeny, Consent};
 use tornect_signal::ping::{self, ServeLimits};
 use tornect_signal::unattended::{EmergencyStop, GuardAdmin, UnattendedAuth};
 
+use crate::direct::DirectWiring;
 use crate::prompt::{CliConsent, Prompter};
 use crate::unattended::HostContext;
 
@@ -616,21 +617,20 @@ pub struct HostWiring {
 }
 
 /// Wire the host FSM for `paths`: `consent` answers the popups, `identity`
-/// signs, `device_pk` is the host's device key (its QUIC identity, §B.6),
-/// `media` serves the sessions' screens, and `control` says whether
-/// `tornect panic` can reach this host when a session starts.
+/// signs, `direct` holds the host's device key (its QUIC identity, §B.6),
+/// the knobs and the machine its sessions' direct paths run with (design
+/// `direct` §8.6), `media` serves the sessions' screens, and `control` says
+/// whether `tornect panic` can reach this host when a session starts.
 pub fn wire(
     paths: &Paths,
     cfg: &Config,
     identity: Arc<HostIdentity>,
-    device_pk: [u8; 32],
+    direct: DirectWiring,
     consent: Arc<dyn Consent>,
     media: Arc<MediaHost>,
     control: ControlChannel,
 ) -> anyhow::Result<HostWiring> {
-    wire_window(
-        paths, cfg, identity, device_pk, consent, media, control, None,
-    )
+    wire_window(paths, cfg, identity, direct, consent, media, control, None)
 }
 
 /// [`wire`], for the window host: `background` is the "indicator shown" fact
@@ -642,7 +642,7 @@ pub fn wire_window(
     paths: &Paths,
     cfg: &Config,
     identity: Arc<HostIdentity>,
-    device_pk: [u8; 32],
+    direct: DirectWiring,
     consent: Arc<dyn Consent>,
     media: Arc<MediaHost>,
     control: ControlChannel,
@@ -703,19 +703,39 @@ pub fn wire_window(
         Arc::new(CliSessions {
             live: Arc::clone(&live),
             polkit: Arc::clone(&polkit),
-            media,
+            media: Arc::clone(&media),
             control,
         }),
     );
     deps.activity = live.clone();
     deps.kill = kill.clone();
+    // The sessions' direct paths (design `direct` §8.6): one link at most
+    // per session, opened only once the viewer's candidates come, and
+    // closed by the host-wide kill like everything else. A direct media
+    // stream that never got as far as sharing says so as an onion one does.
+    deps.paths = Arc::new(DirectHost::new(
+        media,
+        // The services stream stays on the onion circuit until it serves a
+        // direct connection's second stream (design `direct` step B10).
+        None,
+        Arc::clone(&direct.device),
+        direct.knobs.direct.clone(),
+        Arc::clone(&direct.net),
+        kill.clone(),
+        Arc::new(|outcome: &MediaOutcome| {
+            if let Some(line) = describe_media(outcome) {
+                note(format_args!("{line}"));
+            }
+        }),
+    ));
 
-    let mut host_cfg = HostConfig::new(cfg.general.device_name.clone(), device_pk);
+    let mut host_cfg = HostConfig::new(cfg.general.device_name.clone(), direct.device_pk());
     // One knob for both kinds of accept (design `direct` §8.2): attended
-    // accepts read it at the accept, unattended receipts at the request. Its
-    // bridge state is set after the Tor bootstrap once the direct host lands
-    // (step A18); until then it is never bridged, and no direct path exists.
-    host_cfg.transport = TransportKnob::new(&cfg.network);
+    // accepts read it at the accept, unattended receipts at the request. The
+    // caller holds it too, sets the bridge state after each Tor bootstrap
+    // (`DirectKnobs::bootstrapped`, decision M1-86) and asks its own
+    // sessions' paths with it.
+    host_cfg.transport = direct.knobs.transport.clone();
     host_cfg.levels = levels;
 
     if let Ok(ctx) = &ctx {
@@ -765,6 +785,11 @@ pub fn wire_window(
     // M1-76). A host with nothing to show a session on clears it with the
     // rest ([`HostWiring::without_unattended`]).
     host_cfg.feats.push(messages::feats::SVC1.to_owned());
+    // The direct path (design `direct` §4): with it a viewer of this build
+    // tries a direct connection after the accept; without it, one sends
+    // `TOR_FALLBACK{}` at once, as to an older host. Offered whatever the
+    // policy: the accept signs the policy, and the viewer reads it there.
+    host_cfg.feats.push(messages::feats::DIR1.to_owned());
 
     Ok(HostWiring {
         cfg: host_cfg,
@@ -810,7 +835,7 @@ pub fn wire_cli(
     paths: &Paths,
     cfg: &Config,
     identity: Arc<HostIdentity>,
-    device_pk: [u8; 32],
+    direct: DirectWiring,
     prompter: Option<Arc<Prompter>>,
     media: Arc<MediaHost>,
     control: ControlChannel,
@@ -824,14 +849,14 @@ pub fn wire_cli(
                 crate::ui::recognize::Me {
                     name: cfg.general.device_name.clone(),
                     onion: identity.id(),
-                    device: tornect_core::DeviceId::from_bytes(device_pk),
+                    device: tornect_core::DeviceId::from_bytes(direct.device_pk()),
                 },
             );
             let mut wiring = wire(
                 paths,
                 cfg,
                 identity,
-                device_pk,
+                direct,
                 Arc::new(CliConsent::new(Arc::clone(&prompter)).with_words(Arc::new(words))),
                 media,
                 control,
@@ -852,7 +877,7 @@ pub fn wire_cli(
             paths,
             cfg,
             identity,
-            device_pk,
+            direct,
             Arc::new(AutoDeny),
             media,
             control,
@@ -1376,6 +1401,11 @@ impl CliMedia {
 impl MediaObserver for CliMedia {
     fn capture_started(&self, s: &CaptureStarted<'_>) {
         say(format_args!("SHARING {}", s.session_id));
+        // The route its media was claimed on (design `direct` §3.5).
+        say(format_args!(
+            "{}",
+            crate::direct::session_route_line(s.session_id, s.route)
+        ));
         let input = match (s.mode, s.input) {
             (SessionMode::ViewOnly, _) => "view-only",
             (_, true) => "their input is injected",
@@ -1912,7 +1942,7 @@ mod tests {
             &env.paths,
             &cfg,
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -1958,7 +1988,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -1974,9 +2004,11 @@ mod tests {
             wiring.cfg.feats,
             vec![
                 messages::feats::UA1.to_owned(),
-                messages::feats::SVC1.to_owned()
+                messages::feats::SVC1.to_owned(),
+                messages::feats::DIR1.to_owned()
             ],
-            "a host with a store offers the unattended suite and the services stream"
+            "a host with a store offers the unattended suite, the services stream and the \
+             direct path"
         );
     }
 
@@ -1992,7 +2024,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             None,
             media(),
             ControlChannel::default(),
@@ -2015,7 +2047,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             Some(prompter),
             media(),
             ControlChannel::default(),
@@ -2025,9 +2057,45 @@ mod tests {
             terminal.cfg.feats,
             vec![
                 messages::feats::UA1.to_owned(),
-                messages::feats::SVC1.to_owned()
+                messages::feats::SVC1.to_owned(),
+                messages::feats::DIR1.to_owned()
             ]
         );
+    }
+
+    /// Design `direct` §8.6 (step A18): the host signs its accepts with the
+    /// caller's own knob, so the bridge state each Tor bootstrap sets
+    /// (decision M1-86) reaches the next accept, attended or unattended,
+    /// and the device key it offers is the wiring's.
+    #[test]
+    fn the_host_signs_with_the_knob_its_caller_bootstraps() {
+        use tornect_signal::consent::TransportPolicy;
+        use tornect_signal::tor::Rung;
+
+        let env = env();
+        let direct = DirectWiring::for_test(0x33);
+        let cfg = Config::default();
+        let wiring = wire(
+            &env.paths,
+            &cfg,
+            Arc::clone(&env.identity),
+            direct.clone(),
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        assert_eq!(wiring.cfg.host_device_pk, direct.device_pk());
+        assert_eq!(wiring.cfg.transport.get(), TransportPolicy::Any);
+        direct.knobs.bootstrapped(Rung::Obfs4, &cfg.tor);
+        assert_eq!(wiring.cfg.transport.get(), TransportPolicy::TorOnly);
+        assert!(wiring.cfg.transport.off_by_bridge());
+        assert!(
+            wiring.cfg.transport.host_transport().paranoid,
+            "the unattended path reads the same knob"
+        );
+        direct.knobs.bootstrapped(Rung::Direct, &cfg.tor);
+        assert_eq!(wiring.cfg.transport.get(), TransportPolicy::Any);
     }
 
     /// FR2R-L1 (P-L4, the host's file): the host's start writes
@@ -2046,7 +2114,7 @@ mod tests {
                     &env.paths,
                     &Config::default(),
                     Arc::clone(&env.identity),
-                    [9; 32],
+                    DirectWiring::for_test(9),
                     Arc::new(ScriptedConsent::new()),
                     media(),
                     ControlChannel::default(),
@@ -2197,7 +2265,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            host_device_pk,
+            DirectWiring::for_test(0x33),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -2377,7 +2445,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             Some(Arc::clone(&prompter)),
             media(),
             ControlChannel::default(),
@@ -2396,7 +2464,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             None,
             media(),
             ControlChannel::default(),
@@ -2465,7 +2533,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            host_device_pk,
+            DirectWiring::for_test(0x33),
             Some(Arc::clone(&prompter)),
             media(),
             ControlChannel::default(),
@@ -2598,7 +2666,7 @@ mod tests {
                 &env.paths,
                 &Config::default(),
                 Arc::clone(&env.identity),
-                host_device_pk,
+                DirectWiring::for_test(0x33),
                 Arc::new(ScriptedConsent::new()),
                 media(),
                 ControlChannel::default(),
@@ -2706,7 +2774,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            host_device_pk,
+            DirectWiring::for_test(0x33),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -2834,7 +2902,7 @@ mod tests {
                 &env.paths,
                 &Config::default(),
                 Arc::clone(&env.identity),
-                host_device_pk,
+                DirectWiring::for_test(0x33),
                 Arc::new(ScriptedConsent::new()),
                 media(),
                 ControlChannel::default(),
@@ -2944,7 +3012,7 @@ mod tests {
                 &env.paths,
                 &Config::default(),
                 Arc::clone(&env.identity),
-                host_device_pk,
+                DirectWiring::for_test(0x33),
                 Arc::new(ScriptedConsent::new()),
                 media(),
                 ControlChannel::default(),
@@ -2952,7 +3020,11 @@ mod tests {
             .unwrap();
             assert_eq!(
                 wiring.cfg.feats,
-                [messages::feats::UA1, messages::feats::SVC1]
+                [
+                    messages::feats::UA1,
+                    messages::feats::SVC1,
+                    messages::feats::DIR1
+                ]
             );
             let (client_end, host_end) = duplex(64 * 1024);
             let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
@@ -2970,7 +3042,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            host_device_pk,
+            DirectWiring::for_test(0x33),
             None,
             media(),
             ControlChannel::default(),
@@ -3005,7 +3077,6 @@ mod tests {
     /// and the request it sends.
     struct UnattendedSetup {
         env: Env,
-        host_device_pk: [u8; 32],
         identity: DeviceIdentity,
         ccfg: ClientConfig,
         cdeps: ClientDeps,
@@ -3029,7 +3100,6 @@ mod tests {
         grant_unattended(&env, &device, SETUP_PASSWORD);
         UnattendedSetup {
             env,
-            host_device_pk,
             identity,
             ccfg,
             cdeps,
@@ -3043,7 +3113,7 @@ mod tests {
                 &self.env.paths,
                 &Config::default(),
                 Arc::clone(&self.env.identity),
-                self.host_device_pk,
+                DirectWiring::for_test(0x33),
                 Arc::new(ScriptedConsent::new()),
                 media(),
                 ControlChannel::default(),
@@ -3091,7 +3161,11 @@ mod tests {
         let wiring = setup.window(Some(shown.clone()));
         assert_eq!(
             wiring.cfg.feats,
-            [messages::feats::UA1, messages::feats::SVC1]
+            [
+                messages::feats::UA1,
+                messages::feats::SVC1,
+                messages::feats::DIR1
+            ]
         );
         let ctx = wiring.ctx.as_ref().unwrap();
         let pending = Probe::Warn(tornect_platform::readiness::INDICATOR_NOT_SHOWN.to_owned());
@@ -3168,7 +3242,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            DirectWiring::for_test(0x33),
             consent,
             media(),
             ControlChannel::default(),
@@ -3263,7 +3337,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            host_device_pk,
+            DirectWiring::for_test(0x33),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -3366,7 +3440,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            host_device_pk,
+            DirectWiring::for_test(0x33),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -3526,7 +3600,7 @@ mod tests {
                 &env.paths,
                 &Config::default(),
                 Arc::clone(&env.identity),
-                [0x33; 32],
+                DirectWiring::for_test(0x33),
                 Arc::new(ScriptedConsent::new()),
                 media(),
                 ControlChannel::default(),
@@ -3586,7 +3660,7 @@ mod tests {
                 &env.paths,
                 &Config::default(),
                 Arc::clone(&env.identity),
-                [0x33; 32],
+                DirectWiring::for_test(0x33),
                 Arc::new(ScriptedConsent::new()),
                 media(),
                 ControlChannel::default(),
@@ -3702,7 +3776,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [0x33; 32],
+            DirectWiring::for_test(0x33),
             Arc::new(ScriptedConsent::new()),
             media(),
             ControlChannel::default(),
@@ -3977,7 +4051,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            [9; 32],
+            DirectWiring::for_test(9),
             consent.clone(),
             media(),
             ControlChannel::default(),
@@ -4030,7 +4104,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            DirectWiring::for_test(0x33),
             consent,
             media(),
             control.clone(),
@@ -4039,8 +4113,9 @@ mod tests {
         assert!(ctx.is_err(), "the store is held elsewhere");
         assert_eq!(
             cfg.feats,
-            [messages::feats::SVC1],
-            "without a store the host offers no unattended suite, and still the services stream"
+            [messages::feats::SVC1, messages::feats::DIR1],
+            "without a store the host offers no unattended suite, and still the services stream \
+             and the direct path"
         );
         let ipc = start_control_channel(&env.paths, ctx, deps.kill.clone(), control.clone())
             .await
@@ -4064,6 +4139,10 @@ mod tests {
         assert!(
             session.host_has(messages::feats::SVC1),
             "the client reads the services stream's token from the signed HELLO_ACK"
+        );
+        assert!(
+            session.host_has(messages::feats::DIR1),
+            "and the direct path's (design `direct` §4)"
         );
         session.send_tor_fallback(None).await.unwrap();
         session.ping().await.unwrap();
@@ -4602,7 +4681,7 @@ mod tests {
             &env.paths,
             &Config::default(),
             Arc::clone(&env.identity),
-            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            DirectWiring::for_test(0x33),
             consent,
             media(),
             ControlChannel::default(),

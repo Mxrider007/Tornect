@@ -515,10 +515,15 @@ pub struct Backend {
     pub host: bool,
     /// The host identity (the onion service key).
     pub identity: Arc<HostIdentity>,
-    /// The device identity (what hosts pin when this machine connects).
+    /// The device identity (what hosts pin when this machine connects, and
+    /// the host role's QUIC identity).
     pub device: Arc<DeviceIdentity>,
-    /// The device key's public half.
-    pub device_pk: [u8; 32],
+    /// What the direct path runs with (design `direct` §8.6): the policy
+    /// both roles read and the path's options, shared with the host role.
+    /// Its bridge state follows each Tor bootstrap.
+    pub knobs: crate::direct::DirectKnobs,
+    /// The network the direct links run on ([`tornect_net::RealNet`]).
+    pub net: Arc<dyn tornect_net::NetEnv>,
     /// The device words and the look-alike alarm of this home (§B.6.1).
     pub words: Arc<super::recognize::Recognizer>,
     /// Started in background mode (`tornect --background`, §B.1.1): the
@@ -534,6 +539,16 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// The parts of both halves of the direct path: this device, the
+    /// knobs, the network.
+    fn direct(&self) -> crate::direct::DirectWiring {
+        crate::direct::DirectWiring {
+            device: Arc::clone(&self.device),
+            knobs: self.knobs.clone(),
+            net: Arc::clone(&self.net),
+        }
+    }
+
     /// This device's `sessions.log` line for one unattended attempt at `known`
     /// (§B.8.13): through the store of this window's host role, else keyed as
     /// that store would key it ([`ua_client::log_attempt_via`]).
@@ -2088,7 +2103,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         &b.paths,
         &b.cfg,
         Arc::clone(&b.identity),
-        b.device_pk,
+        b.direct(),
         Arc::new(AutoDeny),
         Arc::clone(&media),
         control.clone(),
@@ -2905,7 +2920,10 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
         tokio::select! {
             step = tor.next(), if tor.pending() => match step {
                 Restart::Started(started) => {
-                    // The way into Tor that worked is known now.
+                    // The way into Tor that worked is known now, and with it
+                    // whether direct paths are off for the bridge (decision
+                    // M1-86): before the onion service is published again.
+                    b.knobs.bootstrapped(started.rung(), &b.cfg.tor);
                     refresh_diagnostics(&b);
                     let started = Arc::new(started);
                     b.shared.update(|m| m.tor_retry = None);
@@ -5972,7 +5990,8 @@ mod tests {
             host: true,
             identity,
             device: Arc::new(device),
-            device_pk,
+            knobs: crate::direct::DirectKnobs::new(&Config::default()),
+            net: crate::direct::no_network(),
             words,
             background: Some(shown.clone()),
             hosted_store: std::sync::OnceLock::new(),
@@ -6049,7 +6068,8 @@ mod tests {
             host: true,
             identity,
             device: Arc::new(device),
-            device_pk,
+            knobs: crate::direct::DirectKnobs::new(&Config::default()),
+            net: crate::direct::no_network(),
             words,
             background: None,
             hosted_store: std::sync::OnceLock::new(),
@@ -6137,7 +6157,7 @@ mod tests {
             &paths,
             &Config::default(),
             Arc::clone(&identity),
-            host_pk,
+            crate::direct::DirectWiring::for_test(0x12),
             Arc::new(AutoDeny),
             media,
             ControlChannel::default(),
@@ -6634,7 +6654,7 @@ mod tests {
             &paths,
             &Config::default(),
             Arc::clone(&identity),
-            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            crate::direct::DirectWiring::for_test(0x33),
             Arc::new(AutoDeny),
             Arc::clone(&media),
             ControlChannel::default(),
@@ -7089,7 +7109,8 @@ mod tests {
             host: true,
             identity,
             device: Arc::new(device),
-            device_pk,
+            knobs: crate::direct::DirectKnobs::new(&Config::default()),
+            net: crate::direct::no_network(),
             words,
             background: None,
             hosted_store: std::sync::OnceLock::new(),

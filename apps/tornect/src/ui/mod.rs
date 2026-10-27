@@ -297,6 +297,9 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             device: tornect_core::DeviceId::from_bytes(real.device_pk),
         },
     ));
+    // One set of knobs for both roles, from this start's configuration
+    // (design `direct` §8.6); the bridge state follows each bootstrap.
+    let knobs = crate::direct::DirectKnobs::new(&real.cfg);
     runtime.spawn(backend::run(
         Backend {
             paths: paths.clone(),
@@ -309,7 +312,8 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             words,
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
-            device_pk: real.device_pk,
+            knobs,
+            net: Arc::new(tornect_net::RealNet::new()),
             background: gate_fact,
             hosted_store: std::sync::OnceLock::new(),
         },

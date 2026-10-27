@@ -18,6 +18,9 @@ tornect-core = { workspace = true, features = ["keyring"] }
 tornect-signal.workspace = true
 tornect-platform.workspace = true
 tornect-session.workspace = true
+# The machine the direct path runs on (`RealNet`) and its candidate kinds
+# (design `direct` §8.6); the sockets themselves stay inside it.
+tornect-net.workspace = true
 tornect-proto.workspace = true
 tornect-capture.workspace = true
 tornect-codec.workspace = true
@@ -59,6 +62,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # A capturing subscriber: no device words in any trace (§B.6.1 W-B4).
 tracing-subscriber.workspace = true
 ed25519-dalek.workspace = true
+# `MemNet`, the in-memory network of the direct-path tests (never in a
+# release build: dev-dependency features do not reach it).
+tornect-net = { workspace = true, features = ["test-support"] }
 
 # The SIGTERM test signals its own process with kill(2): spawning `kill` would
 # fork, and a forked child holds a copy of every open file, the other tests'

@@ -41,10 +41,11 @@ use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
 use tornect_signal::{
-    HostSigner, Isolation, Ladder, LadderEvent, MEDIA_PORT, OnionStatus, SERVICES_PORT,
-    SIGNALING_PORT, SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
+    Isolation, Ladder, LadderEvent, MEDIA_PORT, OnionStatus, SERVICES_PORT, SIGNALING_PORT,
+    SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
 };
 
+use crate::direct::{DirectKnobs, DirectWiring};
 use crate::host::{CliMedia, ControlChannel, HostLock, HostWiring, Served};
 use crate::prompt::{CliPairingUi, Prompter};
 
@@ -119,11 +120,12 @@ pub fn host(
     if let Some(mode) = bridges {
         cfg.tor.bridges = mode;
     }
+    let direct = DirectWiring::real(Arc::new(device), DirectKnobs::new(&cfg));
     block_on(run_host(
         paths,
         &cfg,
         Arc::new(identity),
-        HostSigner::public_key(&device),
+        direct,
         once,
         source,
     ))
@@ -341,10 +343,11 @@ async fn run_host(
     paths: &Paths,
     cfg: &Config,
     identity: Arc<HostIdentity>,
-    device_pk: [u8; 32],
+    direct: DirectWiring,
     once: bool,
     source: Source,
 ) -> anyhow::Result<()> {
+    let knobs = direct.knobs.clone();
     let prompter = Prompter::stdin();
     if prompter.is_none() {
         eprintln!("{}", crate::host::NO_TERMINAL_LINE);
@@ -374,7 +377,7 @@ async fn run_host(
         paths,
         cfg,
         Arc::clone(&identity),
-        device_pk,
+        direct,
         prompter,
         Arc::clone(&media),
         control.clone(),
@@ -398,6 +401,10 @@ async fn run_host(
 
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
+    // Through a bridge, sessions are signed `tor_only` unless
+    // `network.direct_with_bridges` (decision M1-86): set before the onion
+    // service is published, so no accept is signed without it.
+    knobs.bootstrapped(node.rung(), &cfg.tor);
     if node.rung() == tornect_signal::tor::Rung::Snowflake {
         // SLICE-A1 A1-7, kept as a warning rather than a refusal: in a censored
         // network where obfs4 is blocked too, Snowflake is the only way to host.

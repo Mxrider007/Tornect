@@ -7498,6 +7498,7 @@ dependencies = [
  "tornect-codec",
  "tornect-core",
  "tornect-input",
+ "tornect-net",
  "tornect-platform",
  "tornect-proto",
  "tornect-session",

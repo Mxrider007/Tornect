@@ -1037,7 +1037,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_consent_timeout_denies_and_takes_the_popup_down() {
         use tornect_core::{Config, Paths};
-        use tornect_signal::HostSigner;
         use tornect_signal::fsm::HandshakeError;
         use tornect_signal::fsm::client::{
             ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, connect,
@@ -1060,7 +1059,7 @@ mod tests {
             &paths,
             &Config::default(),
             Arc::clone(&identity),
-            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            crate::direct::DirectWiring::for_test(0x33),
             Arc::new(tornect_signal::pairing::AutoDeny),
             media,
             crate::host::ControlChannel::default(),
