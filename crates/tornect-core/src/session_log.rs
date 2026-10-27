@@ -156,6 +156,66 @@ pub enum SessionEvent {
     /// ([`ServicesCounts::detail`]), `reason` the services stream's closing
     /// reason; never a name or any text.
     ServicesSummary,
+    /// Host or viewer: a router port mapping of the direct path changed
+    /// (design `direct` §3.6, §8.1): `detail` holds what happened and the
+    /// protocol only ([`RouterPort::detail`]), never an address or a port.
+    RouterPort,
+}
+
+/// What happened to a router port mapping of the direct path, for its
+/// `router_port` line (design `direct` §8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PortChange {
+    /// The router granted the mapping.
+    Opened,
+    /// The mapping was released.
+    Closed,
+    /// Releasing the mapping failed (it lapses with its lease).
+    CloseFailed,
+    /// A mapping an earlier run left was removed at start.
+    LeftoverRemoved,
+}
+
+/// The protocol a router port mapping was made with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PortVia {
+    /// Port Control Protocol (RFC 6887).
+    Pcp,
+    /// NAT-PMP (RFC 6886).
+    NatPmp,
+    /// UPnP IGD.
+    Upnp,
+}
+
+/// One `router_port` line's facts: the change and the protocol, fixed
+/// words only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RouterPort {
+    /// What happened.
+    pub change: PortChange,
+    /// With which protocol.
+    pub via: PortVia,
+}
+
+impl RouterPort {
+    /// The line's `detail`: `opened <via>`, `closed <via>`, `close-failed
+    /// <via>` or `leftover-removed <via>`, where `<via>` is `pcp`,
+    /// `nat-pmp` or `upnp`.
+    #[must_use]
+    pub fn detail(self) -> String {
+        let change = match self.change {
+            PortChange::Opened => "opened",
+            PortChange::Closed => "closed",
+            PortChange::CloseFailed => "close-failed",
+            PortChange::LeftoverRemoved => "leftover-removed",
+        };
+        let via = match self.via {
+            PortVia::Pcp => "pcp",
+            PortVia::NatPmp => "nat-pmp",
+            PortVia::Upnp => "upnp",
+        };
+        format!("{change} {via}")
+    }
 }
 
 /// What a session's services carried, for its `services_summary` line:
@@ -1646,6 +1706,55 @@ mod tests {
                 ms: 0,
             }
         );
+    }
+
+    /// Design `direct` §3.6, §8.1: a router port line is named
+    /// `router_port` and its detail is the change and the protocol, fixed
+    /// words only; it reads back as written.
+    #[test]
+    fn a_router_port_line_says_the_change_and_the_protocol_only() {
+        let mut details = Vec::new();
+        for change in [
+            PortChange::Opened,
+            PortChange::Closed,
+            PortChange::CloseFailed,
+            PortChange::LeftoverRemoved,
+        ] {
+            for via in [PortVia::Pcp, PortVia::NatPmp, PortVia::Upnp] {
+                details.push(RouterPort { change, via }.detail());
+            }
+        }
+        assert_eq!(
+            details,
+            [
+                "opened pcp",
+                "opened nat-pmp",
+                "opened upnp",
+                "closed pcp",
+                "closed nat-pmp",
+                "closed upnp",
+                "close-failed pcp",
+                "close-failed nat-pmp",
+                "close-failed upnp",
+                "leftover-removed pcp",
+                "leftover-removed nat-pmp",
+                "leftover-removed upnp",
+            ]
+        );
+        let record = SessionRecord::at(1_700_000_000, SessionEvent::RouterPort).detail(
+            RouterPort {
+                change: PortChange::Opened,
+                via: PortVia::Pcp,
+            }
+            .detail(),
+        );
+        let line = serde_json::to_string(&record).unwrap();
+        assert!(
+            line.contains(r#""event":"router_port""#) && line.contains(r#""detail":"opened pcp""#),
+            "{line}"
+        );
+        let back: SessionRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
     }
 
     /// Design `services` §8: the four services events have their names; a
