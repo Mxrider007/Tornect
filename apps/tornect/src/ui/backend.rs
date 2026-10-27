@@ -2191,6 +2191,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             shared: Arc::clone(&b.shared),
             started: started_tx,
         }),
+        crate::host::media_routes(&media),
     );
     let kill_watch = media.watch_kill(deps.kill.clone());
     let banner = ctx.as_ref().ok().map(|c| {

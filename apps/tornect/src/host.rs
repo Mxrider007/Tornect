@@ -706,6 +706,7 @@ pub fn wire_window(
             media: Arc::clone(&media),
             control,
         }),
+        media_routes(&media),
     );
     deps.activity = live.clone();
     deps.kill = kill.clone();
@@ -1181,9 +1182,17 @@ impl SessionSink for CliSessions {
     }
 }
 
-/// The transport of this build's sessions: their media goes over the Tor
-/// stream (decision M1-43).
-const SESSION_TRANSPORT: TransportKind = TransportKind::TorRelay;
+/// The path a session's media stream was claimed on, by session id
+/// ([`MediaHost::route`]): `None` before the claim and once the media layer
+/// ended the session.
+pub type RouteOf = Arc<dyn Fn(&str) -> Option<TransportKind> + Send + Sync>;
+
+/// [`RouteOf`] for the sessions `media` serves.
+#[must_use]
+pub fn media_routes(media: &Arc<MediaHost>) -> RouteOf {
+    let media = Arc::clone(media);
+    Arc::new(move |session_id: &str| media.route(session_id))
+}
 
 /// The longest gap between a PAKE success and its session's start that counts
 /// towards the session's length: the block window and an "Ask before
@@ -1213,9 +1222,17 @@ const MAX_LEAD: u64 = 15 * 60;
 /// the same device started (`BYE{REPLACED}`) leaves the newer one's record
 /// alone. A session whose host process ends without the session's end (killed,
 /// crashed) records no length, and so no cooldown follows it.
+///
+/// `last_used.transport` is the path the session's media took (design
+/// `direct`: a direct LAN path, or the Tor stream), read at the session's end
+/// from `routes` before the media layer forgets it; a session whose media
+/// never bound went over Tor alone. The path is chosen after the accept, so
+/// the start (and the PAKE success before it) leaves the transport on record
+/// as it was until the end writes the session's own.
 pub struct UnattendedUse {
     inner: Arc<dyn SessionSink>,
     store: tornect_core::unattended::store::GrantStore,
+    routes: RouteOf,
     state: std::sync::Mutex<UseState>,
 }
 
@@ -1241,16 +1258,17 @@ struct UseStart {
 }
 
 impl UnattendedUse {
-    /// `inner`, recording unattended sessions on the grants of `ctx`'s store;
-    /// `inner` itself when the store did not open (no unattended session can
-    /// start then).
+    /// `inner`, recording unattended sessions on the grants of `ctx`'s store,
+    /// each with the path `routes` says its media took; `inner` itself when
+    /// the store did not open (no unattended session can start then).
     #[must_use]
     pub fn wrap(
         ctx: &Result<HostContext, String>,
         inner: Arc<dyn SessionSink>,
+        routes: RouteOf,
     ) -> Arc<dyn SessionSink> {
         match ctx {
-            Ok(ctx) => Arc::new(Self::new(inner, ctx.guard.store().clone())),
+            Ok(ctx) => Arc::new(Self::new(inner, ctx.guard.store().clone(), routes)),
             Err(_) => inner,
         }
     }
@@ -1258,10 +1276,12 @@ impl UnattendedUse {
     fn new(
         inner: Arc<dyn SessionSink>,
         store: tornect_core::unattended::store::GrantStore,
+        routes: RouteOf,
     ) -> Self {
         Self {
             inner,
             store,
+            routes,
             state: std::sync::Mutex::new(UseState::default()),
         }
     }
@@ -1283,13 +1303,17 @@ impl UnattendedUse {
         // two clocks agree ([`session_secs`]).
         let wall = clock.wall();
         let mono = clock.mono();
-        let lead = match self.store.grant(&device).and_then(|g| g.last_used) {
+        let last = self.store.grant(&device).and_then(|g| g.last_used);
+        let lead = match last {
             // This session's own PAKE success: `settle(Ok)` writes no length.
             Some(last) if last.duration_secs == 0 && last.at <= wall => {
                 (wall - last.at).min(MAX_LEAD)
             }
             _ => {
-                if let Err(e) = self.store.record_session_start(&device, SESSION_TRANSPORT) {
+                // The media's path is not chosen yet: the transport on record
+                // stays, as `settle(Ok)` keeps it, until the end writes it.
+                let transport = last.map_or(TransportKind::TorRelay, |l| l.transport);
+                if let Err(e) = self.store.record_session_start(&device, transport) {
                     not_recorded(&device, &e, "start");
                 }
                 0
@@ -1311,7 +1335,9 @@ impl UnattendedUse {
         );
     }
 
-    fn ended(&self, session_id: &str) {
+    /// Session `session_id` ended; its media went over `route` (`None`:
+    /// its media never bound, so it went over Tor alone).
+    fn ended(&self, session_id: &str, route: Option<TransportKind>) {
         let start = {
             let mut st = self.state();
             let Some(start) = st.live.remove(session_id) else {
@@ -1328,9 +1354,10 @@ impl UnattendedUse {
         let wall = clock.wall();
         let ran = session_secs((start.wall, start.mono), (wall, mono)).saturating_add(start.lead);
         let secs = u32::try_from(ran).unwrap_or(u32::MAX);
+        let transport = route.unwrap_or(TransportKind::TorRelay);
         if let Err(e) = self
             .store
-            .record_session_end(&start.device, SESSION_TRANSPORT, secs)
+            .record_session_end(&start.device, transport, secs)
         {
             not_recorded(&start.device, &e, "length");
         }
@@ -1378,9 +1405,17 @@ impl SessionSink for UnattendedUse {
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
-        // The sink's own end first: that is what stops capture.
+        // The media's path is read first, for a session this sink tracks:
+        // the sink's own end, which then comes first because it is what stops
+        // capture, ends the media the path belongs to.
+        let tracked = self.state().live.contains_key(session_id);
+        let route = if tracked {
+            (self.routes)(session_id)
+        } else {
+            None
+        };
         self.inner.on_end(session_id, end);
-        self.ended(session_id);
+        self.ended(session_id, route);
     }
 }
 
@@ -3485,6 +3520,214 @@ mod tests {
         assert_eq!(wiring.live.count(), 0);
     }
 
+    /// Routes for a sink whose sessions never bind media.
+    fn no_routes() -> RouteOf {
+        Arc::new(|_: &str| None)
+    }
+
+    /// An inner sink whose end makes the media layer forget the session, as
+    /// the real one's does ([`MediaHost`]'s `on_end`).
+    struct Forgets(Arc<AtomicBool>);
+
+    impl SessionSink for Forgets {
+        fn on_start(&self, _: &LiveSession<'_>) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+
+        fn on_end(&self, _: &str, _: Option<&SessionEnd>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The grant's `last_used.transport` is the path the session's media
+    /// took, read before the sink's own end forgets it: a direct LAN session
+    /// records `lan`. A start that writes (no PAKE success of its own on
+    /// record) keeps the transport on record, the path being unknown yet;
+    /// a session whose media never bound records Tor.
+    #[test]
+    fn the_use_sink_records_the_path_its_media_took() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::clock::FakeClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+            RandomServerSetupSource,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::limiter::Settle;
+        use tornect_core::unattended::store::GrantStore;
+        use tornect_signal::consent::SessionToken;
+
+        let env = env();
+        let clock = Arc::new(FakeClock::at(1_787_961_600));
+        let store = GrantStore::open(
+            &env.paths,
+            Arc::new(FileSecretStore::open(env.paths.keys_dir()).unwrap()),
+            clock.clone(),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        let guard = MutationGuard::new(
+            store.clone(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(RandomServerSetupSource));
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        let device = DeviceId::from_bytes([3; 32]);
+        guard
+            .create_grant(
+                Actor::Cli,
+                &device,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let limiter = AttemptLimiter::new(store.clone());
+        let forgotten = Arc::new(AtomicBool::new(false));
+        let routes: RouteOf = {
+            let forgotten = Arc::clone(&forgotten);
+            Arc::new(move |id: &str| {
+                (id == "lan" && !forgotten.load(Ordering::SeqCst)).then_some(TransportKind::Lan)
+            })
+        };
+        let sink = UnattendedUse::new(Arc::new(Forgets(forgotten)), store.clone(), routes);
+        let token = SessionToken::new([1; 32]);
+        let live = |id: &'static str| LiveSession {
+            device,
+            label: "Laptop",
+            session_id: id,
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::Control,
+            elevation: tornect_core::levels::Elevation::None,
+            unattended: true,
+            transport: TransportPolicy::Any,
+            viewer_dir1: true,
+        };
+        let last = || store.grant(&device).unwrap().last_used.unwrap();
+
+        limiter.charge(&device).unwrap();
+        limiter.settle(&device, Settle::Ok).unwrap();
+        assert_eq!(
+            last().transport,
+            TransportKind::TorRelay,
+            "none on record yet"
+        );
+        sink.on_start(&live("lan"));
+        clock.advance(Duration::from_secs(30));
+        sink.on_end("lan", None);
+        assert_eq!(
+            (last().transport, last().duration_secs),
+            (TransportKind::Lan, 30)
+        );
+
+        // No PAKE success of its own on record: the start writes, keeping
+        // the transport the last session took.
+        sink.on_start(&live("never-bound"));
+        assert_eq!(
+            (last().transport, last().duration_secs),
+            (TransportKind::Lan, 0)
+        );
+        clock.advance(Duration::from_secs(5));
+        sink.on_end("never-bound", None);
+        assert_eq!(
+            (last().transport, last().duration_secs),
+            (TransportKind::TorRelay, 5)
+        );
+    }
+
+    /// The same through a host wired as `tornect host` wires it: an
+    /// unattended session whose viewer is on the host's LAN goes direct, and
+    /// its grant's `last_used` says `lan` once it ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_direct_unattended_session_records_the_lan() {
+        use tornect_net::mem::{LinkSpec, MachineSpec, MemNet};
+        use tornect_signal::fsm::client::UnattendedIntent;
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device = Arc::new(DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(
+                env.identity.id(),
+                "Desk",
+                HostSigner::public_key(host_device.as_ref()),
+            )
+            .unwrap();
+        grant_unattended(&env, &device, PASSWORD);
+        let net = MemNet::new(17);
+        let lan = net.segment(LinkSpec::LAN);
+        let viewer_net: Arc<dyn tornect_net::NetEnv> =
+            Arc::new(net.machine(MachineSpec::on(lan, "192.168.1.10/24")));
+        let host_net: Arc<dyn tornect_net::NetEnv> =
+            Arc::new(net.machine(MachineSpec::on(lan, "192.168.1.20/24")));
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        let media = media();
+        let wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            DirectWiring {
+                device: host_device,
+                knobs: knobs.clone(),
+                net: host_net,
+            },
+            Arc::new(ScriptedConsent::new()),
+            Arc::clone(&media),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let store = wiring.ctx.as_ref().unwrap().guard.store().clone();
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let unattended = Intent::Unattended(UnattendedIntent {
+            password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+            want_mode: messages::mode::CONTROL,
+            want_elevation: tornect_core::levels::Elevation::None,
+        });
+        let ccfg = crate::tor_cmd::viewer_config(ccfg.host, ccfg.name);
+        let mut session = match connect(client_end, &ccfg, &identity, &cdeps, unattended).await {
+            Ok(ClientOutcome::Session(s)) => s,
+            other => panic!("no unattended session: {other:?}"),
+        };
+        let sid = session.session_token().session_id();
+        let ctx = DirectWiring {
+            device: Arc::new(identity),
+            knobs,
+            net: viewer_net,
+        }
+        .ctx(false);
+        let binding = tornect_session::Binding::new(session.session_token(), &session.th());
+        let never = || std::future::pending::<anyhow::Result<tokio::io::DuplexStream>>();
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        let bound = crate::tor_cmd::bind_media(&mut session, &ctx, &binding, never, &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        assert!(matches!(bound.media, crate::tor_cmd::MediaPath::Direct(_)));
+        assert_eq!(media.route(&sid), Some(TransportKind::Lan));
+        session.ping().await.unwrap();
+        session.bye(bye::USER).await.unwrap();
+        assert_eq!(host_task.await.unwrap(), Served::Session);
+        drop(bound);
+        let last = store.grant(&device).unwrap().last_used.unwrap();
+        assert_eq!(last.transport, TransportKind::Lan, "{last:?}");
+    }
+
     /// The sink records only unattended sessions, and an older session of a
     /// device that ends after a newer one of the same device started leaves
     /// the newer one's record alone; the length counts from the PAKE success.
@@ -3537,7 +3780,7 @@ mod tests {
             limiter.charge(&device).unwrap();
             limiter.settle(&device, Settle::Ok).unwrap();
         };
-        let sink = UnattendedUse::new(Arc::new(LiveSessions::new()), store.clone());
+        let sink = UnattendedUse::new(Arc::new(LiveSessions::new()), store.clone(), no_routes());
         let token = SessionToken::new([1; 32]);
         let live = |id: &'static str, unattended: bool| LiveSession {
             device,
@@ -3960,7 +4203,7 @@ mod tests {
             clock.set_wall(BASE + real.as_secs());
             clock.advance_mono(real.saturating_sub(clock.mono()));
         };
-        let sink = UnattendedUse::new(Arc::new(LiveSessions::new()), store.clone());
+        let sink = UnattendedUse::new(Arc::new(LiveSessions::new()), store.clone(), no_routes());
         let token = SessionToken::new([1; 32]);
 
         // (the PAKE's, the start's, the cut's milliseconds into their seconds)
