@@ -18,10 +18,12 @@
 //! The caller (the session's path phase) exchanges candidates over Tor:
 //! it sends the host candidates [`DirectLink::start`] returns and the
 //! batches of [`DirectLink::next_local`], and hands the peer's to
-//! [`DirectLink::add_remote`] and [`DirectLink::remote_done`]. In Phase A
-//! the host candidates are all of this side's (same-site gathering), so
-//! `next_local` says `Done` at once; Phase B adds the mapped and
-//! server-reflexive batches (design §7.5).
+//! [`DirectLink::add_remote`] and [`DirectLink::remote_done`]. In same-site
+//! scope the host candidates are all of this side's, so `next_local` says
+//! `Done` at once; in internet scope the link's gathering ([`gather`])
+//! adds the mapped and the server-reflexive batches, then `Done` (design
+//! §7.5), and tells the checklist this side's public addresses for its
+//! ranks (design §7.6).
 //!
 //! **Lifetime.** The link, every [`Established`] and every [`QuicStream`]
 //! share one inner value; the last of them to go closes the connection and
@@ -29,8 +31,10 @@
 //! stream keeps exactly what that stream needs. [`DirectLink::close`] closes
 //! at once whatever else still holds the link, so after it no QUIC
 //! connection can complete (the viewer's fallback, design §4). The runtime
-//! the link starts on is captured: the driver runs on it, and Phase B
-//! releases the router mapping through it (design §7.4 "Release").
+//! the link starts on is captured: the driver and the gathering run on it.
+//! The gathering holds the router mapping and renews it for as long as the
+//! link lives; the link's end aborts it, and the mapping, dropped, is
+//! released on that runtime (design §7.4 "Release").
 //!
 //! Nothing here logs. Every type has a redacted `Debug` (decision M1-83),
 //! and [`LinkStats`] holds counts only.
@@ -53,10 +57,11 @@ use zeroize::Zeroizing;
 use crate::addr::{AddrClass, Candidate, CandidateKind, RemoteFilter, Scope, canon, canon_ip};
 use crate::checklist::{Action, Checklist, PunchRole, PunchStats};
 use crate::env::NetEnv;
+use crate::gather::{self, GatherConfig, GatherStats, Gathered, Gatherer};
 use crate::local;
 use crate::probe::ProbeKey;
 use crate::quic::{self, QuicError, QuicIdentity};
-use crate::udp::{ProbeGate, PunchCounters, PunchSocket, Tees, V6Sources};
+use crate::udp::{ProbeGate, PunchCounters, PunchSocket, TeedProbe, TeedStun, Tees, V6Sources};
 use crate::{BoxFuture, TornectRole};
 
 /// The longest [`DirectLink::close`] waits for the endpoint to drain.
@@ -76,9 +81,7 @@ const COMMAND_QUEUE: usize = 16;
 /// clock that does not move.
 const MIN_TICK: Duration = Duration::from_millis(1);
 
-/// What a direct link is started with (design §8.3 `DirectParams`). The
-/// fields of Phase B's gathering (the STUN partition, the router protocols)
-/// join at step B6.
+/// What a direct link is started with (design §8.3 `DirectParams`).
 pub struct DirectParams {
     /// This side's role in the session.
     pub me: TornectRole,
@@ -94,6 +97,10 @@ pub struct DirectParams {
     /// How far this side's candidates reach (the scope the two sides agreed
     /// on, design §4).
     pub scope: Scope,
+    /// What this side may gather beyond its host candidates in internet
+    /// scope (its STUN servers, the router protocols); same-site scope asks
+    /// nobody whatever it says.
+    pub gather: GatherConfig,
 }
 
 impl fmt::Debug for DirectParams {
@@ -102,6 +109,7 @@ impl fmt::Debug for DirectParams {
             .field("me", &self.me)
             .field("direct_port", &self.direct_port.is_some())
             .field("scope", &self.scope)
+            .field("gather", &self.gather)
             .finish_non_exhaustive()
     }
 }
@@ -110,8 +118,8 @@ impl fmt::Debug for DirectParams {
 /// names an address or a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DirectFail {
-    /// This side has no address in scope (or the interface read failed);
-    /// nothing was bound.
+    /// This side has no address in scope and nothing to gather one with
+    /// (or the interface read failed); nothing was bound.
     #[error("no network address a direct connection can use")]
     NoAddresses,
     /// The session socket could not be bound, or quinn could not start on
@@ -206,6 +214,8 @@ pub struct LinkStats {
     /// Candidate batches and `DONE`s dropped because the driver's queue was
     /// full or gone.
     pub commands_dropped: u64,
+    /// The gathering's counters.
+    pub gather: GatherStats,
 }
 
 /// How the one dial failed.
@@ -222,6 +232,8 @@ pub enum DialFailure {
 #[derive(Default)]
 struct Shared {
     stats: Mutex<LinkStats>,
+    /// The gathering's counters, which its task keeps.
+    gather: Arc<Mutex<GatherStats>>,
     /// Stream bytes read on this link's connection.
     received: AtomicU64,
 }
@@ -242,24 +254,37 @@ struct LinkInner {
     endpoint: quinn::Endpoint,
     socket: Arc<PunchSocket>,
     driver: tokio::task::AbortHandle,
+    /// The gathering, which holds the router mapping for as long as it
+    /// runs: aborted, it drops the mapping, which releases itself on the
+    /// runtime the mapper captured (this link's, design §7.4 "Release").
+    gatherer: Option<tokio::task::AbortHandle>,
     shared: Arc<Shared>,
-    /// The runtime the link started on: the driver runs there, and step B4
-    /// releases the router mapping through it (design §7.4 "Release").
+    /// The runtime the link started on: the driver and the gathering run
+    /// there.
     _runtime: tokio::runtime::Handle,
 }
 
 impl LinkInner {
-    /// Stops the driver and closes the endpoint with every connection on
-    /// it; no new connection can start or complete afterwards. Needs no
-    /// runtime context, so a drop anywhere closes.
+    /// Stops the driver and the gathering (releasing the router mapping)
+    /// and closes the endpoint with every connection on it; no new
+    /// connection can start or complete afterwards. Needs no runtime
+    /// context, so a drop anywhere closes.
     fn shut(&self) {
         self.driver.abort();
+        if let Some(gatherer) = &self.gatherer {
+            gatherer.abort();
+        }
         self.endpoint.close(VarInt::from_u32(LINK_CLOSED), b"");
     }
 
     fn stats(&self) -> LinkStats {
         LinkStats {
             socket: self.socket.counters(),
+            gather: *self
+                .shared
+                .gather
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
             ..self.shared.snapshot()
         }
     }
@@ -320,18 +345,25 @@ impl DirectLink {
     ///
     /// 1. refuses the peer's key when it is this device's own
     ///    ([`DirectFail::SameKey`]), before any call to `env`;
-    /// 2. reads this computer's addresses and route sources and selects the
-    ///    host candidates of `params.scope` ([`local::select_host_candidates`]);
-    ///    none ([`DirectFail::NoAddresses`]) binds nothing;
+    /// 2. reads this computer's addresses and route sources, selects the
+    ///    host candidates of `params.scope` ([`local::select_host_candidates`])
+    ///    and plans the gathering ([`gather::plan`]); with no host candidate
+    ///    and nothing to gather ([`DirectFail::NoAddresses`]) nothing is
+    ///    bound. In internet scope a side without host candidates (only a
+    ///    carrier-grade NAT address, say) still takes part when the router
+    ///    or a STUN server may give it one (design §7.1 "Without host
+    ///    candidates");
     /// 3. binds the session socket ([`DirectFail::Socket`]), offers only the
     ///    candidates its family can carry, pins the IPv6 sources to the
     ///    offered addresses, and builds the remote filter, the checklist and
     ///    quinn's endpoint (with the server configuration on the controlled
     ///    side);
-    /// 4. spawns the driver on the current runtime.
+    /// 4. spawns the driver, and the gathering when the plan asks anything,
+    ///    on the current runtime.
     ///
     /// Returns the link and the host candidates to send to the peer (each
-    /// on the socket's port).
+    /// on the socket's port); there may be none when the gathering is to
+    /// find some.
     ///
     /// # Errors
     ///
@@ -353,13 +385,33 @@ impl DirectLink {
             .map_err(|_| DirectFail::NoAddresses)?;
         let sources = env.route_sources();
         let vpn = local::vpn_mode(&addrs, &sources);
-        if local::select_host_candidates(&addrs, &sources, 0, params.scope, vpn).is_empty() {
+        let hosts: Vec<std::net::SocketAddr> =
+            local::select_host_candidates(&addrs, &sources, 0, params.scope, vpn)
+                .into_iter()
+                .map(|c| c.addr)
+                .collect();
+        // Asked only when something may be gathered, so that a same-site
+        // link without an address calls nothing beyond its interface read.
+        let asks =
+            params.scope == Scope::Internet && (params.gather.use_stun || params.gather.map.any());
+        let admit_early = asks.then(|| env.admit_loopback());
+        let plan = gather::plan(
+            &params.gather,
+            params.scope,
+            &addrs,
+            &sources,
+            vpn,
+            &hosts,
+            admit_early.unwrap_or(false),
+        );
+        if hosts.is_empty() && !plan.gathers() {
             return Err(DirectFail::NoAddresses);
         }
 
         let bound = env
             .bind(params.direct_port)
             .map_err(|_| DirectFail::Socket)?;
+        let bound_at = tokio::time::Instant::now();
         let port = bound
             .inner
             .local_addr()
@@ -371,9 +423,10 @@ impl DirectLink {
                 .into_iter()
                 .filter(|c| dual_stack || c.addr.is_ipv4())
                 .collect();
-        if offered.is_empty() {
+        if offered.is_empty() && !plan.gathers() {
             return Err(DirectFail::NoAddresses);
         }
+        let admit_loopback = admit_early.unwrap_or_else(|| env.admit_loopback());
         let filter = local::remote_filter(
             params.scope,
             &addrs,
@@ -381,12 +434,12 @@ impl DirectLink {
             &offered,
             dual_stack,
             vpn,
-            env.admit_loopback(),
+            admit_loopback,
         );
         let v6 = v6_sources(&offered);
 
         let gate = ProbeGate::new();
-        let (socket, tees) = PunchSocket::new(bound, gate.clone());
+        let (socket, Tees { probes, stun }) = PunchSocket::new(bound, gate.clone());
         socket.set_sources(v6);
         let (server, client) = match punch {
             PunchRole::Controlled => (
@@ -410,8 +463,19 @@ impl DirectLink {
 
         let key = ProbeKey::derive(&params.session_token);
         let mut checklist = Checklist::new(punch, params.me, key, filter.clone(), gate.clone(), v6);
-        // Phase A gathers nothing beyond the host candidates (design §7.5).
-        checklist.local_done();
+        // A global IPv4 host candidate is a public address of this side
+        // (design §7.6); the gathering adds the mapped and the
+        // server-reflexive ones as they land.
+        let publics: Vec<IpAddr> = offered
+            .iter()
+            .map(|c| canon_ip(c.addr.ip()))
+            .filter(|ip| ip.is_ipv4() && crate::addr::class(*ip) == AddrClass::Global)
+            .collect();
+        checklist.set_local_public(&publics);
+        let gathers = plan.gathers();
+        if !gathers {
+            checklist.local_done();
+        }
 
         let shared = Arc::new(Shared::default());
         shared.update(|s| {
@@ -425,9 +489,30 @@ impl DirectLink {
         });
         let (commands_tx, commands) = mpsc::channel(COMMAND_QUEUE);
         let (events_tx, events) = mpsc::channel(4);
+        // At most two gathered batches and `Done`.
         let (local_tx, local) = mpsc::channel(4);
-        // Cannot fail: a fresh channel with room.
-        let _ = local_tx.try_send(LocalBatch::Done);
+        let (gathered_tx, gathered_rx) = mpsc::channel(4);
+        let (gatherer, unread_stun) = if gathers {
+            let gatherer = Gatherer {
+                filter: local::stun_filter(&addrs, &sources, admit_loopback),
+                plan,
+                env: Arc::clone(&env),
+                socket: Arc::clone(&socket),
+                replies: stun,
+                hosts: offered.iter().map(|c| c.addr).collect(),
+                port,
+                bound: bound_at,
+                admit_loopback,
+                out: local_tx,
+                driver: gathered_tx,
+                stats: Arc::clone(&shared.gather),
+            };
+            (Some(gatherer), None)
+        } else {
+            // Cannot fail: a fresh channel with room.
+            let _ = local_tx.try_send(LocalBatch::Done);
+            (None, Some(stun))
+        };
 
         let driver = Driver {
             checklist,
@@ -440,16 +525,20 @@ impl DirectLink {
             client,
             commands,
             events: events_tx,
-            _local: local_tx,
-            tees,
+            gathered: gatherer.is_some().then_some(gathered_rx),
+            publics,
+            probes,
+            _stun: unread_stun,
             shared: Arc::clone(&shared),
             floor: None,
         };
         let driver = runtime.spawn(driver.run()).abort_handle();
+        let gatherer = gatherer.map(|g| runtime.spawn(g.run()).abort_handle());
         let inner = Arc::new(LinkInner {
             endpoint,
             socket,
             driver,
+            gatherer,
             shared,
             _runtime: runtime,
         });
@@ -859,7 +948,8 @@ type Handshake = BoxFuture<'static, Result<quinn::Connection, QuicError>>;
 enum Woke {
     Command(Command),
     Connected(Result<quinn::Connection, QuicError>),
-    Probe(crate::udp::TeedProbe),
+    Probe(TeedProbe),
+    Gathered(Gathered),
     Timer,
 }
 
@@ -878,9 +968,14 @@ struct Driver {
     client: Option<quinn::ClientConfig>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<LinkEvent>,
-    /// Phase B sends the mapped and server-reflexive batches here.
-    _local: mpsc::Sender<LocalBatch>,
-    tees: Tees,
+    /// The gathering's public addresses and its end, while it runs.
+    gathered: Option<mpsc::Receiver<Gathered>>,
+    /// This side's public IPv4 addresses known so far (design §7.6).
+    publics: Vec<IpAddr>,
+    /// The session socket's probe tee.
+    probes: mpsc::Receiver<TeedProbe>,
+    /// The STUN tee of a link that gathers nothing, held unread.
+    _stun: Option<mpsc::Receiver<TeedStun>>,
     shared: Arc<Shared>,
     /// The earliest next timer turn after one that found nothing due.
     floor: Option<Instant>,
@@ -901,6 +996,14 @@ async fn sleep_until(at: Option<Instant>) {
 async fn handshake(pending: &mut Option<Handshake>) -> Result<quinn::Connection, QuicError> {
     match pending {
         Some(handshake) => handshake.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The gathering's next word, while it runs; `None` once it ended.
+async fn gathered(rx: &mut Option<mpsc::Receiver<Gathered>>) -> Option<Gathered> {
+    match rx {
+        Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -954,10 +1057,17 @@ impl Driver {
                 },
                 done = handshake(&mut accept) => Woke::Connected(done),
                 done = handshake(&mut dial) => Woke::Connected(done),
-                probe = self.tees.probes.recv(), if probes_open => match probe {
+                probe = self.probes.recv(), if probes_open => match probe {
                     Some(probe) => Woke::Probe(probe),
                     None => {
                         probes_open = false;
+                        continue;
+                    }
+                },
+                word = gathered(&mut self.gathered) => match word {
+                    Some(word) => Woke::Gathered(word),
+                    None => {
+                        self.gathered = None;
                         continue;
                     }
                 },
@@ -981,6 +1091,15 @@ impl Driver {
                             .on_datagram(probe.from, probe.dst_ip, &probe.bytes, at);
                     actions.extend(self.checklist.poll(at));
                     actions
+                }
+                Woke::Gathered(Gathered::Public(ip)) => {
+                    self.publics.push(ip);
+                    self.checklist.set_local_public(&self.publics);
+                    self.checklist.poll(at)
+                }
+                Woke::Gathered(Gathered::Done) => {
+                    self.checklist.local_done();
+                    self.checklist.poll(at)
                 }
                 Woke::Timer => {
                     let actions = self.checklist.poll(at);

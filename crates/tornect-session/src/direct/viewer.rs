@@ -434,13 +434,15 @@ impl ViewerDirect {
         S: AsyncRead + AsyncWrite + Unpin + Send,
         F: Future<Output = ()>,
     {
+        let options = self.settings.get();
         let params = DirectParams {
             me: TornectRole::Viewer,
             identity: Arc::clone(&self.identity),
             peer_pk: session.host_device_pk(),
             session_token: Zeroizing::new(*at.token.bytes()),
-            direct_port: self.settings.get().direct_port,
+            direct_port: options.direct_port,
             scope: at.scope,
+            gather: options.gather(TornectRole::Viewer),
         };
         let Some(started) = race(stop, DirectLink::start(params, Arc::clone(&self.env))).await
         else {

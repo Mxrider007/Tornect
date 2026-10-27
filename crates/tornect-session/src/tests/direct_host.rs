@@ -225,6 +225,7 @@ impl Fixture {
             session_token: Zeroizing::new(*self.session.session_token().bytes()),
             direct_port: None,
             scope: Scope::SameSite,
+            gather: tornect_net::GatherConfig::default(),
         };
         DirectLink::start(params, Arc::new(machine.clone()))
             .await

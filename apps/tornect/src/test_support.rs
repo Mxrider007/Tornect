@@ -162,6 +162,7 @@ pub(crate) async fn bind_closed_with_reason(reason: &'static [u8]) -> tornect_se
         session_token: zeroize::Zeroizing::new(*token.bytes()),
         direct_port: None,
         scope: Scope::SameSite,
+        gather: tornect_net::GatherConfig::default(),
     };
     let (mut viewer, viewer_offered) =
         DirectLink::start(params(TornectRole::Viewer, 0x22, 0x44), viewer_env)

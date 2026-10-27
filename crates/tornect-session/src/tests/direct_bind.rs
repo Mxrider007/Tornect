@@ -1079,6 +1079,7 @@ async fn links_on_a_lan(token: &[u8; 32], viewer: u8, host: u8, pinned: u8) -> L
         session_token: Zeroizing::new(*token),
         direct_port: None,
         scope: Scope::SameSite,
+        gather: tornect_net::GatherConfig::default(),
     };
     let (mut viewer_link, viewer_offered) =
         DirectLink::start(params(TornectRole::Viewer, viewer, host), viewer_env)

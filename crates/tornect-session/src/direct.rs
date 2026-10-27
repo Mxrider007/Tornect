@@ -9,13 +9,14 @@
 //! stream of the connection is served through ([`SecondStream`]), and the
 //! viewer's one fallback after its direct `Bind` ([`after_bind_close`]).
 
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tornect_core::config::Network;
-use tornect_net::{BoxFuture, Established, QuicStream};
+use tornect_net::{BoxFuture, Established, GatherConfig, MapProtocols, QuicStream, TornectRole};
 use zeroize::Zeroizing;
 
 mod decide;
@@ -67,9 +68,8 @@ const _: () = assert!(HOST_DIRECT_LINGER.as_secs() >= PUNCH_TIMEOUT_MAX_MS as u6
 const _: () = assert!(tornect_core::config::MIN_DIRECT_PORT == tornect_net::addr::MIN_REMOTE_PORT);
 
 /// What the direct path is run with, from `[network]` (the direct design
-/// §8.5 `DirectOptions`). Phase B adds the STUN partitions and the router
-/// protocols.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// §8.5 `DirectOptions`).
+#[derive(Clone, PartialEq, Eq)]
 pub struct DirectOptions {
     /// `network.direct_port`: the session socket's port when it is free.
     pub direct_port: Option<u16>,
@@ -77,6 +77,29 @@ pub struct DirectOptions {
     /// `network.punch_timeout_ms`, kept within [`PUNCH_TIMEOUT_MIN_MS`] and
     /// [`PUNCH_TIMEOUT_MAX_MS`].
     pub punch_timeout: Duration,
+    /// The viewer's part of `network.stun_servers`
+    /// ([`tornect_net::partition`], decision M1-81).
+    pub stun_partition_viewer: Arc<[String]>,
+    /// The host's part: no operator is in both.
+    pub stun_partition_host: Arc<[String]>,
+    /// `network.enable_stun`.
+    pub enable_stun: bool,
+    /// `network.upnp`, `network.nat_pmp` and `network.pcp`.
+    pub map: MapProtocols,
+}
+
+impl fmt::Debug for DirectOptions {
+    /// The servers' count only: the list is the user's.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectOptions")
+            .field("direct_port", &self.direct_port.is_some())
+            .field("punch_timeout", &self.punch_timeout)
+            .field("stun_servers_viewer", &self.stun_partition_viewer.len())
+            .field("stun_servers_host", &self.stun_partition_host.len())
+            .field("enable_stun", &self.enable_stun)
+            .field("map", &self.map)
+            .finish()
+    }
 }
 
 impl Default for DirectOptions {
@@ -96,6 +119,30 @@ impl DirectOptions {
         Self {
             direct_port: net.direct_port,
             punch_timeout: Duration::from_millis(u64::from(punch_ms)),
+            stun_partition_viewer: tornect_net::partition(&net.stun_servers, TornectRole::Viewer)
+                .into(),
+            stun_partition_host: tornect_net::partition(&net.stun_servers, TornectRole::Host)
+                .into(),
+            enable_stun: net.enable_stun,
+            map: MapProtocols {
+                upnp: net.upnp,
+                nat_pmp: net.nat_pmp,
+                pcp: net.pcp,
+            },
+        }
+    }
+
+    /// What `role`'s side may gather in internet scope: its part of the
+    /// STUN list, `enable_stun` and the router protocols.
+    #[must_use]
+    pub fn gather(&self, role: TornectRole) -> GatherConfig {
+        GatherConfig {
+            stun_partition: match role {
+                TornectRole::Viewer => Arc::clone(&self.stun_partition_viewer),
+                TornectRole::Host => Arc::clone(&self.stun_partition_host),
+            },
+            use_stun: self.enable_stun,
+            map: self.map,
         }
     }
 }
@@ -334,6 +381,62 @@ mod tests {
         settings.set_from(&net(2500));
         assert_eq!(shared.get().punch_timeout, Duration::from_millis(2500));
         assert_eq!(shared.get().direct_port, Some(4100));
+    }
+
+    /// Design `direct` §5.3, §7.3, §7.4 (decision M1-81): each role gathers
+    /// with its own part of `stun_servers`, no operator in both, with
+    /// `enable_stun` and the router protocols as `[network]` says; `Debug`
+    /// counts the servers and never names one.
+    #[test]
+    fn each_role_gathers_with_its_part_of_the_stun_list_and_the_router_switches() {
+        let net = Network {
+            stun_servers: vec![
+                "stun.cloudflare.com:3478".to_owned(),
+                "stun.l.google.com:19302".to_owned(),
+                "stun1.l.google.com:19302".to_owned(),
+                "stun.example.org:3478".to_owned(),
+            ],
+            enable_stun: false,
+            upnp: false,
+            nat_pmp: true,
+            pcp: true,
+            ..Network::default()
+        };
+        let options = DirectOptions::from_network(&net);
+        let viewer = options.gather(TornectRole::Viewer);
+        let host = options.gather(TornectRole::Host);
+        assert_eq!(
+            *viewer.stun_partition,
+            *tornect_net::partition(&net.stun_servers, TornectRole::Viewer)
+        );
+        assert_eq!(
+            *host.stun_partition,
+            *tornect_net::partition(&net.stun_servers, TornectRole::Host)
+        );
+        assert!(!viewer.stun_partition.is_empty() && !host.stun_partition.is_empty());
+        let google = |list: &[String]| list.iter().any(|s| s.contains(".l.google.com"));
+        assert!(
+            google(&viewer.stun_partition) != google(&host.stun_partition),
+            "one operator's servers stay on one side"
+        );
+        for side in [&viewer, &host] {
+            assert!(!side.use_stun);
+            assert_eq!(
+                side.map,
+                MapProtocols {
+                    upnp: false,
+                    nat_pmp: true,
+                    pcp: true
+                }
+            );
+        }
+        let defaults = DirectOptions::default().gather(TornectRole::Viewer);
+        assert_eq!(defaults.use_stun, Network::default().enable_stun);
+        let shown = format!("{options:?}");
+        assert!(
+            !shown.contains("stun.") && !shown.contains("3478"),
+            "{shown}"
+        );
     }
 
     /// Decision M1-79: only a TLS-alert close with no host stream byte falls

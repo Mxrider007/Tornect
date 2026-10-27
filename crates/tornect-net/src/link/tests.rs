@@ -31,6 +31,7 @@ fn params(me: TornectRole, mine: u8, peer: u8) -> DirectParams {
         session_token: Zeroizing::new(TOKEN),
         direct_port: None,
         scope: Scope::SameSite,
+        gather: GatherConfig::default(),
     }
 }
 

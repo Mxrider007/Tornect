@@ -21,6 +21,8 @@ use crate::udp::{BoundUdp, ProbeGate, STUN_COOKIE, Tees};
 use crate::{NetError, TornectRole};
 
 mod fake_stun;
+mod gathering;
+mod plan;
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)

@@ -1,14 +1,29 @@
 //! Gathering the candidates beyond this computer's own addresses (design
-//! `direct` §7.3, §5.3; decisions M1-81, M1-83, M1-86): the STUN client
-//! that learns the server-reflexive candidate, and [`StunDns`], the cache
-//! of the STUN servers' addresses it reads.
+//! `direct` §7.3–§7.5, §5.3; decisions M1-81, M1-83, M1-86): the plan of a
+//! session's gathering, the task that runs it beside the link, the STUN
+//! client that learns the server-reflexive candidate, and [`StunDns`], the
+//! cache of the STUN servers' addresses it reads.
 //!
-//! Step B3 holds the client ([`ask_stun`]), the cache and its background
-//! refresh, and [`stun_base`], the part of "when STUN runs" that is this
-//! computer's. The plan of a session's gathering (scope, `enable_stun`, the
-//! router mapping and its head start, the trickled batches) is step B6's,
-//! and the app starts the refresh when the internet direct path is on
-//! (steps B11, B12); until then only tests call the client.
+//! - **The plan** ([`plan`]): nothing beyond the host candidates in
+//!   same-site scope. In internet scope, the router is asked for one port
+//!   ([`MapTarget`]) when a protocol is on, outside VPN mode, without a
+//!   global IPv4 host candidate, from a private or shared (carrier-grade
+//!   NAT) IPv4 route source toward that interface's gateway; a STUN server
+//!   when `enable_stun` is on, this side's part of the list is not empty
+//!   and [`stun_base`] allows it. With both, STUN waits for the router,
+//!   [`MAPPING_HEAD_START`] at most: a mapping with a global address by
+//!   then skips it, and a router that answered without one starts it at
+//!   once.
+//! - **The task** (started by [`DirectLink::start`](crate::DirectLink)
+//!   when the plan asks anything): the mapped candidate as it lands, then
+//!   the server-reflexive one, each its own batch and only when it is new,
+//!   then `Done` once both finished or were skipped, or at
+//!   [`GATHER_BUDGET`] from the bind. It then holds the mapping and renews
+//!   it ([`Mapping::keep_renewed`]) until the link closes, which drops it
+//!   and so releases it on the link's runtime.
+//!
+//! The app starts the names' refresh when the internet direct path is on
+//! (steps B11, B12); until then only tests ask a server.
 //!
 //! - **Who is asked** (§5.3, decision M1-81): the servers of this side's
 //!   part of the list ([`stun::partition`]), one at a time. The first,
@@ -48,6 +63,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -56,9 +72,14 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, Timeout};
 
 use crate::BoxFuture;
-use crate::addr::{AddrClass, Candidate, CandidateKind, StunFilter, canon, class, class_v4};
+use crate::addr::{
+    AddrClass, Candidate, CandidateKind, RedactedIp, Scope, StunFilter, canon, canon_ip, class,
+    class_v4,
+};
 use crate::env::NetEnv;
-use crate::local::{IfaceAddr, RouteSources, global_families};
+use crate::link::LocalBatch;
+use crate::local::{IfaceAddr, RouteSources, global_families, owner};
+use crate::mapping::{MAP_LEASE, MapFail, MapProtocols, MapRequest, MapVia, Mapping};
 use crate::stun::{self, StunReply, StunTxid, TXID_LEN, binding_request, parse_response};
 use crate::udp::{PunchSocket, RawSend, TeedStun};
 
@@ -293,7 +314,7 @@ fn random_u64() -> u64 {
 ///
 /// The rest of the rule (internet scope, `enable_stun`, a non-empty part of
 /// the list, no global router mapping by the head start) is the gathering
-/// plan's (step B6), which in VPN mode also passes this address as
+/// [`plan`]'s and its task's, which in VPN mode also pass this address as
 /// [`StunAsk::tunnel`], so that each server's own route is checked too.
 #[must_use]
 pub fn stun_base(
@@ -309,11 +330,17 @@ pub fn stun_base(
         AddrClass::Loopback => admit_loopback,
         _ => false,
     };
-    let public_host = hosts.iter().any(|h| {
+    (usable && !public_v4_host(hosts) && (!vpn || global_families(addrs, sources, vpn).0))
+        .then_some(base)
+}
+
+/// Whether one of `hosts` is a global IPv4 address: such a computer is
+/// reachable at it, and needs neither a STUN server nor the router.
+fn public_v4_host(hosts: &[SocketAddr]) -> bool {
+    hosts.iter().any(|h| {
         let h = canon(*h);
         h.is_ipv4() && class(h.ip()) == AddrClass::Global
-    });
-    (usable && !public_host && (!vpn || global_families(addrs, sources, vpn).0)).then_some(base)
+    })
 }
 
 /// A draw from the OS's random source for [`StunAsk::draw`]; 0 when it
@@ -684,6 +711,471 @@ pub async fn ask_stun(
         }
     }
     client.report()
+}
+
+// ---------------------------------------------------------------------------
+// The plan of one session's gathering and the task that runs it.
+
+/// How long STUN waits for the router when both are planned (design §4
+/// "Gathering", §5.3): a mapping with a global address by then makes the
+/// STUN request needless, and no server learns of the session.
+pub const MAPPING_HEAD_START: Duration = Duration::from_millis(250);
+
+/// What one side may gather beyond its host candidates (design §8.3
+/// `GatherConfig`): the user's `[network]` settings, for this side's role.
+/// The default asks nobody.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct GatherConfig {
+    /// This side's part of `network.stun_servers` ([`stun::partition`]),
+    /// `host:port` entries.
+    pub stun_partition: Arc<[String]>,
+    /// `network.enable_stun`.
+    pub use_stun: bool,
+    /// The router protocols `network.upnp`, `network.nat_pmp` and
+    /// `network.pcp` allow.
+    pub map: MapProtocols,
+}
+
+impl fmt::Debug for GatherConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatherConfig")
+            .field("stun_servers", &self.stun_partition.len())
+            .field("use_stun", &self.use_stun)
+            .field("map", &self.map)
+            .finish()
+    }
+}
+
+/// The STUN part of a [`GatherPlan`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct StunPlan {
+    /// The servers that may be asked: this side's part of the list.
+    pub servers: Arc<[String]>,
+    /// The IPv4 address the requests leave from ([`stun_base`]); in VPN
+    /// mode the tunnel's, which the client passes as [`StunAsk::tunnel`].
+    pub base: Ipv4Addr,
+}
+
+impl fmt::Debug for StunPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StunPlan")
+            .field("servers", &self.servers.len())
+            .field("base", &RedactedIp(IpAddr::V4(self.base)))
+            .finish()
+    }
+}
+
+/// The router part of a [`GatherPlan`] (design §7.4 "Preconditions").
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MapTarget {
+    /// The IPv4 gateway of the route-source interface.
+    pub gateway: Ipv4Addr,
+    /// The IPv4 route source: this computer's address toward the gateway.
+    pub client: Ipv4Addr,
+    /// The protocols the settings allow.
+    pub protocols: MapProtocols,
+}
+
+impl fmt::Debug for MapTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MapTarget")
+            .field("gateway", &RedactedIp(IpAddr::V4(self.gateway)))
+            .field("client", &RedactedIp(IpAddr::V4(self.client)))
+            .field("protocols", &self.protocols)
+            .finish()
+    }
+}
+
+/// What one side gathers in a session beyond its host candidates (design
+/// §8.3 `GatherPlan`, §7.3, §7.4), as [`plan`] decides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatherPlan {
+    /// The session's scope.
+    pub scope: Scope,
+    /// This computer is in VPN mode ([`crate::local::vpn_mode`]).
+    pub vpn: bool,
+    /// The STUN client runs (unless the router answers first).
+    pub stun: Option<StunPlan>,
+    /// The router is asked for a port.
+    pub map: Option<MapTarget>,
+    /// How long STUN waits for the router: [`MAPPING_HEAD_START`] when both
+    /// are planned, otherwise none.
+    pub head_start: Duration,
+    /// Gathering ends this long after the bind at the latest
+    /// ([`GATHER_BUDGET`]).
+    pub budget: Duration,
+}
+
+impl GatherPlan {
+    /// Whether anything beyond the host candidates is gathered. Without,
+    /// gathering is over at the bind and nothing is asked of the
+    /// environment beyond the interfaces and the socket.
+    #[must_use]
+    pub fn gathers(&self) -> bool {
+        self.stun.is_some() || self.map.is_some()
+    }
+}
+
+/// The plan of one side's gathering (design §7.3 "When it runs", §7.4
+/// "Preconditions", §5.3 "STUN is skipped entirely when"): `config` is the
+/// side's settings, `addrs` and `sources` this computer's addresses and
+/// route sources, `vpn` its VPN mode, `hosts` its host candidates (any
+/// port), `admit_loopback` true only in test environments (a loopback
+/// route source, gateway and STUN base then count as private).
+///
+/// - Same-site scope gathers nothing.
+/// - The router is asked when a protocol is on, outside VPN mode, without
+///   a global IPv4 host candidate, from an IPv4 route source of class
+///   private or shared (`100.64/10`), toward the IPv4 gateway of that
+///   source's interface ([`IfaceAddr::gateway_v4`]) of the same classes.
+/// - STUN runs when `use_stun` is on, the part of the list is not empty,
+///   and [`stun_base`] gives a base (no global IPv4 host candidate; in VPN
+///   mode only with the IPv4 route through the tunnel).
+#[must_use]
+pub fn plan(
+    config: &GatherConfig,
+    scope: Scope,
+    addrs: &[IfaceAddr],
+    sources: &RouteSources,
+    vpn: bool,
+    hosts: &[SocketAddr],
+    admit_loopback: bool,
+) -> GatherPlan {
+    let mut plan = GatherPlan {
+        scope,
+        vpn,
+        stun: None,
+        map: None,
+        head_start: Duration::ZERO,
+        budget: GATHER_BUDGET,
+    };
+    if scope != Scope::Internet {
+        return plan;
+    }
+    if config.use_stun && !config.stun_partition.is_empty() {
+        plan.stun = stun_base(addrs, sources, vpn, hosts, admit_loopback).map(|base| StunPlan {
+            servers: Arc::clone(&config.stun_partition),
+            base,
+        });
+    }
+    if config.map.any() && !vpn && !public_v4_host(hosts) {
+        plan.map = map_target(addrs, sources, admit_loopback).map(|(gateway, client)| MapTarget {
+            gateway,
+            client,
+            protocols: config.map,
+        });
+    }
+    if plan.stun.is_some() && plan.map.is_some() {
+        plan.head_start = MAPPING_HEAD_START;
+    }
+    plan
+}
+
+/// The gateway and the client of a mapping: the IPv4 route source and its
+/// interface's gateway, both private or shared (design §7.4: PCP is made
+/// for carrier NATs, and a global gateway is no home router).
+fn map_target(
+    addrs: &[IfaceAddr],
+    sources: &RouteSources,
+    admit_loopback: bool,
+) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    let fits = |ip: Ipv4Addr| match class_v4(ip) {
+        AddrClass::Private | AddrClass::SharedCgnat => true,
+        AddrClass::Loopback => admit_loopback,
+        _ => false,
+    };
+    let client = sources.v4.filter(|c| fits(*c))?;
+    let gateway = owner(addrs, IpAddr::V4(client))?
+        .gateway_v4
+        .filter(|g| fits(*g))?;
+    Some((gateway, client))
+}
+
+/// Whether `external`, a router's mapped address, may be offered: global
+/// IPv4 with a port (loopback too in test environments). [`RealMapper`]
+/// refuses any other; this checks every mapper.
+///
+/// [`RealMapper`]: crate::RealMapper
+fn offerable_mapping(external: SocketAddr, admit_loopback: bool) -> bool {
+    let ip = canon_ip(external.ip());
+    external.port() != 0
+        && ip.is_ipv4()
+        && match class(ip) {
+            AddrClass::Global => true,
+            AddrClass::Loopback => admit_loopback,
+            _ => false,
+        }
+}
+
+/// The gathering's counters (design §5.5: counts and kinds only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatherStats {
+    /// The plan asks a STUN server.
+    pub stun_planned: bool,
+    /// The plan asks the router.
+    pub map_planned: bool,
+    /// The router granted a mapping that was offered, by this protocol.
+    pub mapped: Option<MapVia>,
+    /// The router gave no mapping, or one that could not be offered
+    /// ([`MapFail::NotGlobal`]).
+    pub map_failed: Option<MapFail>,
+    /// The STUN client ran.
+    pub stun_ran: bool,
+    /// STUN was skipped: the router gave a global address within the head
+    /// start.
+    pub stun_skipped: bool,
+    /// The STUN client's counts.
+    pub stun: StunStats,
+    /// A server-reflexive candidate was learned.
+    pub srflx: bool,
+    /// A server saw this side at a host candidate (no NAT).
+    pub no_nat: bool,
+    /// Batches of gathered candidates handed to the owner.
+    pub batches: u8,
+    /// A gathered candidate equal to one already offered, not offered
+    /// again.
+    pub duplicates: u8,
+    /// Gathering was cut at the budget with the router or STUN still
+    /// running.
+    pub cut_at_budget: bool,
+    /// Gathering is over: the owner has been told.
+    pub done: bool,
+}
+
+/// What the gathering tells the link's checklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gathered {
+    /// A public IPv4 address of this side (mapped or server-reflexive),
+    /// for the ranks of design §7.6.
+    Public(IpAddr),
+    /// Gathering is over.
+    Done,
+}
+
+/// The gathering of one link (see the module documentation), spawned by
+/// [`DirectLink::start`](crate::DirectLink) on the link's runtime.
+pub(crate) struct Gatherer {
+    /// What to gather; it gathers something ([`GatherPlan::gathers`]).
+    pub plan: GatherPlan,
+    pub env: Arc<dyn NetEnv>,
+    pub socket: Arc<PunchSocket>,
+    /// The session socket's STUN tee.
+    pub replies: mpsc::Receiver<TeedStun>,
+    /// The filter STUN servers' addresses pass.
+    pub filter: StunFilter,
+    /// The host candidates offered (at the socket's port).
+    pub hosts: Vec<SocketAddr>,
+    /// The session socket's port.
+    pub port: u16,
+    /// When the session socket was bound: the budget runs from here.
+    pub bound: Instant,
+    pub admit_loopback: bool,
+    /// The owner's batches ([`DirectLink::next_local`](crate::DirectLink::next_local)).
+    pub out: mpsc::Sender<LocalBatch>,
+    /// The link's driver.
+    pub driver: mpsc::Sender<Gathered>,
+    pub stats: Arc<Mutex<GatherStats>>,
+}
+
+/// Where STUN stands in a gathering.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StunStep {
+    /// Due at this time (the head start).
+    Due(Instant),
+    /// Asking.
+    Running,
+    /// Done, skipped or not planned.
+    Over,
+}
+
+/// The router's answer in flight, if any.
+async fn mapped(
+    pending: &mut Option<BoxFuture<'static, Result<Mapping, MapFail>>>,
+) -> Result<Mapping, MapFail> {
+    match pending {
+        Some(pending) => pending.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn due(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Gatherer {
+    /// Gathers, says `Done` to the owner and the driver, then renews the
+    /// mapping (if any) until the link aborts this task, which drops the
+    /// mapping and so releases it.
+    pub(crate) async fn run(self) {
+        let out = self.out.clone();
+        let driver = self.driver.clone();
+        let stats = Arc::clone(&self.stats);
+        let mapping = self.gather().await;
+        lock(&stats).done = true;
+        let _ = out.try_send(LocalBatch::Done);
+        let _ = driver.try_send(Gathered::Done);
+        drop((out, driver));
+        if let Some(mut mapping) = mapping {
+            let _ = mapping.keep_renewed().await;
+        }
+    }
+
+    /// The router and STUN, each batch handed on as it lands, until both
+    /// are over or the budget ends; returns the mapping offered.
+    async fn gather(self) -> Option<Mapping> {
+        let Self {
+            plan,
+            env,
+            socket,
+            mut replies,
+            filter,
+            hosts,
+            port,
+            bound,
+            admit_loopback,
+            out,
+            driver,
+            stats,
+        } = self;
+        let note = |change: &dyn Fn(&mut GatherStats)| change(&mut lock(&stats));
+        note(&|s| {
+            s.stun_planned = plan.stun.is_some();
+            s.map_planned = plan.map.is_some();
+        });
+        let deadline = bound + plan.budget;
+        let mut offered: Vec<SocketAddr> = hosts.iter().map(|h| canon(*h)).collect();
+        let mut offer = |candidate: Candidate| {
+            let addr = canon(candidate.addr);
+            if offered.contains(&addr) {
+                note(&|s| s.duplicates = s.duplicates.saturating_add(1));
+                return;
+            }
+            offered.push(addr);
+            note(&|s| s.batches = s.batches.saturating_add(1));
+            // Cannot be full: at most two batches and `Done` on a queue of
+            // four.
+            let _ = out.try_send(LocalBatch::More(vec![Candidate { addr, ..candidate }]));
+            let _ = driver.try_send(Gathered::Public(addr.ip()));
+        };
+
+        let mut router = match (plan.map, NonZeroU16::new(port)) {
+            (Some(target), Some(internal_port)) => Some(env.mapper().map(MapRequest {
+                gateway: target.gateway,
+                client: target.client,
+                internal_port,
+                lease: MAP_LEASE,
+                protocols: target.protocols,
+                deadline: deadline.into_std(),
+            })),
+            _ => None,
+        };
+        let servers = plan
+            .stun
+            .as_ref()
+            .map(|s| Arc::clone(&s.servers))
+            .unwrap_or_default();
+        let ask = StunAsk {
+            servers: &servers,
+            filter: &filter,
+            hosts: &hosts,
+            deadline: deadline.into_std(),
+            draw: draw(),
+            tunnel: plan.stun.as_ref().filter(|_| plan.vpn).map(|s| s.base),
+        };
+        let client = ask_stun(&socket, &mut replies, &*env, &ask);
+        tokio::pin!(client);
+        let mut stun = if plan.stun.is_some() {
+            StunStep::Due(bound + plan.head_start)
+        } else {
+            StunStep::Over
+        };
+        let mut mapping: Option<Mapping> = None;
+
+        enum Woke {
+            Router(Result<Mapping, MapFail>),
+            StunDue,
+            Stun(StunReport),
+            Budget,
+        }
+        while router.is_some() || stun != StunStep::Over {
+            let due_at = match stun {
+                StunStep::Due(at) => Some(at),
+                _ => None,
+            };
+            let woke = tokio::select! {
+                biased;
+                answer = mapped(&mut router) => Woke::Router(answer),
+                () = due(due_at) => Woke::StunDue,
+                report = &mut client, if stun == StunStep::Running => Woke::Stun(report),
+                () = tokio::time::sleep_until(deadline) => Woke::Budget,
+            };
+            match woke {
+                Woke::Router(answer) => {
+                    router = None;
+                    match answer {
+                        Ok(granted)
+                            if offerable_mapping(
+                                SocketAddr::V4(granted.external),
+                                admit_loopback,
+                            ) =>
+                        {
+                            let via = granted.via;
+                            note(&|s| s.mapped = Some(via));
+                            offer(Candidate {
+                                kind: CandidateKind::Mapped,
+                                addr: SocketAddr::V4(granted.external),
+                            });
+                            mapping = Some(granted);
+                        }
+                        // Dropped, so released.
+                        Ok(_) => note(&|s| s.map_failed = Some(MapFail::NotGlobal)),
+                        Err(fail) => note(&|s| s.map_failed = Some(fail)),
+                    }
+                    // The router answered within the head start: a global
+                    // mapping skips STUN, anything else starts it now
+                    // rather than at the end of a wait for nothing.
+                    if matches!(stun, StunStep::Due(_)) {
+                        stun = if mapping.is_some() {
+                            note(&|s| s.stun_skipped = true);
+                            StunStep::Over
+                        } else {
+                            note(&|s| s.stun_ran = true);
+                            StunStep::Running
+                        };
+                    }
+                }
+                Woke::StunDue => {
+                    if mapping.is_some() {
+                        note(&|s| s.stun_skipped = true);
+                        stun = StunStep::Over;
+                    } else {
+                        note(&|s| s.stun_ran = true);
+                        stun = StunStep::Running;
+                    }
+                }
+                Woke::Stun(report) => {
+                    stun = StunStep::Over;
+                    note(&|s| s.stun = report.stats);
+                    match report.outcome {
+                        StunOutcome::Srflx(candidate) => {
+                            note(&|s| s.srflx = true);
+                            offer(candidate);
+                        }
+                        StunOutcome::NoNat => note(&|s| s.no_nat = true),
+                        StunOutcome::Nothing => {}
+                    }
+                }
+                Woke::Budget => {
+                    note(&|s| s.cut_at_budget = true);
+                    break;
+                }
+            }
+        }
+        mapping
+    }
 }
 
 #[cfg(test)]

@@ -501,7 +501,7 @@ pub async fn read_interfaces() -> Result<Vec<IfaceAddr>, NetError> {
 }
 
 /// The address of `addrs` that is `ip`, if any.
-fn owner(addrs: &[IfaceAddr], ip: IpAddr) -> Option<&IfaceAddr> {
+pub(crate) fn owner(addrs: &[IfaceAddr], ip: IpAddr) -> Option<&IfaceAddr> {
     addrs.iter().find(|a| canon_ip(a.ip) == canon_ip(ip))
 }
 

@@ -529,13 +529,15 @@ impl Task {
             Scope::SameSite
         };
         let scope = own.min(viewer_scope);
+        let options = self.settings.get();
         let params = DirectParams {
             me: TornectRole::Host,
             identity: Arc::clone(&self.identity),
             peer_pk: *self.device.public_key_bytes(),
             session_token: self.token.clone(),
-            direct_port: self.settings.get().direct_port,
+            direct_port: options.direct_port,
             scope,
+            gather: options.gather(TornectRole::Host),
         };
         let started = tokio::select! {
             biased;

@@ -5,8 +5,8 @@
 //! device keys pinned, the authenticated punch probes and the checklist
 //! that validates paths with them, and the direct link that wires them
 //! together; the STUN codec and client with the cache of the servers'
-//! names, and router port mapping with its ledger (Phase B); then (in the
-//! following steps) the internet gathering plan.
+//! names, router port mapping with its ledger, and the plan and task of a
+//! session's internet gathering (Phase B).
 //!
 //! Nothing outside this crate may touch sockets or quinn. It never names
 //! `tornect-signal`: the wire forms of candidates are converted in
@@ -41,7 +41,8 @@ pub use addr::{
 pub use checklist::{Action, Checklist, PunchRole, PunchStats, Rank};
 pub use env::{NetEnv, RealNet};
 pub use gather::{
-    GATHER_BUDGET, StunAsk, StunDns, StunOutcome, StunReport, StunStats, ask_stun, stun_base,
+    GATHER_BUDGET, GatherConfig, GatherPlan, GatherStats, MAPPING_HEAD_START, MapTarget, StunAsk,
+    StunDns, StunOutcome, StunPlan, StunReport, StunStats, ask_stun, plan, stun_base,
 };
 pub use link::{
     DialFailure, DirectFail, DirectLink, DirectParams, Established, LinkNews, LinkStats,

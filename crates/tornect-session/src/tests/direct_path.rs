@@ -307,6 +307,7 @@ async fn fixture(opts: &Opts) -> Fx {
     let settings = DirectSettings::new(DirectOptions {
         direct_port: None,
         punch_timeout: opts.punch,
+        ..DirectOptions::default()
     });
     let viewer = ViewerDirect::new(
         key(opts.link_key.unwrap_or(opts.viewer)),
