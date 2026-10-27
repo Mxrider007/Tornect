@@ -52,7 +52,20 @@ impl fmt::Debug for BoundSocket {
 ///   it is always set); if the OS refuses (no `AF_INET6`, as in a container
 ///   without IPv6), `0.0.0.0:port`.
 /// - A fixed `port` that is busy is retried once with 0 (any port).
-/// - No `SO_REUSEADDR`: no other socket shares the port.
+/// - No `SO_REUSEADDR`. On Linux that keeps every other socket off the
+///   port, since sharing needs the option on both sockets. On Windows it
+///   does not: only `SO_EXCLUSIVEADDRUSE` would, and this crate sets no
+///   option through FFI (socket2 0.6 has no setter for it). A process of the
+///   same account that binds the port with `SO_REUSEADDR` can then take its
+///   unicast datagrams. On macOS the BSD rules let a process of the same
+///   account that sets `SO_REUSEADDR` itself bind a specific address on the
+///   port this one holds on the wildcard, with the same effect (to be
+///   confirmed on the device). Everything the socket carries is
+///   authenticated (keyed probes, pinned QUIC), so such a process can only
+///   deny the direct path (a Tor fallback, or `NO_LAN_PATH` under
+///   `lan_only`), and it already runs as the user. `docs/VERIFICATION.md`,
+///   rows "design §13 row 13, Windows" and "row 12, macOS", check it on the
+///   devices.
 /// - A [`RECV_BUFFER`] receive buffer, best effort.
 ///
 /// `port` 0 and `None` both mean "any port".
