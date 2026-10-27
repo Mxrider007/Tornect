@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Fourteen modules so far:
+//! Fifteen modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -38,6 +38,9 @@
 //!   services' files and clipboard (design `services` §2.3): logind's
 //!   `LockedHint` on Linux, the secure-desktop probe on Windows.
 //! - `logind` — Linux: the logind lookups [`polkit`] and [`lock`] share.
+//! - [`route`] — the IPv4 default gateway of an interface, the router a port
+//!   mapping is asked of (design `direct` §7.1): `GetBestRoute2` on Windows,
+//!   a route lookup that sends nothing.
 //!
 //! Everything else in §B.8.8 — presence, the lock state beyond the services'
 //! pause, keep-awake, wake hooks, capture-excluded windows and the readiness
@@ -72,6 +75,9 @@ pub mod notify;
 pub mod polkit;
 pub mod readiness;
 pub mod reauth;
+pub mod route;
+#[cfg(windows)]
+mod route_windows;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
