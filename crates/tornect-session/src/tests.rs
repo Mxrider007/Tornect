@@ -43,6 +43,7 @@ use crate::*;
 
 mod direct_bind;
 mod direct_host;
+mod direct_path;
 
 const WAIT: Duration = Duration::from_secs(10);
 const KEY_A: u32 = 0x07_0004;

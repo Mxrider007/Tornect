@@ -26,19 +26,19 @@ use super::*;
 
 /// Three device-key seeds, lowest public key first: of a pair, the lower
 /// key dials the direct connection and the higher accepts.
-fn keys_by_order() -> [u8; 3] {
+pub(super) fn keys_by_order() -> [u8; 3] {
     let mut seeds = [101, 102, 103];
     seeds.sort_by_key(|seed| key(*seed).verifying_key().to_bytes());
     seeds
 }
 
-fn key(seed: u8) -> Arc<DeviceIdentity> {
+pub(super) fn key(seed: u8) -> Arc<DeviceIdentity> {
     Arc::new(DeviceIdentity::from_seed(&[seed; 32]))
 }
 
 /// Each session's end line: its media route and its path summary.
 #[derive(Default)]
-struct Ends(Mutex<Vec<(Option<TransportKind>, Option<PathSummary>)>>);
+pub(super) struct Ends(Mutex<Vec<(Option<TransportKind>, Option<PathSummary>)>>);
 
 impl HandshakeAudit for Ends {
     fn record(&self, event: AuditEvent) {
@@ -53,7 +53,7 @@ impl HandshakeAudit for Ends {
 
 impl Ends {
     /// The one session's end line, once written.
-    async fn line(&self) -> (Option<TransportKind>, Option<PathSummary>) {
+    pub(super) async fn line(&self) -> (Option<TransportKind>, Option<PathSummary>) {
         until("the session's end line", || {
             !self.0.lock().unwrap().is_empty()
         })
@@ -65,7 +65,7 @@ impl Ends {
 }
 
 /// Waits until `check` holds.
-async fn until(what: &str, check: impl Fn() -> bool) {
+pub(super) async fn until(what: &str, check: impl Fn() -> bool) {
     tokio::time::timeout(WAIT, async {
         while !check() {
             tokio::time::sleep(Duration::from_millis(5)).await;
