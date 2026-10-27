@@ -1536,20 +1536,9 @@ pub(crate) fn describe_media_end(end: MediaEnd) -> String {
     }
 }
 
-/// A `tornect_proto::reason` for people.
-pub fn media_reason(reason: u16) -> &'static str {
-    use tornect_proto::reason as r;
-    match reason {
-        r::BAD_BIND => "the session did not match",
-        r::CAPTURE_FAILED => "screen capture failed",
-        r::ENDED_BY_HOST => "ended by the host",
-        r::ENDED_BY_VIEWER => "ended by the viewer",
-        r::SESSION_OVER => "the session ended",
-        r::PROTOCOL => "protocol error",
-        r::ENCODER_FAILED => "the video encoder failed",
-        _ => "unknown reason",
-    }
-}
+/// A `tornect_proto::reason` for people: the table the viewer's refusal
+/// text uses too.
+pub use tornect_session::media_reason;
 
 /// One line for a media stream that never got as far as sharing (the observer
 /// reports the ones that did).

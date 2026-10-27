@@ -76,7 +76,7 @@ pub use host::{
 pub use tornect_net::QuicStream;
 pub use viewer::{
     Binding, BoundStream, FrameSink, MediaViewer, SWITCH_WAIT, Screens, ScreensNews,
-    ViewerChannels, ViewerEnd, ViewerError, ViewerRequest, ViewerStats,
+    ViewerChannels, ViewerEnd, ViewerError, ViewerRequest, ViewerStats, media_reason,
 };
 
 #[cfg(test)]

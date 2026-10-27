@@ -307,7 +307,7 @@ pub enum ViewerEnd {
 #[non_exhaustive]
 pub enum ViewerError {
     /// The host refused the bind (`BindRefused{reason}`), or closed at once.
-    #[error("the host refused the media stream (reason {0})")]
+    #[error("the host refused the media stream: {words} (reason {0})", words = media_reason(*.0))]
     Refused(u16),
     /// The host closed the stream without answering the bind.
     #[error("the host closed the media stream without answering")]
@@ -842,6 +842,26 @@ struct Pending {
     deadline: tokio::time::Instant,
 }
 
+/// A [`tornect_proto::reason`] code in words, the one table both ends use:
+/// the host's lines about a media stream that ended, and the viewer's about
+/// a stream the host refused or closed. Fixed words; a code this build does
+/// not know reads "unknown reason".
+#[must_use]
+pub fn media_reason(reason: u16) -> &'static str {
+    use tornect_proto::reason as r;
+    match reason {
+        r::BAD_BIND => "the session did not match",
+        r::CAPTURE_FAILED => "screen capture failed",
+        r::ENDED_BY_HOST => "ended by the host",
+        r::ENDED_BY_VIEWER => "ended by the viewer",
+        r::SESSION_OVER => "the session ended",
+        r::PROTOCOL => "protocol error",
+        r::ENCODER_FAILED => "the video encoder failed",
+        r::TRANSPORT => "the session's transport policy forbids this path",
+        _ => "unknown reason",
+    }
+}
+
 /// The request id after `last`: they count up from 1, wrapping, and skip 0,
 /// which is the host's news.
 fn following(last: u16) -> u16 {
@@ -952,6 +972,43 @@ fn kind(msg: &Msg) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `tornect_proto::reason` code has words of its own, and the
+    /// codes around them read "unknown reason"; a refusal says the words
+    /// and the code (the direct design §6.6's `TRANSPORT` included).
+    #[test]
+    fn every_media_reason_has_its_own_words() {
+        use tornect_proto::reason as r;
+
+        let codes = [
+            r::BAD_BIND,
+            r::CAPTURE_FAILED,
+            r::ENDED_BY_HOST,
+            r::ENDED_BY_VIEWER,
+            r::SESSION_OVER,
+            r::PROTOCOL,
+            r::ENCODER_FAILED,
+            r::TRANSPORT,
+        ];
+        let words: Vec<&str> = codes.iter().map(|&code| media_reason(code)).collect();
+        for (code, said) in codes.iter().zip(&words) {
+            assert_ne!(*said, "unknown reason", "reason {code}");
+        }
+        let mut distinct = words.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), codes.len(), "{words:?}");
+        // The codes are 1 to 8, with no gap: anything beside them is unknown.
+        assert_eq!(codes.to_vec(), (1..=8).collect::<Vec<u16>>());
+        for code in [0, 9, u16::MAX] {
+            assert_eq!(media_reason(code), "unknown reason");
+        }
+        assert_eq!(
+            ViewerError::Refused(r::TRANSPORT).to_string(),
+            "the host refused the media stream: the session's transport policy forbids this \
+             path (reason 8)"
+        );
+    }
 
     /// The monitors design's V1: request ids count up from 1, wrap, and
     /// never take 0, the host's news.

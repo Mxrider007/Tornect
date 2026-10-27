@@ -3164,6 +3164,29 @@ mod tests {
         );
     }
 
+    /// A refusal for the path (the direct design §6.6's `TRANSPORT`) is
+    /// said in the words of the table both ends use, on the viewer's
+    /// `MEDIA FAILED` line and on the host's lines alike.
+    #[test]
+    fn a_refusal_for_the_path_is_said_in_words_on_both_sides() {
+        use tornect_proto::reason;
+
+        let end = End::NoPicture(bind_failed(ViewerError::Refused(reason::TRANSPORT)));
+        assert_eq!(
+            unbound_line(&end),
+            "MEDIA FAILED: binding the media stream: the host refused the media stream: the \
+             session's transport policy forbids this path (reason 8)"
+        );
+        assert_eq!(
+            crate::host::describe_media_end(tornect_session::MediaEnd::Pipeline(reason::TRANSPORT)),
+            "the session's transport policy forbids this path"
+        );
+        assert_eq!(
+            media_end(&Ok(ViewerEnd::Host(reason::TRANSPORT)), &End::You),
+            "MEDIA ENDED by the host (the session's transport policy forbids this path)"
+        );
+    }
+
     /// A picture of the test card at `index`, as the decoder lends it (the
     /// card's BGRx keeps green where RGBA does, which is what the index is
     /// read from).
