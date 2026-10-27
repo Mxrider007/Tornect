@@ -5,7 +5,7 @@ with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-contai
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-is under way: B1 to B5 are done (2026-10-27; "OPEN, owned by Phase B steps" below).
+is under way: B1 to B7 are done (2026-10-27; "OPEN, owned by Phase B steps" below).
 
 ## What Phase A does
 
@@ -120,8 +120,8 @@ and the crates below ring check here).
   first server, a second at 750 ms of another operator where there is one, RTO 500 ms, at most 2
   servers and 4 requests in the 1500 ms budget, replies only from the address asked under its
   transaction ID), `gather::stun_base` (a CGNAT base asks), `StunDns` with `RealNet::resolve`
-  cache-first and `RealNet::prefetch`, fake STUN servers on loopback. Nothing calls them yet. Left
-  for B6: the link's gathering task reading `tees.stun` and calling `ask_stun` with this role's
+  cache-first and `RealNet::prefetch`, fake STUN servers on loopback. Done at B6 (below): what was
+  left for B6: the link's gathering task reading `tees.stun` and calling `ask_stun` with this role's
   part, `stun_base` combined with the scope, `enable_stun` and the mapping's head start, the
   `DirectParams`/`DirectOptions` STUN fields, and the second ULA design gap. Left for B11/B12: the
   app's `RealNet::prefetch` call, with a list that is empty whenever STUN may not run (design
@@ -145,14 +145,31 @@ and the crates below ring check here).
   `MappingLedger` under `Paths::router_ports_dir()` (one locked list per running process),
   `renewal_delay` and `Mapping::keep_renewed`, release on drop through `ReleaseTracker`,
   `RealMapper::sweep`, `RealNet::with_router` and `RealNet::sweep_leftovers`, `FakePcp` and
-  `FakeIgd` (`tornect_net::mapping::fake`, also under `test-support` for B9). Nothing calls them yet:
-  the app still builds `RealNet::new()` (mapper `NoMapper`). Owed by B6 (or B11): the app's
+  `FakeIgd` (`tornect_net::mapping::fake`, also under `test-support` for B9). Done at B6 (below),
+  what was owed by B6 (or B11): the app's
   `RealNet::with_router(paths.router_ports_dir(), <sessions.log router_port sink>)` once per
   process, `sweep_leftovers()` at GUI, `host` and `connect` start, `releases().wait(
   SHUTDOWN_RELEASE_WAIT)` at exit, and the link holding the `Mapping` with `keep_renewed` beside
   the session. Left as NEEDS-DEVICE: the `FakePcp` tests on Windows (Wine cannot run them) and on
   macOS (`lo0` aliases), and real routers (design §13 row 4, after B12).
-- B7/B8: the internet-scope ranks in `MemNet`; `NatBox`, `MemStun`, `MemMapper`.
+- B6/B7 (done 2026-10-27, `b9b55f1b`, `9236a7bc`, `515cf9d5`; ledger rows "Step B6", "Step B7" and
+  "Steps B6 and B7", decision M1-81's step note): `gather::plan` (`GatherConfig` in `DirectParams`,
+  from `DirectOptions::gather(role)`: this role's part of the STUN list, `enable_stun`, the router
+  switches) and the gathering task (`gather::Gatherer`): router from the bind, STUN after the 250 ms
+  head start (skipped on a global mapping inside it, at once when the router answers without one),
+  one batch per gathered candidate, `Done` at both ends or 1500 ms; the task holds and renews the
+  `Mapping` until `LinkInner::shut` aborts it. A side with no host candidate still gathers;
+  `NoAddresses` only with nothing to gather. The driver feeds `Checklist::set_local_public` (global
+  hosts, then each gathered address), so the §7.6 ranks apply; a proptest pins them. The app builds
+  one `RealNet` per process (`direct::real_net(paths)`, ledger plus `RouterPortLog`), sweeps at GUI,
+  `host` and `connect` start and waits up to 1 s for releases at exit (`router_lifecycle`,
+  `wait_router_releases`). Deviations (commit bodies, M1-81): the mapping lives in the gathering task,
+  not `LinkInner`; `plan`'s signature; events through the app's mapper, not a `DirectHost` field.
+  Residuals: a viewer with no host candidate and nothing gathered sends only `CANDIDATES_DONE` and
+  falls back at its punch timeout (OPEN row, for B9/B12); a link closed in the last instant before
+  exit may count its release after the exit wait looked (the next start's sweep removes it). Left
+  as NEEDS-DEVICE: the real router run of the sweep and the release (after B12).
+- B8: `NatBox`, `MemStun`, `MemMapper` in `MemNet`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
 - B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
   `direct_loopback_stats` shows 15 fps), the `SecondStream` hook (services on a direct session
