@@ -229,7 +229,7 @@ on either. B1 re-reads these paths before turning it on.
 
 ### 1.7 Logging and output
 
-- netdev has no `log` or `tracing` dependency, so design DIRECT-6's quiet-target filter
+- netdev has no `log` or `tracing` dependency, so decision M1-83's quiet-target filter
   (`QUIET_TARGETS`, target `netdev` and `netlink_*`) has nothing to drop from netdev
   itself; `netlink-packet-*` and `netlink-sys` depend on `log` (target names
   `netlink_packet_route`, `netlink_sys`), which the filter covers.

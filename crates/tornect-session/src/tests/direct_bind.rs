@@ -1197,7 +1197,7 @@ async fn a_refusal_over_a_quic_link_ends_without_fallback() {
     links.close().await;
 }
 
-/// DIRECT-2's one exception (the direct design §6.5 "Pin refused by the
+/// Decision M1-79's one exception (the direct design §6.5 "Pin refused by the
 /// host's TLS", §12.1): the host's link is pinned to another device, so its
 /// TLS refuses the viewer's key after the viewer's own handshake completed.
 /// The viewer's `Bind` never reaches the host: the bind fails with no host

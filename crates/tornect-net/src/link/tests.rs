@@ -472,7 +472,7 @@ fn error_texts(e: &(dyn std::error::Error + 'static)) -> Vec<String> {
     texts
 }
 
-/// Design §5.5 (DIRECT-6): a peer whose key is pinned can still close its
+/// Design §5.5 (decision M1-83): a peer whose key is pinned can still close its
 /// connection with any reason, control sequences included. A stream's read
 /// and write errors carry quinn's kind in fixed words, with no error under
 /// them: neither their text, nor their `Debug`, nor any source names what

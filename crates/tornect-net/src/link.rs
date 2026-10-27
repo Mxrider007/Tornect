@@ -836,7 +836,7 @@ impl AsyncWrite for QuicStream {
 }
 
 /// A stream error as a [`QuicStream`] hands it on: quinn's kind, in fixed
-/// words, and nothing else (design `direct` §5.5, DIRECT-6). quinn's own
+/// words, and nothing else (design `direct` §5.5, decision M1-83). quinn's own
 /// error value is never passed on: its `ConnectionError` writes the peer's
 /// close reason (any bytes, terminal control sequences included) through
 /// its `Display`, and an `io::Error` built on it hands that error on as its

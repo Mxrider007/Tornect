@@ -10415,7 +10415,7 @@ mod tests {
         assert!(!written.contains("hello"), "no chat text in sessions.log");
     }
 
-    /// Design `direct` §5.5 (DIRECT-6) in the window: a host whose key is
+    /// Design `direct` §5.5 (decision M1-83) in the window: a host whose key is
     /// pinned closes the direct connection after the `Bind` with a reason
     /// of its own, control sequences included; the window's note (and the
     /// `VIEWER:` line, the same text) says fixed words only.

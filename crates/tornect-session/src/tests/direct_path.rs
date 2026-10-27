@@ -1000,7 +1000,7 @@ async fn a_refused_direct_bind_ends_the_session() {
     assert_eq!(path.expect("a summary").outcome, "bind-refused");
 }
 
-/// DIRECT-2's one exception, through the caller: the viewer's link
+/// Decision M1-79's one exception, through the caller: the viewer's link
 /// presents another key than the session's, so the host's TLS refuses it
 /// after the viewer's handshake completed. The `Bind` fails before any
 /// host byte, [`DirectMedia::bind`] says [`AfterBind::Fallback`], and the

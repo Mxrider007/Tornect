@@ -22,7 +22,7 @@ has not started.
   Tor-only (`network.paranoid`, Tor through a bridge unless `network.direct_with_bridges`,
   `connect --tor-only`), or when the peer is an old version. `network.lan_only` refuses the Tor
   fallback and ends the session `NO_LAN_PATH`. Once the viewer commits to the direct path it never
-  falls back (DIRECT-2): a dead LAN ends the media about 10 s later (QUIC idle timeout).
+  falls back (decision M1-79): a dead LAN ends the media about 10 s later (QUIC idle timeout).
 - Seen by people: `ROUTE` and `PATH` lines in `connect`, `SESSION ROUTE` on the host, `doctor`'s
   `direct connections:` and `network:` lines (kinds of address, never an address), the window's
   route badge and details, Settings > Connection "Direct connections", the consent sheet's and the

@@ -1567,7 +1567,7 @@ impl<O> std::fmt::Debug for BoundMedia<O> {
 }
 
 /// The onion media stream opened beside the path phase (design `direct`
-/// §4, DIRECT-2), only when the path is tried with a Tor fallback: the
+/// §4, decision M1-79), only when the path is tried with a Tor fallback: the
 /// fallback then finds its stream open, one round trip on the session's
 /// circuit sooner.
 enum Preopen<F: Future> {
@@ -1660,7 +1660,7 @@ fn into_path(choice: PathChoice) -> Result<PathChoice, End> {
 ///
 /// `direct`'s [`OnRoute`](crate::direct::OnRoute) is told the route as soon
 /// as it is chosen, before the bind's wait: the direct route, then the Tor
-/// route that replaced it when DIRECT-2's exception falls back.
+/// route that replaced it when decision M1-79's exception falls back.
 ///
 /// [`ViewerDirect::choose_path`]: tornect_session::ViewerDirect::choose_path
 pub(crate) async fn bind_media<S, O, F, Fut>(
@@ -4648,7 +4648,7 @@ mod tests {
         assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
     }
 
-    /// DIRECT-2's one exception through the caller: a link whose key is
+    /// Decision M1-79's one exception through the caller: a link whose key is
     /// not the session's device key is refused by the host's TLS before any
     /// stream byte, so the bind fails with [`AfterBind::Fallback`]; the
     /// viewer sends `TOR_FALLBACK{QUIC}` and binds a fresh onion stream:
@@ -4696,7 +4696,7 @@ mod tests {
         assert_eq!(log.outcomes(1).await[0], MediaOutcome::Abandoned);
     }
 
-    /// DIRECT-2's pre-open through the caller: a host with no address
+    /// Decision M1-79's pre-open through the caller: a host with no address
     /// answers the viewer's candidates with `TOR_FALLBACK{NO_ADDRESSES}`,
     /// and the onion stream opened beside the path phase is the one bound:
     /// one open in all, `ROUTE tor host-no-addresses`, the host's route
@@ -4733,7 +4733,7 @@ mod tests {
         );
     }
 
-    /// Design `direct` §5.5 (DIRECT-6) at the viewer's sinks: a host whose
+    /// Design `direct` §5.5 (decision M1-83) at the viewer's sinks: a host whose
     /// key is pinned reads the `Bind`, then closes the direct connection
     /// with a reason of its own (control sequences included). The `MEDIA
     /// FAILED` line, the error `connect` returns (its chain, and its
@@ -4770,7 +4770,7 @@ mod tests {
         none_holds_the_reason(&[broke, line, format!("{e:#}"), format!("{e:?}")]);
     }
 
-    /// The early onion stream (DIRECT-2's pre-open): used while it is
+    /// The early onion stream (decision M1-79's pre-open): used while it is
     /// younger than [`ONION_PREOPEN_MAX`] (still opening counts), replaced
     /// by one fresh open when it is older or its open failed; with nothing
     /// opened beside the path phase the fresh open is the only one.
@@ -4842,7 +4842,7 @@ mod tests {
         );
     }
 
-    /// Decision M1-85 at DIRECT-2's exception: a `lan_only` viewer whose
+    /// Decision M1-85 at decision M1-79's exception: a `lan_only` viewer whose
     /// direct connection the host's TLS refused does not fall back; the
     /// session ends `BYE{NO_LAN_PATH}` and no onion stream is ever opened.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -180,13 +180,13 @@ pub enum AfterBind {
     /// session: send `TOR_FALLBACK{QUIC}` and bind onion media.
     Fallback,
     /// The `Bind` may have reached the host: the commit point has passed
-    /// and the session's media ends (DIRECT-2).
+    /// and the session's media ends (decision M1-79).
     End,
 }
 
 /// Whether a viewer whose direct `Bind` failed on `link` may still fall
-/// back to the onion path (the direct design §4, §8.5; DIRECT-2's one
-/// exception to the commit point): only when the connection was closed by a
+/// back to the onion path (the direct design §4, §8.5; decision M1-79's
+/// one exception to the commit point): only when the connection was closed by a
 /// TLS alert ([`Established::closed_by_crypto`]) before any host stream
 /// byte arrived. Anything else — a refusal, a wrong proof, a timeout, a
 /// close after the host wrote — is [`AfterBind::End`].
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(shared.get().direct_port, Some(4100));
     }
 
-    /// DIRECT-2: only a TLS-alert close with no host stream byte falls
+    /// Decision M1-79: only a TLS-alert close with no host stream byte falls
     /// back; a byte from the host, or any other close, ends the media.
     #[test]
     fn only_a_crypto_close_before_any_host_byte_falls_back() {

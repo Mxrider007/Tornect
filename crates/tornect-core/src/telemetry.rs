@@ -51,7 +51,7 @@ pub const IDENTIFIERS_ENV: &str = "TORNECT_LOG_IDENTIFIERS";
 
 /// The log targets of the third-party network crates, whose own lines carry
 /// IP addresses, ports, connection IDs or certificates (decision M1-83,
-/// design `direct` DIRECT-6): quinn-udp writes a failed send's destination
+/// design `direct` §5.5): quinn-udp writes a failed send's destination
 /// and source at `WARN`; quinn-proto remote addresses and connection IDs at
 /// `DEBUG`/`TRACE`; rustls both certificates at `TRACE`, which with raw public
 /// keys are the two device keys; the netlink crates, igd-next, crab_nat, the

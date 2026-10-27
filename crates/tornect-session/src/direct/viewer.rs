@@ -161,7 +161,7 @@ impl Live {
 #[derive(Debug)]
 pub enum PathChoice {
     /// The direct stream is open: the caller writes the `Bind` on it
-    /// ([`DirectMedia::bind`]), the commit point (DIRECT-2).
+    /// ([`DirectMedia::bind`]), the commit point (decision M1-79).
     Direct(Box<DirectMedia>),
     /// `TOR_FALLBACK` was sent: the caller binds the onion media stream.
     Tor {
@@ -249,7 +249,7 @@ impl DirectMedia {
     /// and `BindOk` ([`MediaViewer::bind`]; the caller's bind wait, never
     /// the punch window). On failure the connection is dropped, and
     /// [`DirectBindFailed::after`] says whether the session may still use
-    /// the onion path (DIRECT-2's one exception).
+    /// the onion path (decision M1-79's one exception).
     ///
     /// # Errors
     ///

@@ -5,7 +5,7 @@
 //! pictures decoded over the pinned QUIC connection (the direct design
 //! §12.2 "Loopback e2e"). On top of it, the redaction e2e (§12.4 end) and
 //! the `direct_loopback_stats` stand-in for the loopback demo (decision
-//! DIRECT-5).
+//! M1-82).
 
 use std::fmt::Write as _;
 use std::future::pending;
@@ -85,7 +85,7 @@ struct Lx {
     viewer_key: [u8; 32],
     host_key: [u8; 32],
     /// When the viewer read the `SESSION_ACCEPT` (the start of the path
-    /// phase's clock, decision DIRECT-5).
+    /// phase's clock, decision M1-82).
     accepted: Instant,
     _tmp: tempfile::TempDir,
 }
@@ -321,7 +321,7 @@ async fn a_whole_session_goes_direct_on_loopback_sockets() {
     assert_eq!(ended.viewer_bound[0].ip().to_string(), "127.0.0.30");
 }
 
-/// Decision DIRECT-5's stand-in for `tornect demo --loopback
+/// Decision M1-82's stand-in for `tornect demo --loopback
 /// --headless-stats` on the direct path: time to the open stream, to
 /// `BindOk` and to the first picture, then 10 s of the test card's
 /// pictures: their rate and bytes, to read against `docs/PLAN.md` §B.7.
@@ -540,8 +540,8 @@ fn named<'a>(log: &str, secrets: &'a [(String, String)]) -> Option<&'a (String, 
     })
 }
 
-/// The redaction e2e (the direct design §12.4 end, decisions M1-83 and
-/// DIRECT-6), Phase A's half: a child process installs the real log layers
+/// The redaction e2e (the direct design §12.4 end, decision
+/// M1-83), Phase A's half: a child process installs the real log layers
 /// with every target at `trace` and identifiers off, forces quinn-udp's
 /// `sendmsg` warning through a raw `UdpSocketState::send`, and completes a
 /// whole direct session on loopback sockets, so quinn, quinn-proto and

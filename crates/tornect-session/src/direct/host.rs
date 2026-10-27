@@ -504,7 +504,7 @@ impl Task {
                     r.viewer_fallback.get_or_insert((reason, ms));
                 });
                 if self.direct_claim || self.claimed_here() {
-                    // After the commit the viewer never falls back (DIRECT-2):
+                    // After the commit the viewer never falls back (decision M1-79):
                     // the direct media stands.
                     Shared::count(&self.shared.late_fallbacks);
                     return;

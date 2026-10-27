@@ -150,7 +150,7 @@ pub fn no_network() -> Arc<dyn NetEnv> {
 /// Where a viewer session's route goes as soon as it is known (design
 /// `direct` §3.1, §8.6 `on_route`; the window's model): the path the path
 /// phase chose, then, when a direct connection the host's TLS refused falls
-/// back (DIRECT-2's one exception), the Tor route that replaced it.
+/// back (decision M1-79's one exception), the Tor route that replaced it.
 pub type OnRoute = Arc<dyn Fn(PathEnd) + Send + Sync>;
 
 /// One viewer session's direct path (design `direct` §8.6).
