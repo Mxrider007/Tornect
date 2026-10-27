@@ -1,13 +1,224 @@
-//! The session layer's side of the direct path (the direct design §6.5,
-//! §6.6, §8.5): what a stream of a session's direct QUIC connection must
-//! offer [`MediaHost::serve_direct`](crate::MediaHost::serve_direct), and
-//! the viewer's one fallback after its direct `Bind`
-//! ([`after_bind_close`]).
+//! The session layer's side of the direct path (the direct design §4,
+//! §6.5–§6.7, §8.5): what a stream of a session's direct QUIC connection
+//! must offer [`MediaHost::serve_direct`](crate::MediaHost::serve_direct),
+//! the host's half of the path phase ([`DirectHost`]), the settings both
+//! halves read ([`DirectSettings`]), the candidates' wire form
+//! ([`to_wire`], [`from_wire`]), the hook a second stream of the
+//! connection is served through ([`SecondStream`]), and the viewer's one
+//! fallback after its direct `Bind` ([`after_bind_close`]).
 
 use std::future::Future;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tornect_net::{Established, QuicStream};
+use tornect_core::config::Network;
+use tornect_net::{BoxFuture, Candidate, CandidateKind, Established, QuicStream, Scope, canon_ip};
+use tornect_signal::messages::{self, MAX_CANDIDATES_PER_FRAME, candidate_kind};
+use zeroize::Zeroizing;
+
+mod host;
+
+pub use host::{DirectHost, DirectHostStats, OnMedia};
+
+/// Whether a session may reach beyond the same site (the direct design
+/// §4): public addresses, server-reflexive and mapped candidates. Off in
+/// Phase A, so both sides' scope is always [`Scope::SameSite`]; Phase B
+/// turns it on once its gathering and its tests land.
+pub const INTERNET_DIRECT: bool = false;
+
+/// How long the host keeps a session's direct link open from its bind
+/// without a direct claim (the direct design §4): the largest
+/// `punch_timeout` plus 10 s for Tor's delay and the viewer's commit, so the
+/// host never stops listening while the viewer still punches. A link with
+/// no `Bind` by then is closed; a `lan_only` session then ends
+/// `BYE{NO_LAN_PATH}`.
+pub const HOST_DIRECT_LINGER: Duration = Duration::from_secs(20);
+
+/// How long the host waits, once a direct media stream was served to its
+/// end, for the viewer to close the connection before closing it itself: the
+/// last frames written (the media `Close` among them) reach the viewer
+/// instead of being cut off by the endpoint's close.
+pub const DIRECT_DRAIN: Duration = Duration::from_secs(2);
+
+/// The least `network.punch_timeout_ms` the direct path uses (the direct
+/// design §4); a configured value below it is raised to it.
+pub const PUNCH_TIMEOUT_MIN_MS: u32 = 1000;
+
+/// The most `network.punch_timeout_ms` the direct path uses, under the
+/// host's [`HOST_DIRECT_LINGER`]; a configured value above it is lowered to
+/// it.
+pub const PUNCH_TIMEOUT_MAX_MS: u32 = 10_000;
+
+// The linger outlasts the longest punch by 10 s (the direct design §4).
+const _: () = assert!(HOST_DIRECT_LINGER.as_secs() >= PUNCH_TIMEOUT_MAX_MS as u64 / 1000 + 10);
+
+/// What the direct path is run with, from `[network]` (the direct design
+/// §8.5 `DirectOptions`). Phase B adds the STUN partitions and the router
+/// protocols.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectOptions {
+    /// `network.direct_port`: the session socket's port when it is free.
+    pub direct_port: Option<u16>,
+    /// The viewer's hard cap from the accept to "direct ready":
+    /// `network.punch_timeout_ms`, kept within [`PUNCH_TIMEOUT_MIN_MS`] and
+    /// [`PUNCH_TIMEOUT_MAX_MS`].
+    pub punch_timeout: Duration,
+}
+
+impl Default for DirectOptions {
+    fn default() -> Self {
+        Self::from_network(&Network::default())
+    }
+}
+
+impl DirectOptions {
+    /// The options `net` asks for, its punch timeout kept within
+    /// [`PUNCH_TIMEOUT_MIN_MS`]`..=`[`PUNCH_TIMEOUT_MAX_MS`].
+    #[must_use]
+    pub fn from_network(net: &Network) -> Self {
+        let punch_ms = net
+            .punch_timeout_ms
+            .clamp(PUNCH_TIMEOUT_MIN_MS, PUNCH_TIMEOUT_MAX_MS);
+        Self {
+            direct_port: net.direct_port,
+            punch_timeout: Duration::from_millis(u64::from(punch_ms)),
+        }
+    }
+}
+
+/// The direct path's options as the settings change them (the direct design
+/// §8.5 `DirectSettings`): clones share one value, and each session reads it
+/// once, when its path starts.
+#[derive(Debug, Clone, Default)]
+pub struct DirectSettings(Arc<RwLock<DirectOptions>>);
+
+impl DirectSettings {
+    /// Settings holding `options`.
+    #[must_use]
+    pub fn new(options: DirectOptions) -> Self {
+        Self(Arc::new(RwLock::new(options)))
+    }
+
+    /// Settings holding what `net` asks for ([`DirectOptions::from_network`]).
+    #[must_use]
+    pub fn from_network(net: &Network) -> Self {
+        Self::new(DirectOptions::from_network(net))
+    }
+
+    /// From now on, what `net` asks for; sessions already on their path keep
+    /// what they read.
+    pub fn set_from(&self, net: &Network) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = DirectOptions::from_network(net);
+    }
+
+    /// The current options.
+    #[must_use]
+    pub fn get(&self) -> DirectOptions {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The host's hook for the second stream of a session's direct connection
+/// (the direct design §6.7): the services stream, once the services layer
+/// implements it. [`DirectHost`] accepts that stream only after the
+/// session's media was claimed on this connection, and serves it beside the
+/// media stream, neither waiting on the other; a kill, the linger or the
+/// session's end drop it with the link. `None` until then: the connection
+/// takes one stream ([`tornect_net::quic::HOST_STREAMS`]).
+pub trait SecondStream: Send + Sync {
+    /// Serve `stream` for session `expected_session`, whose connection's
+    /// exporter output is `ekm` (what its own `Bind` MAC covers).
+    fn serve(
+        &self,
+        stream: QuicStream,
+        expected_session: String,
+        ekm: Zeroizing<[u8; 32]>,
+    ) -> BoxFuture<'static, ()>;
+}
+
+/// `batch` as the `CANDIDATES` frames that carry it, at most
+/// [`MAX_CANDIDATES_PER_FRAME`] candidates each, every frame with `scope`
+/// (the direct design §4, §6.1): IPv4 as 4 bytes (never v4-mapped), IPv6 as
+/// 16. A peer-reflexive candidate is local only and never sent, nor is a
+/// candidate without a port.
+#[must_use]
+pub fn to_wire(batch: &[Candidate], scope: Scope) -> Vec<messages::Candidates> {
+    let code = match scope {
+        Scope::SameSite => messages::scope::SAME_SITE,
+        Scope::Internet => messages::scope::INTERNET,
+    };
+    let wire: Vec<messages::Candidate> = batch
+        .iter()
+        .filter_map(|c| {
+            let kind = match c.kind {
+                CandidateKind::Host => candidate_kind::HOST,
+                CandidateKind::Srflx => candidate_kind::SRFLX,
+                CandidateKind::Mapped => candidate_kind::MAPPED,
+                CandidateKind::Prflx => return None,
+            };
+            let ip = match canon_ip(c.addr.ip()) {
+                IpAddr::V4(v4) => v4.octets().to_vec(),
+                IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
+            (c.addr.port() != 0).then(|| messages::Candidate {
+                kind,
+                ip,
+                port: c.addr.port(),
+            })
+        })
+        .collect();
+    wire.chunks(MAX_CANDIDATES_PER_FRAME)
+        .map(|chunk| messages::Candidates {
+            candidates: chunk.to_vec(),
+            scope: Some(code),
+        })
+        .collect()
+}
+
+/// A peer's `CANDIDATES` frame as the direct link takes it: its candidates
+/// and its scope (the direct design §4, §6.1). A candidate of a kind this
+/// build does not know, a v4-mapped IPv6 address, an address of another
+/// length or port 0 is dropped; an absent or unknown scope is
+/// [`Scope::SameSite`].
+#[must_use]
+pub fn from_wire(frame: &messages::Candidates) -> (Vec<Candidate>, Scope) {
+    let scope = if frame.internet() {
+        Scope::Internet
+    } else {
+        Scope::SameSite
+    };
+    let batch = frame
+        .candidates
+        .iter()
+        .filter_map(|c| {
+            let kind = match c.kind {
+                candidate_kind::HOST => CandidateKind::Host,
+                candidate_kind::SRFLX => CandidateKind::Srflx,
+                candidate_kind::MAPPED => CandidateKind::Mapped,
+                _ => return None,
+            };
+            let ip = if let Ok(v4) = <[u8; 4]>::try_from(c.ip.as_slice()) {
+                IpAddr::from(v4)
+            } else {
+                let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(c.ip.as_slice()).ok()?);
+                if v6.to_ipv4_mapped().is_some() {
+                    return None;
+                }
+                IpAddr::V6(v6)
+            };
+            (c.port != 0).then(|| Candidate {
+                kind,
+                addr: SocketAddr::new(ip, c.port),
+            })
+        })
+        .collect();
+    (batch, scope)
+}
 
 /// A bidirectional stream of a session's direct connection, as the media
 /// host serves it: [`tornect_net::QuicStream`] in production, a pipe in
@@ -66,6 +277,129 @@ fn after_close(closed_by_crypto: bool, host_bytes: u64) -> AfterBind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tornect_signal::messages::Body as _;
+    use tornect_signal::messages::scope;
+
+    fn candidate(kind: CandidateKind, addr: &str) -> Candidate {
+        Candidate {
+            kind,
+            addr: addr.parse().unwrap(),
+        }
+    }
+
+    /// The wire form round-trips: kinds, IPv4 as 4 bytes, IPv6 as 16, the
+    /// scope in every frame, at most eight candidates a frame, and every
+    /// frame valid as the FSM checks it.
+    #[test]
+    fn candidates_round_trip_through_the_wire_form() {
+        let mut batch: Vec<Candidate> = (1..=9u8)
+            .map(|i| candidate(CandidateKind::Host, &format!("192.168.1.{i}:4000")))
+            .collect();
+        batch.push(candidate(CandidateKind::Srflx, "[2001:db8::1]:5000"));
+        batch.push(candidate(CandidateKind::Mapped, "203.0.113.7:6000"));
+        for scope in [Scope::SameSite, Scope::Internet] {
+            let frames = to_wire(&batch, scope);
+            assert_eq!(
+                frames
+                    .iter()
+                    .map(|f| f.candidates.len())
+                    .collect::<Vec<_>>(),
+                [8, 3]
+            );
+            let mut back = Vec::new();
+            for frame in &frames {
+                frame.validate().expect("a valid frame");
+                let (candidates, got) = from_wire(frame);
+                assert_eq!(got, scope);
+                back.extend(candidates);
+            }
+            assert_eq!(back, batch);
+        }
+        let frames = to_wire(&batch[..1], Scope::SameSite);
+        assert_eq!(frames[0].candidates[0].ip, vec![192, 168, 1, 1]);
+        assert_eq!(frames[0].scope, Some(scope::SAME_SITE));
+        assert!(to_wire(&[], Scope::SameSite).is_empty());
+    }
+
+    /// What never goes on the wire: a peer-reflexive candidate (local
+    /// only) and port 0; a v4-mapped address goes as its 4 IPv4 bytes.
+    #[test]
+    fn prflx_and_port_zero_are_never_sent_and_v4_mapped_goes_as_ipv4() {
+        let batch = [
+            candidate(CandidateKind::Prflx, "192.168.1.9:4000"),
+            candidate(CandidateKind::Host, "192.168.1.10:0"),
+            candidate(CandidateKind::Host, "[::ffff:192.168.1.11]:4000"),
+        ];
+        let frames = to_wire(&batch, Scope::SameSite);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].candidates.len(), 1);
+        assert_eq!(frames[0].candidates[0].ip, vec![192, 168, 1, 11]);
+        let (back, _) = from_wire(&frames[0]);
+        assert_eq!(back, [candidate(CandidateKind::Host, "192.168.1.11:4000")]);
+    }
+
+    /// What a receiver drops: an unknown kind, a v4-mapped IPv6 address,
+    /// an address of another length, port 0; an absent or unknown scope is
+    /// same-site, and only the internet code is the internet scope.
+    #[test]
+    fn unknown_kinds_and_malformed_addresses_are_dropped() {
+        let wire = |kind, ip: Vec<u8>, port| messages::Candidate { kind, ip, port };
+        let mut mapped = vec![0; 10];
+        mapped.extend([0xff, 0xff, 192, 168, 1, 1]);
+        let frame = |scope| messages::Candidates {
+            candidates: vec![
+                wire(7, vec![192, 168, 1, 1], 4000),
+                wire(candidate_kind::HOST, mapped.clone(), 4000),
+                wire(candidate_kind::HOST, vec![192, 168, 1], 4000),
+                wire(candidate_kind::HOST, vec![192, 168, 1, 2], 0),
+                wire(candidate_kind::HOST, vec![192, 168, 1, 3], 4000),
+            ],
+            scope,
+        };
+        for (scope, want) in [
+            (None, Scope::SameSite),
+            (Some(scope::SAME_SITE), Scope::SameSite),
+            (Some(scope::INTERNET), Scope::Internet),
+            (Some(9), Scope::SameSite),
+        ] {
+            let (batch, got) = from_wire(&frame(scope));
+            assert_eq!(got, want);
+            assert_eq!(batch, [candidate(CandidateKind::Host, "192.168.1.3:4000")]);
+        }
+    }
+
+    /// `punch_timeout_ms` is kept within 1–10 s, under the host's linger;
+    /// the settings' clones share one value.
+    #[test]
+    fn the_punch_timeout_is_kept_within_its_bounds_and_settings_are_shared() {
+        let net = |ms| Network {
+            punch_timeout_ms: ms,
+            direct_port: Some(4100),
+            ..Network::default()
+        };
+        for (ms, want) in [
+            (1, 1000),
+            (999, 1000),
+            (4000, 4000),
+            (10_000, 10_000),
+            (60_000, 10_000),
+        ] {
+            let options = DirectOptions::from_network(&net(ms));
+            assert_eq!(options.punch_timeout, Duration::from_millis(want));
+            assert_eq!(options.direct_port, Some(4100));
+            assert!(options.punch_timeout < HOST_DIRECT_LINGER);
+        }
+        assert_eq!(
+            DirectOptions::default().punch_timeout,
+            Duration::from_secs(4)
+        );
+        let settings = DirectSettings::default();
+        let shared = settings.clone();
+        settings.set_from(&net(2500));
+        assert_eq!(shared.get().punch_timeout, Duration::from_millis(2500));
+        assert_eq!(shared.get().direct_port, Some(4100));
+    }
 
     /// DIRECT-2: only a TLS-alert close with no host stream byte falls
     /// back; a byte from the host, or any other close, ends the media.

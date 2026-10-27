@@ -42,6 +42,7 @@ use crate::viewer::BoundStream;
 use crate::*;
 
 mod direct_bind;
+mod direct_host;
 
 const WAIT: Duration = Duration::from_secs(10);
 const KEY_A: u32 = 0x07_0004;
