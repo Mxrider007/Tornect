@@ -7,7 +7,8 @@
 //! race it in a `select!` and drop it at any point: the next call carries on
 //! where the last one stopped, and no byte is lost or read twice. It never
 //! reads past the frame it holds, so whatever the peer sends next stays in
-//! the stream until that frame is taken.
+//! the stream until that frame is taken, apart from the one byte
+//! [`RxBuf::watch_past_frame`] may read past it to see the stream end.
 
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -42,9 +43,23 @@ pub(super) enum RxFault {
     },
 }
 
-/// At most one frame, as it was on the wire. The bytes are wiped when the
-/// frame is taken and on drop, and `Debug` prints only sizes: a client frame
-/// of the handshake may carry KE3 and an accept carries the attended token.
+/// What [`RxBuf::watch_past_frame`] learned past the buffered frame, for the
+/// [`RxBuf::fill`] after it is taken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Past {
+    /// Nothing was read past the frame.
+    #[default]
+    Nothing,
+    /// The first byte of the next frame's length prefix.
+    Byte(u8),
+    /// The stream ended right after the frame.
+    End,
+}
+
+/// At most one frame, as it was on the wire, and at most one byte past it.
+/// The bytes are wiped when the frame is taken and on drop, and `Debug`
+/// prints only sizes: a client frame of the handshake may carry KE3 and an
+/// accept carries the attended token.
 #[derive(Default)]
 pub(super) struct RxBuf {
     /// The length prefix while it is incomplete.
@@ -58,6 +73,8 @@ pub(super) struct RxBuf {
     /// The announced payload length, once the prefix is complete.
     want: Option<usize>,
     fault: Option<RxFault>,
+    /// Read past the whole frame while it waited to be taken.
+    past: Past,
 }
 
 impl core::fmt::Debug for RxBuf {
@@ -66,6 +83,8 @@ impl core::fmt::Debug for RxBuf {
             .field("buffered", &self.buffered())
             .field("want", &self.want)
             .field("fault", &self.fault)
+            .field("past", &self.past_len())
+            .field("ended_after", &(self.past == Past::End))
             .finish()
     }
 }
@@ -73,6 +92,7 @@ impl core::fmt::Debug for RxBuf {
 impl Drop for RxBuf {
     fn drop(&mut self) {
         self.hdr.zeroize();
+        self.past = Past::Nothing;
     }
 }
 
@@ -84,6 +104,12 @@ impl RxBuf {
         } else {
             self.wire.len()
         }
+    }
+
+    /// Bytes read past the buffered frame: the first byte of the next one's
+    /// prefix, at most.
+    pub(super) fn past_len(&self) -> usize {
+        usize::from(matches!(self.past, Past::Byte(_)))
     }
 
     /// The payload length the current frame announced, once its prefix is in.
@@ -136,6 +162,23 @@ impl RxBuf {
                 return Ok(Filled::Eof);
             }
             let Some(len) = self.want else {
+                // What the watch read past the frame taken last comes first;
+                // it read only with a whole frame buffered, so the next
+                // prefix had not begun.
+                match std::mem::take(&mut self.past) {
+                    Past::Nothing => {}
+                    Past::Byte(byte) => {
+                        debug_assert_eq!(self.hdr_len, 0);
+                        self.hdr[0] = byte;
+                        self.hdr_len = 1;
+                        continue;
+                    }
+                    Past::End => {
+                        debug_assert_eq!(self.hdr_len, 0);
+                        self.fault = Some(RxFault::Eof);
+                        continue;
+                    }
+                }
                 let n = stream.read(&mut self.hdr[self.hdr_len..]).await?;
                 if n == 0 {
                     if self.hdr_len == 0 {
@@ -167,6 +210,35 @@ impl RxBuf {
             }
             self.wire.extend_from_slice(&chunk[..n]);
         }
+    }
+
+    /// With a whole frame buffered (call after [`Self::fill`] returned
+    /// [`Filled::Frame`]), see whether the stream ends right after it,
+    /// reading at most one byte past it: `Ok(true)` once it ended there,
+    /// `Ok(false)` once the next frame began (the byte is kept for the next
+    /// [`Self::fill`], and nothing more is read here), pending while the
+    /// stream stays quiet. Either answer is kept, so a later call returns it
+    /// at once.
+    ///
+    /// Cancel safe: a single one-byte `read`, whose byte is kept before the
+    /// call returns.
+    pub(super) async fn watch_past_frame<R>(&mut self, stream: &mut R) -> std::io::Result<bool>
+    where
+        R: AsyncRead + Unpin,
+    {
+        debug_assert!(self.complete(), "only past a whole frame");
+        match self.past {
+            Past::End => return Ok(true),
+            Past::Byte(_) => return Ok(false),
+            Past::Nothing => {}
+        }
+        let mut byte = [0u8; 1];
+        if stream.read(&mut byte).await? == 0 {
+            self.past = Past::End;
+            return Ok(true);
+        }
+        self.past = Past::Byte(byte[0]);
+        Ok(false)
     }
 }
 
@@ -275,6 +347,81 @@ mod tests {
         assert_eq!(&rx.take_wire()[..], &[0, 0, 0, 0]);
     }
 
+    /// The watch past a whole frame (B04 after the rewrite): it sees the
+    /// stream end right after the frame, or reads the first byte of the
+    /// next frame and nothing more; either answer is kept, the buffered
+    /// frame is untouched, and the next fill starts from what the watch
+    /// read, so every frame and the end still come out in order.
+    #[tokio::test]
+    async fn the_watch_past_a_frame_reads_one_byte_at_most() {
+        // The end right after the frame.
+        let (mut a, mut b) = duplex(4096);
+        a.write_all(&frame(b"first")).await.unwrap();
+        drop(a);
+        let mut rx = RxBuf::default();
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        assert!(rx.watch_past_frame(&mut b).await.unwrap());
+        assert!(rx.watch_past_frame(&mut b).await.unwrap(), "kept");
+        assert_eq!(rx.past_len(), 0);
+        assert_eq!(rx.fault(), None, "the frame comes before the end");
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        assert_eq!(&rx.take_wire()[..], &frame(b"first")[..]);
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Eof);
+
+        // A next frame: its first byte is read, the rest stays in the stream.
+        let (mut a, mut b) = duplex(4096);
+        let second = frame(b"second");
+        let mut both = frame(b"first");
+        both.extend_from_slice(&second);
+        a.write_all(&both).await.unwrap();
+        drop(a);
+        let mut rx = RxBuf::default();
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        assert!(!rx.watch_past_frame(&mut b).await.unwrap());
+        assert!(!rx.watch_past_frame(&mut b).await.unwrap(), "kept");
+        assert_eq!(
+            (rx.buffered(), rx.past_len()),
+            (HEADER_LEN + 5, 1),
+            "the frame and one byte"
+        );
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut b, &mut rest)
+            .await
+            .unwrap();
+        assert_eq!(rest, second[1..], "the rest was left in the stream");
+
+        // The same, read back through the buffer.
+        let (mut a, mut b) = duplex(4096);
+        a.write_all(&both).await.unwrap();
+        drop(a);
+        let mut rx = RxBuf::default();
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        assert!(!rx.watch_past_frame(&mut b).await.unwrap());
+        assert_eq!(&rx.take_wire()[..], &frame(b"first")[..]);
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        assert_eq!(rx.past_len(), 0, "the byte went into the next prefix");
+        assert_eq!(&rx.take_wire()[..], &second[..]);
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Eof);
+
+        // A quiet stream: the watch waits, and dropping it loses nothing.
+        let (mut a, mut b) = duplex(4096);
+        a.write_all(&frame(b"x")).await.unwrap();
+        let mut rx = RxBuf::default();
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            rx.watch_past_frame(&mut b),
+        )
+        .await;
+        assert!(quiet.is_err(), "nothing past the frame yet");
+        assert_eq!(rx.past_len(), 0);
+        a.write_all(&frame(b"y")).await.unwrap();
+        assert!(!rx.watch_past_frame(&mut b).await.unwrap());
+        assert_eq!(&rx.take_wire()[..], &frame(b"x")[..]);
+        assert_eq!(rx.fill(&mut b, 64).await.unwrap(), Filled::Frame);
+        assert_eq!(&rx.take_wire()[..], &frame(b"y")[..]);
+    }
+
     #[test]
     fn debug_prints_sizes_only() {
         let mut rx = RxBuf::default();
@@ -282,8 +429,10 @@ mod tests {
         rx.hdr_len = HEADER_LEN;
         rx.want = Some(3);
         rx.wire.extend_from_slice(&[0, 0, 0, 3, 0xAB, 0xCD, 0xEF]);
+        rx.past = Past::Byte(0xEF);
         let shown = format!("{rx:?}");
         assert!(shown.contains("buffered: 7"), "{shown}");
+        assert!(shown.contains("past: 1"), "{shown}");
         for secret in ["171", "205", "239", "AB", "ab"] {
             assert!(!shown.contains(secret), "{shown}");
         }

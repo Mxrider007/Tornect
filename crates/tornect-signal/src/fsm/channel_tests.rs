@@ -314,7 +314,9 @@ async fn a_write_cut_short_is_the_last_write() {
 }
 
 /// A whole frame that comes while `departure` watches stops the watch from
-/// reading: the next frame stays in the stream, and `recv` takes the first.
+/// reading, once it read the first byte past it (to see the stream end
+/// there): the rest of the next frame stays in the stream, and `recv` takes
+/// the first, then the second whole.
 #[tokio::test(start_paused = true)]
 async fn departure_reads_at_most_one_frame() {
     let (mut chan, mut peer) = established();
@@ -325,6 +327,10 @@ async fn departure_reads_at_most_one_frame() {
     let watched = tokio::time::timeout(Duration::from_millis(10), chan.departure()).await;
     assert!(watched.is_err(), "the peer is still there");
     assert_eq!(chan.rx.buffered(), first.len(), "one frame, no more");
+    assert_eq!(chan.rx.past_len(), 1, "and one byte of the next");
+    let again = tokio::time::timeout(Duration::from_millis(10), chan.departure()).await;
+    assert!(again.is_err(), "a second watch reads nothing more");
+    assert_eq!((chan.rx.buffered(), chan.rx.past_len()), (first.len(), 1));
     let rx = chan
         .recv(Duration::from_secs(1), "frame")
         .await
@@ -339,6 +345,46 @@ async fn departure_reads_at_most_one_frame() {
     assert_eq!(rx.wire, second);
     drop(peer);
     assert!(matches!(chan.departure().await, HandshakeError::Closed));
+}
+
+/// A peer that sends one whole frame while it owes silence and then leaves
+/// is still seen leaving (B04): the watch reads one byte past the frame,
+/// which is the stream's end. The frame is not lost: the next `recv` takes
+/// it, and the one after reads the end. Also when the frame and the end
+/// came before the watch began, and when the watch was dropped in between.
+#[tokio::test(start_paused = true)]
+async fn departure_sees_a_peer_leave_after_one_early_frame() {
+    for watched_first in [false, true] {
+        let (mut chan, mut peer) = established();
+        let first = wire(&ping(1, 1));
+        peer.write_all(&first).await.unwrap();
+        if watched_first {
+            let watched = tokio::time::timeout(Duration::from_millis(10), chan.departure()).await;
+            assert!(watched.is_err(), "the peer is still there");
+            assert_eq!(chan.rx.past_len(), 0, "nothing past the frame yet");
+        }
+        drop(peer);
+        let gone = tokio::time::timeout(Duration::from_millis(10), chan.departure())
+            .await
+            .expect("the leave is seen at once");
+        assert!(matches!(gone, HandshakeError::Closed), "{gone:?}");
+        assert!(
+            matches!(chan.departure().await, HandshakeError::Closed),
+            "kept"
+        );
+        let rx = chan
+            .recv(Duration::from_secs(1), "frame")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.wire, first, "the early frame is still handed on");
+        assert!(
+            chan.recv(Duration::from_secs(1), "frame")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 fn frames_strategy() -> impl Strategy<Value = Vec<(u64, u16)>> {

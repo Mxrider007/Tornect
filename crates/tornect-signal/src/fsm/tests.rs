@@ -10133,6 +10133,58 @@ async fn bytes_the_requester_sends_during_the_card_reach_the_next_read() {
     let _ = task.await;
 }
 
+/// B04 after step A2 (the final review): a requester that sends one whole
+/// frame while its card is up, owing silence, and then leaves is still seen
+/// leaving. The watch holds the frame and reads one byte past it, which is
+/// the stream's end: the card goes at once, unanswered, instead of staying
+/// until the popup's 60 s, and nothing is started or accepted.
+#[tokio::test]
+async fn a_requester_that_sends_a_frame_and_leaves_takes_its_card_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let card = Arc::new(HeldCard::default());
+    host.deps.consent = card.clone();
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
+    card.opened.notified().await;
+    let ping = Envelope::new(
+        raw.chan.version(),
+        raw.chan.next_tx_id(),
+        Kind::Ping,
+        encode_body(&Ping { nonce: 7 }),
+    )
+    .encode();
+    let mut frame = u32::try_from(ping.len()).unwrap().to_be_bytes().to_vec();
+    frame.extend_from_slice(&ping);
+    let mut stream = raw.chan.into_stream();
+    stream.write_all(&frame).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(card.withdrawn.load(Ordering::SeqCst), 0, "still up");
+    drop(stream);
+    // The owner never answers: only the requester's leaving ends the wait.
+    let outcome = host_noticed(task).await;
+    assert!(
+        matches!(outcome, Err(HandshakeError::Closed)),
+        "{outcome:?}"
+    );
+    assert_eq!(card.withdrawn.load(Ordering::SeqCst), 1, "the card went");
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "no on_start");
+}
+
 /// A block window held open until it is taken down, saying when it opened.
 #[derive(Default)]
 struct HeldWindow {

@@ -1232,25 +1232,37 @@ where
     /// broken ([`HandshakeError::Io`]). The peer owes silence then (strict
     /// alternation, §B.3); what it sends anyway is kept, up to one frame, and
     /// handed to the next [`Channel::recv`], which judges it as it would have
-    /// without this watch. Cancel safe: the caller drops this future once it
-    /// decided, and no byte read by then is lost.
+    /// without this watch. Past such a frame the watch reads one byte more,
+    /// kept for the next read too, so a peer that sends one frame and then
+    /// leaves is still seen leaving (B04). It reads no further: a peer that
+    /// begins a second frame while it owes silence, or announces a length
+    /// over the cap, is not watched past that (its card stays until the
+    /// owner answers or the card's timeout). Cancel safe: the caller drops
+    /// this future once it decided, and no byte read by then is lost.
     pub async fn departure(&mut self) -> HandshakeError {
         if self.closing {
             return HandshakeError::Aborted("channel is closing");
         }
-        if self.rx.fault().is_none() {
-            let cap = self.cap();
-            match self.rx.fill(&mut self.stream, cap).await {
-                Ok(Filled::Eof) | Err(FrameError::Truncated) => return HandshakeError::Closed,
-                Err(FrameError::Io(e)) => return HandshakeError::Io(e),
-                // A whole frame, or a length over the cap, came early: the
-                // next read judges it.
-                Ok(Filled::Frame) | Err(FrameError::TooLarge { .. }) => {}
-            }
-        } else if self.rx.fault() == Some(RxFault::Eof) {
-            return HandshakeError::Closed;
+        match self.rx.fault() {
+            Some(RxFault::Eof) => return HandshakeError::Closed,
+            Some(RxFault::Envelope { .. }) => return std::future::pending().await,
+            None => {}
         }
-        std::future::pending().await
+        let cap = self.cap();
+        match self.rx.fill(&mut self.stream, cap).await {
+            Ok(Filled::Eof) | Err(FrameError::Truncated) => return HandshakeError::Closed,
+            Err(FrameError::Io(e)) => return HandshakeError::Io(e),
+            // A length over the cap came early: the next read judges it, and
+            // nothing of its body is read here.
+            Err(FrameError::TooLarge { .. }) => return std::future::pending().await,
+            // A whole frame came early: the next read judges it.
+            Ok(Filled::Frame) => {}
+        }
+        match self.rx.watch_past_frame(&mut self.stream).await {
+            Ok(true) => HandshakeError::Closed,
+            Ok(false) => std::future::pending().await,
+            Err(e) => HandshakeError::Io(e),
+        }
     }
 
     /// Send `BYE{reason}` and close.
