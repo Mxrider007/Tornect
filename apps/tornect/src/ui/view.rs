@@ -1155,8 +1155,6 @@ fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
     });
 }
 
-/// The session sheet's line of what control also gives (the services
-/// design §7.4), in the style of an answer's line.
 /// The session sheet's line while an accept may let the session connect
 /// directly (design `direct` §3.6, \[SEC\]; Phase A: the local address,
 /// the internet address once internet direct connections exist): what
@@ -1184,6 +1182,8 @@ fn direct_line(ui: &mut egui::Ui, label: &str) {
     );
 }
 
+/// The session sheet's line of what control also gives (the services
+/// design §7.4), in the style of an answer's line.
 fn services_answer_line(ui: &mut egui::Ui, line: &str) {
     let t = theme::tokens(ui.ctx());
     ui.add(

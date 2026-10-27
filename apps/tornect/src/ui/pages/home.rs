@@ -949,13 +949,6 @@ fn setup_card(ui: &mut Ui, t: &Tokens, setup: &Setup, sharing: bool, actions: &m
         });
 }
 
-/// The connect stepper (the redesign's §4): the four steps of the
-/// connection this computer asked for, with the elapsed time, the step it is
-/// on, and, when it ended without a session, why, in plain words, with Try
-/// again and Back. The compare-the-code question itself is on the request
-/// sheet; step 2 shows the code and points there. The dialed ID is shown,
-/// never a name the host sent before pairing, and nothing of it while this
-/// screen is shared.
 /// The fourth step's note when the picture opens directly where it can
 /// (design `direct` §3.2, Phase A; the Phase B line is keyed on
 /// `INTERNET_DIRECT`).
@@ -980,6 +973,13 @@ pub(super) fn opening_note(policy: TransportPolicy) -> &'static str {
     }
 }
 
+/// The connect stepper (the redesign's §4): the four steps of the
+/// connection this computer asked for, with the elapsed time, the step it is
+/// on, and, when it ended without a session, why, in plain words, with Try
+/// again and Back. The compare-the-code question itself is on the request
+/// sheet; step 2 shows the code and points there. The dialed ID is shown,
+/// never a name the host sent before pairing, and nothing of it while this
+/// screen is shared.
 fn connect_stepper(
     ui: &mut Ui,
     t: &Tokens,
