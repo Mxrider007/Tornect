@@ -553,6 +553,50 @@ async fn the_signed_policy_refuses_the_paths_it_forbids() {
     conn.served.await.unwrap();
 }
 
+/// The onion media port, which anyone with the Tornect ID can dial, tells a
+/// `Bind` whose MAC does not verify nothing of its session's policy: a wrong
+/// MAC, and the direct MAC of the same session, read `BAD_BIND` on a
+/// `lan_only` session as on an `any` and a `tor_only` one, and leave the
+/// session unbound. Only the right onion MAC reads `TRANSPORT` on the
+/// `lan_only` session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_onion_bind_learns_the_policy_only_with_the_right_mac() {
+    let rig = direct_rig(TestBackend::default());
+    let sessions = [
+        start_direct(&rig.host, 90, TransportPolicy::LanOnly),
+        start_direct(&rig.host, 91, TransportPolicy::Any),
+        start_direct(&rig.host, 92, TransportPolicy::TorOnly),
+    ];
+    for session in &sessions {
+        for bind in [session.bind_with([0; 32]), session.bind(&EKM)] {
+            let (mut client, served) = connect(&rig.host);
+            write_msg(&mut client, &bind).await.unwrap();
+            assert_eq!(
+                read_msg(&mut client).await.unwrap(),
+                Some(Msg::BindRefused {
+                    reason: reason::BAD_BIND
+                }),
+                "session {}",
+                session.id
+            );
+            assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+            assert_eq!(rig.host.route(&session.id), None);
+        }
+    }
+    assert_eq!(rig.sources(), 0, "nothing opened for a refusal");
+
+    let (client, served) = connect(&rig.host);
+    let refused = MediaViewer::bind(client, &sessions[0].onion(), WAIT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, ViewerError::Refused(r) if r == reason::TRANSPORT),
+        "{refused:?}"
+    );
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(rig.sources(), 0);
+}
+
 /// The `Bind` is single-use across both paths: once the direct path claimed
 /// a session, an onion `Bind` (the viewer's fallback arriving late) and a
 /// second direct one are refused, the claim is not published again, and the

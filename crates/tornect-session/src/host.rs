@@ -1063,9 +1063,16 @@ impl MediaHost {
         if bound || session.end.borrow().is_some() {
             return Lookup::Refused(reason::BAD_BIND);
         }
-        // The signed policy, before the proof is looked at: a refusal for
-        // the path says so (the direct design §6.6, check 4).
-        if !proof.allowed_by(session.transport) {
+        // The signed policy (the direct design §6.6, check 4): a refusal for
+        // the path says so. On a direct connection it comes before the
+        // proof, as §6.6 orders: the link's TLS pin already limits the
+        // caller to the session's viewer. On the onion ports, which anyone
+        // with the Tornect ID can dial, it comes only after the MAC
+        // verified, so a peer that knows a session id but not its token
+        // reads `BAD_BIND` whatever the session's policy and learns nothing
+        // of it.
+        let allowed = proof.allowed_by(session.transport);
+        if !allowed && matches!(proof, Proof::Direct { .. }) {
             return Lookup::Refused(reason::TRANSPORT);
         }
         // A wrong MAC leaves the session unbound: a peer that knows a session
@@ -1097,6 +1104,9 @@ impl MediaHost {
         };
         if !verified {
             return Lookup::Refused(reason::BAD_BIND);
+        }
+        if !allowed {
+            return Lookup::Refused(reason::TRANSPORT);
         }
         let proof_mac = match proof {
             Proof::Direct { ekm, .. } => Some(Zeroizing::new(tornect_proto::bind_mac_direct(
