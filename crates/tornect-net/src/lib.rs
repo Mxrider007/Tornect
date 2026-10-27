@@ -4,7 +4,9 @@
 //! session's one UDP socket with its source gates, quinn QUIC with both
 //! device keys pinned, the authenticated punch probes and the checklist
 //! that validates paths with them, and the direct link that wires them
-//! together; then (in the following steps) STUN and router port mapping.
+//! together; the STUN codec and client with the cache of the servers'
+//! names (Phase B); then (in the following steps) router port mapping and
+//! the internet gathering plan.
 //!
 //! Nothing outside this crate may touch sockets or quinn. It never names
 //! `tornect-signal`: the wire forms of candidates are converted in
@@ -20,6 +22,7 @@ use std::pin::Pin;
 pub mod addr;
 pub mod checklist;
 pub mod env;
+pub mod gather;
 pub mod link;
 pub mod local;
 pub mod mapping;
@@ -37,6 +40,9 @@ pub use addr::{
 };
 pub use checklist::{Action, Checklist, PunchRole, PunchStats, Rank};
 pub use env::{NetEnv, RealNet};
+pub use gather::{
+    GATHER_BUDGET, StunAsk, StunDns, StunOutcome, StunReport, StunStats, ask_stun, stun_base,
+};
 pub use link::{
     DialFailure, DirectFail, DirectLink, DirectParams, Established, LinkNews, LinkStats,
     LocalBatch, QuicStream, Route,
@@ -52,7 +58,7 @@ pub use quic::{
     endpoint_config, exporter, is_crypto_close, transport,
 };
 pub use socket::{BoundSocket, QuietUdp, SendErrors, bind_media_socket};
-pub use stun::{StunReply, StunTxid, binding_request, parse_response};
+pub use stun::{StunReply, StunTxid, binding_request, parse_response, partition};
 pub use udp::{
     BoundUdp, ProbeGate, PunchCounters, PunchSocket, RawSend, TeedProbe, TeedStun, Tees, V6Sources,
 };

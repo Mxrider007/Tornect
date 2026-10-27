@@ -14,10 +14,16 @@
 //! understand: a success response with an unknown comprehension-required
 //! attribute is discarded (RFC 8489 §6.3.3), and so is anything malformed.
 //! Tornect never answers STUN, so there is no response encoder here.
+//!
+//! [`partition`] splits the user's server list between the two roles by
+//! operator (§5.3), so that one operator never sees both ends of a
+//! session; the client that asks the servers is
+//! [`gather`](crate::gather)'s.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use crate::TornectRole;
 use crate::addr::Redacted;
 use crate::udp::{STUN_COOKIE, STUN_MAX_LEN, STUN_REQUEST_LEN};
 
@@ -218,6 +224,80 @@ fn decode_address(value: &[u8], xor: Option<&StunTxid>) -> Option<SocketAddr> {
         IpAddr::V6(Ipv6Addr::from(bytes))
     };
     Some(SocketAddr::new(ip, port))
+}
+
+/// The operators of the default list and of the servers users are likely to
+/// add (design §5.3): a host whose name is one of these registrable domains
+/// or below one belongs to that operator, whatever its other labels say
+/// (`stun.l.google.com` and `stun1.l.google.com` are both Google's).
+pub const STUN_OPERATORS: [(&str, &str); 4] = [
+    ("cloudflare.com", "Cloudflare, Inc."),
+    ("google.com", "Google LLC"),
+    ("twilio.com", "Twilio Inc."),
+    ("nextcloud.com", "Nextcloud GmbH"),
+];
+
+/// The operator of a `stun_servers` entry (`host:port`), as the partition
+/// groups entries (design §5.3): the host lowercased, without its port,
+/// brackets or final dot; then a [`STUN_OPERATORS`] domain it is or lies
+/// below, else its last two DNS labels. An IP literal is its own operator:
+/// nothing tells which network runs it.
+#[must_use]
+pub fn operator(entry: &str) -> String {
+    let host = entry.rsplit_once(':').map_or(entry, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_ok() {
+        return host;
+    }
+    for (domain, _) in STUN_OPERATORS {
+        if host == domain || host.strip_suffix(domain).is_some_and(|s| s.ends_with('.')) {
+            return domain.to_owned();
+        }
+    }
+    let labels: Vec<&str> = host.rsplitn(3, '.').collect();
+    match labels.as_slice() {
+        [last, second, ..] => format!("{second}.{last}"),
+        _ => host,
+    }
+}
+
+/// This side's part of the `stun_servers` list (design §5.3): the entries
+/// grouped by [`operator`], the groups in the order their operator first
+/// appears; the viewer takes the groups at even places (0, 2, …) and the
+/// host those at odd places, so no operator is in both parts, whatever the
+/// list. A list of one operator is both sides' part. The entries keep their
+/// order within a group, and an entry listed twice is kept once.
+#[must_use]
+pub fn partition(list: &[String], role: TornectRole) -> Vec<String> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in list {
+        let key = operator(entry);
+        let at = match groups.iter().position(|(k, _)| *k == key) {
+            Some(at) => at,
+            None => {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[at].1;
+        if !group.contains(entry) {
+            group.push(entry.clone());
+        }
+    }
+    if groups.len() == 1 {
+        return groups.remove(0).1;
+    }
+    let first = match role {
+        TornectRole::Viewer => 0,
+        TornectRole::Host => 1,
+    };
+    groups
+        .into_iter()
+        .skip(first)
+        .step_by(2)
+        .flat_map(|(_, entries)| entries)
+        .collect()
 }
 
 #[cfg(test)]

@@ -6,15 +6,19 @@
 //!
 //! The calls that read this computer's addresses (step A7) and bind the
 //! session socket (step A8) are here, and since step B1 the two that STUN
-//! and router mapping need: [`NetEnv::resolve`] (the STUN servers' names;
-//! the cache in front of it is step B3's) and [`NetEnv::mapper`] (the real
-//! router protocols are steps B4 and B5).
+//! and router mapping need: [`NetEnv::resolve`] (the STUN servers' names,
+//! answered from the [`StunDns`] cache that [`RealNet::prefetch`] keeps
+//! filled, step B3) and [`NetEnv::mapper`] (the real router protocols are
+//! steps B4 and B5).
 
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use tokio::task::AbortHandle;
+
+use crate::gather::{Resolver, StunDns};
 use crate::local::{self, IfaceAddr, RouteSources};
 use crate::mapping::{NoMapper, PortMapper};
 use crate::socket::bind_media_socket;
@@ -46,8 +50,10 @@ pub trait NetEnv: Send + Sync {
     fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp>;
 
     /// The addresses of `host` (a STUN server's name from the user's list)
-    /// with `port` (design §7.3 `StunDns`). Called at start and on the
-    /// jittered refresh, never per session; the caller bounds the wait.
+    /// with `port` (design §7.3). Cache-first: the real machine answers from
+    /// the [`StunDns`] its background refresh fills, and asks the resolver
+    /// only for a name the cache does not hold. The caller bounds the wait
+    /// ([`DNS_TIMEOUT`](crate::gather::DNS_TIMEOUT)).
     ///
     /// # Errors
     ///
@@ -68,10 +74,13 @@ pub trait NetEnv: Send + Sync {
 /// lookup [`RealNet::with_gateway_lookup`] takes.
 pub type GatewayLookup = Arc<dyn Fn(u32) -> Option<Ipv4Addr> + Send + Sync>;
 
-/// The real machine.
+/// The real machine. Dropping it stops its background refresh
+/// ([`RealNet::prefetch`]).
 pub struct RealNet {
     gateway: Option<GatewayLookup>,
     mapper: Arc<dyn PortMapper>,
+    dns: StunDns,
+    prefetch: Mutex<Option<AbortHandle>>,
 }
 
 impl Default for RealNet {
@@ -79,8 +88,21 @@ impl Default for RealNet {
         Self {
             gateway: None,
             mapper: Arc::new(NoMapper),
+            dns: StunDns::new(),
+            prefetch: Mutex::new(None),
         }
     }
+}
+
+/// The system resolver (`getaddrinfo` on tokio's blocking pool); a literal
+/// is answered without a query.
+fn system_lookup(host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+    let host = host.to_owned();
+    Box::pin(async move {
+        Ok(tokio::net::lookup_host((host.as_str(), port))
+            .await?
+            .collect())
+    })
 }
 
 impl RealNet {
@@ -107,12 +129,58 @@ impl RealNet {
         self.gateway = Some(Arc::new(lookup));
         self
     }
+
+    /// The cache [`NetEnv::resolve`] answers from.
+    #[must_use]
+    pub fn stun_dns(&self) -> &StunDns {
+        &self.dns
+    }
+
+    /// Starts the background refresh of the STUN servers' names on the
+    /// current tokio runtime (design §5.3; [`StunDns::run`]): a round now,
+    /// then one every 10 min ± 1 min, through the system resolver. `entries`
+    /// is read at each round and returns the list to resolve, or nothing
+    /// when the refresh is not allowed now (it is only while the internet
+    /// direct path is on, the effective policy allows direct paths, STUN is
+    /// on and no bridge is in use); the app calls this at start (GUI, `host`,
+    /// `connect`). A refresh already running is replaced. Returns false
+    /// outside a tokio runtime, where nothing starts.
+    pub fn prefetch(&self, entries: impl Fn() -> Vec<String> + Send + Sync + 'static) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let lookup: Resolver = Arc::new(system_lookup);
+        let task = runtime.spawn(self.dns.clone().run(entries, lookup));
+        let previous = self
+            .prefetch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(task.abort_handle());
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+        true
+    }
+}
+
+impl Drop for RealNet {
+    fn drop(&mut self) {
+        let running = self
+            .prefetch
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(running) = running {
+            running.abort();
+        }
+    }
 }
 
 impl fmt::Debug for RealNet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RealNet")
             .field("gateway_lookup", &self.gateway.is_some())
+            .field("dns", &self.dns)
             .finish_non_exhaustive()
     }
 }
@@ -142,14 +210,25 @@ impl NetEnv for RealNet {
         BoundUdp::quiet(bind_media_socket(port)?)
     }
 
-    /// The OS resolver (`getaddrinfo` on tokio's blocking pool); a literal
-    /// address is returned without a query.
+    /// A literal address without a query; a cached name from the cache;
+    /// any other name through the OS resolver (`getaddrinfo` on tokio's
+    /// blocking pool), its answer cached. Only a session that starts before
+    /// the first refresh round has answered (the one-shot `connect`) waits
+    /// on DNS.
     fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let addr = SocketAddr::new(ip, port);
+            return Box::pin(async move { Ok(vec![addr]) });
+        }
+        if let Some(cached) = self.dns.get(host, port) {
+            return Box::pin(async move { Ok(cached) });
+        }
+        let dns = self.dns.clone();
         let host = host.to_owned();
         Box::pin(async move {
-            Ok(tokio::net::lookup_host((host.as_str(), port))
-                .await?
-                .collect())
+            let addrs = system_lookup(&host, port).await?;
+            dns.put(&host, port, addrs.clone());
+            Ok(addrs)
         })
     }
 
@@ -238,6 +317,73 @@ mod tests {
                 .expect_err("no router protocol yet"),
             crate::MapFail::NoGateway
         );
+    }
+
+    /// Design §5.3: a name the cache holds is answered from it, in any case
+    /// and with or without its final dot, and the resolver is not asked
+    /// (an `.invalid` name, RFC 6761 §6.4, resolves nowhere); an IP literal
+    /// is not cached.
+    #[tokio::test]
+    async fn the_real_machine_answers_names_from_its_cache() {
+        let env = RealNet::new();
+        let addr: SocketAddr = "64.0.0.10:3478".parse().unwrap();
+        env.stun_dns().put("stun.example.invalid", 3478, vec![addr]);
+        for name in ["stun.example.invalid", "STUN.Example.Invalid."] {
+            assert_eq!(env.resolve(name, 3478).await.expect("cached"), vec![addr]);
+        }
+        env.resolve("64.0.0.11", 3478).await.expect("a literal");
+        assert_eq!(env.stun_dns().len(), 1);
+        assert!(format!("{env:?}").contains("names: 1"), "{env:?}");
+    }
+
+    /// The background refresh needs a runtime to start on.
+    #[test]
+    fn the_prefetch_needs_a_runtime() {
+        assert!(!RealNet::new().prefetch(Vec::new));
+    }
+
+    /// Design §5.3: the refresh runs on the runtime and reads its list at
+    /// each round; an empty list (the refresh is not allowed now) asks no
+    /// resolver and empties the cache. A second call replaces the first
+    /// refresh, and dropping the machine stops the last one (each task's
+    /// list closure is dropped with it).
+    #[tokio::test]
+    async fn the_prefetch_runs_on_the_runtime_and_stops_with_the_machine() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        async fn until(what: impl Fn() -> bool) {
+            for _ in 0..500 {
+                if what() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("not within a second");
+        }
+        let env = RealNet::new();
+        env.stun_dns().put(
+            "stun.example.invalid",
+            3478,
+            vec!["64.0.0.10:3478".parse().unwrap()],
+        );
+        let first = Arc::new(AtomicUsize::new(0));
+        let rounds = Arc::clone(&first);
+        assert!(env.prefetch(move || {
+            rounds.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }));
+        until(|| first.load(Ordering::SeqCst) == 1 && env.stun_dns().is_empty()).await;
+
+        let second = Arc::new(AtomicUsize::new(0));
+        let rounds = Arc::clone(&second);
+        assert!(env.prefetch(move || {
+            rounds.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }));
+        until(|| second.load(Ordering::SeqCst) == 1).await;
+        until(|| Arc::strong_count(&first) == 1).await;
+        assert_eq!(first.load(Ordering::SeqCst), 1, "replaced, not run again");
+        drop(env);
+        until(|| Arc::strong_count(&second) == 1).await;
     }
 
     /// The gateway lookup fills what netdev left empty, once per

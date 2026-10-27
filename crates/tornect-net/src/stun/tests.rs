@@ -487,6 +487,115 @@ fn the_fuzz_seeds_are_the_rfc_vectors() {
     );
 }
 
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// Design §5.3: hosts are grouped by the operator table first, by their
+/// last two labels otherwise; case, a final dot, brackets and the port do
+/// not matter, and an IP literal is its own operator.
+#[test]
+fn entries_are_grouped_by_operator() {
+    for (entry, key) in [
+        ("stun.l.google.com:19302", "google.com"),
+        ("stun1.l.google.com:19302", "google.com"),
+        ("STUN.L.Google.COM.:19302", "google.com"),
+        ("google.com:3478", "google.com"),
+        ("stun.cloudflare.com:3478", "cloudflare.com"),
+        ("global.stun.twilio.com:3478", "twilio.com"),
+        ("stun.nextcloud.com:443", "nextcloud.com"),
+        ("notgoogle.com:3478", "notgoogle.com"),
+        ("stun.example.org:3478", "example.org"),
+        ("a.b.stun.example.org:3478", "example.org"),
+        ("stun.example.co.uk:3478", "co.uk"),
+        ("localhost:3478", "localhost"),
+        ("192.0.2.7:3478", "192.0.2.7"),
+        ("[2001:DB8::7]:3478", "2001:db8::7"),
+    ] {
+        assert_eq!(operator(entry), key, "{entry}");
+    }
+    let names: Vec<&str> = STUN_OPERATORS.iter().map(|(_, name)| *name).collect();
+    assert_eq!(
+        names,
+        [
+            "Cloudflare, Inc.",
+            "Google LLC",
+            "Twilio Inc.",
+            "Nextcloud GmbH"
+        ]
+    );
+}
+
+/// Design §5.4: the default list gives the viewer Cloudflare and Twilio and
+/// the host Google and Nextcloud, each entry on a port the STUN filter
+/// admits.
+#[test]
+fn the_default_list_splits_into_two_operators_per_side() {
+    let list = tornect_core::config::Network::default().stun_servers;
+    assert_eq!(
+        partition(&list, TornectRole::Viewer),
+        strings(&["stun.cloudflare.com:3478", "global.stun.twilio.com:3478"])
+    );
+    assert_eq!(
+        partition(&list, TornectRole::Host),
+        strings(&["stun.l.google.com:19302", "stun.nextcloud.com:443"])
+    );
+    for entry in &list {
+        let port: u16 = entry.rsplit_once(':').unwrap().1.parse().unwrap();
+        assert_ne!(port, 0, "{entry}");
+    }
+}
+
+/// Design §5.3: the earlier default (Google twice, then Cloudflare) puts
+/// Google in one part only, however the entries are ordered; a list of one
+/// operator is both sides' part; an empty list is nobody's.
+#[test]
+fn no_operator_is_in_both_parts() {
+    let old = strings(&tornect_core::config::OLD_DEFAULT_STUN);
+    assert_eq!(
+        partition(&old, TornectRole::Viewer),
+        strings(&["stun.l.google.com:19302", "stun1.l.google.com:19302"])
+    );
+    assert_eq!(
+        partition(&old, TornectRole::Host),
+        strings(&["stun.cloudflare.com:3478"])
+    );
+    let mixed = strings(&[
+        "stun.l.google.com:19302",
+        "stun.cloudflare.com:3478",
+        "stun1.l.google.com:19302",
+    ]);
+    assert_eq!(
+        partition(&mixed, TornectRole::Viewer),
+        strings(&["stun.l.google.com:19302", "stun1.l.google.com:19302"])
+    );
+    assert_eq!(
+        partition(&mixed, TornectRole::Host),
+        strings(&["stun.cloudflare.com:3478"])
+    );
+
+    let one = strings(&["stun.l.google.com:19302", "stun2.l.google.com:19302"]);
+    assert_eq!(partition(&one, TornectRole::Viewer), one);
+    assert_eq!(partition(&one, TornectRole::Host), one);
+    let twice = strings(&["stun.example.org:3478", "stun.example.org:3478"]);
+    assert_eq!(
+        partition(&twice, TornectRole::Host),
+        strings(&["stun.example.org:3478"])
+    );
+
+    assert!(partition(&[], TornectRole::Viewer).is_empty());
+    assert!(partition(&[], TornectRole::Host).is_empty());
+    let three = strings(&["a.one.org:1", "b.two.org:2", "c.three.org:3"]);
+    assert_eq!(
+        partition(&three, TornectRole::Viewer),
+        strings(&["a.one.org:1", "c.three.org:3"])
+    );
+    assert_eq!(
+        partition(&three, TornectRole::Host),
+        strings(&["b.two.org:2"])
+    );
+}
+
 fn any_addr() -> impl Strategy<Value = SocketAddr> {
     prop_oneof![
         (any::<[u8; 4]>(), any::<u16>())
@@ -507,7 +616,59 @@ fn optional_attrs() -> impl Strategy<Value = Vec<(u16, Vec<u8>)>> {
     )
 }
 
+/// A list of entries from a small set of operators, in any order, with
+/// repeats.
+fn any_list() -> impl Strategy<Value = Vec<String>> {
+    proptest::collection::vec(
+        (
+            prop::sample::select(vec!["stun", "stun1", "a.b", "STUN"]),
+            prop::sample::select(vec![
+                "google.com",
+                "cloudflare.com",
+                "example.org",
+                "example.net",
+                "twilio.com",
+            ]),
+            1_u16..,
+        )
+            .prop_map(|(sub, domain, port)| format!("{sub}.{domain}:{port}")),
+        0..10,
+    )
+}
+
 proptest! {
+    /// Design §5.3 for any list: with two operators or more, no operator is
+    /// in both parts and the parts together hold every entry once; with one,
+    /// both parts are the whole list.
+    #[test]
+    fn the_partition_never_shares_an_operator(list in any_list()) {
+        let viewer = partition(&list, TornectRole::Viewer);
+        let host = partition(&list, TornectRole::Host);
+        let mut operators: Vec<String> = list.iter().map(|e| operator(e)).collect();
+        operators.sort();
+        operators.dedup();
+        let mut unique = list.clone();
+        unique.sort();
+        unique.dedup();
+        if operators.len() == 1 {
+            prop_assert_eq!(&viewer, &host);
+            let mut whole = viewer.clone();
+            whole.sort();
+            prop_assert_eq!(whole, unique);
+        } else {
+            for v in &viewer {
+                prop_assert!(!host.iter().any(|h| operator(h) == operator(v)), "{} {:?}", v, host);
+            }
+            let mut both: Vec<String> = viewer.iter().chain(&host).cloned().collect();
+            both.sort();
+            prop_assert_eq!(both, unique);
+        }
+        if !list.is_empty() {
+            prop_assert!(!viewer.is_empty());
+            prop_assert_eq!(operator(&viewer[0]), operator(&list[0]));
+        }
+    }
+
     /// A response built from any address, transaction ID and optional
     /// attributes reads back as that address, XOR-mapped or plain.
     #[test]
