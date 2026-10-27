@@ -129,6 +129,31 @@ every session at once, press **Ctrl-C in the console where `tornect.exe host`
 runs**, or press Stop on the banner or the "Tornect: sharing" window when you
 use the window.
 
+## Direct connections on one network
+
+When both computers are on the same local network, a session's picture and
+input go straight between them over an encrypted connection (QUIC, each
+computer checking the other's key), which is faster than Tor; chat, clipboard
+text and files still go over Tor. Tor also still finds the other computer,
+checks who it is and carries the question; the two computers exchange their
+local-network addresses only after the sharing side accepts, so a computer you
+accept learns this computer's local address. The sharing side is told so when
+it decides (in the window's question, and in `tornect host`'s `note:` line).
+When no direct path is ready within 4 seconds, the session goes over Tor as
+before. Across the internet, every session still goes over Tor in this build.
+
+To keep every session on Tor, switch off "Connect directly when both
+computers are on the same local network" in Settings > Connection, or set
+`paranoid = true` under `[network]` in `config.toml`; `tornect connect
+--tor-only` does it for one session. Direct connections are also off while
+Tor reaches the network through a bridge. `tornect connect` prints which way
+the picture went (`ROUTE direct lan` or `ROUTE tor <reason>`), and `tornect
+doctor` says whether direct connections are on.
+
+On Windows, the first direct connection may make Windows ask whether Tornect
+may communicate on your networks: choose "Allow access". If you cancel, or
+this Windows account cannot change the firewall, sessions go over Tor.
+
 ## Start at logon
 
 `tornect service install` registers Tornect (this executable) to start after

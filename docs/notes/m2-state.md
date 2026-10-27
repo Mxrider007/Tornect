@@ -104,15 +104,23 @@ and the crates below ring check here).
 
 ## OPEN, owned by Phase B steps
 
+- B1/B2: the research and pins of the internet half (igd-next, crab_nat, netdev `gateway`, the
+  Windows route lookup) and the STUN codec (`stun.rs`, RFC 5769 vectors, the `stun` fuzz target).
 - B3/B6: server-reflexive candidates (a CGNAT-only computer), the second ULA design gap (B6).
 - B4/B5: router mapping (UPnP, PCP, NAT-PMP), `default_gateway_v4`, the `router_port` ledger sweep.
-- B7: the internet-scope ranks in `MemNet`.
+- B7/B8: the internet-scope ranks in `MemNet`; `NatBox`, `MemStun`, `MemMapper`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
 - B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
-  `direct_loopback_stats` shows 15 fps) and the `SecondStream` hook.
+  `direct_loopback_stats` shows 15 fps), the `SecondStream` hook (services on a direct session
+  still go over the onion service) and the onion stream-count test.
 - B11: the Phase B copy and settings (STUN, router mapping).
-- B13: the internet checkpoint, the `stun` fuzz target, tag `m2b`.
-- C1: the final text of decision rows M1-77 to M1-86 (still placeholders with step notes).
+- B12: `INTERNET_DIRECT = true`.
+- B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11, 15 and 16
+  (row 16, measured punch success, already reads the Phase A runs), tag `m2b`.
+- C1: the final text of decision rows M1-77 to M1-86 (still placeholders with step notes) and of
+  the plan: `docs/PLAN.md` describes Phase A since the Phase A close (Part C M2 amended, §B.2,
+  §B.6, §B.8.6.4, §B.8.17 item 7, Parts E and G), in words C1 replaces with the final ones.
+- C2: the security-reviewer pass over the whole feature, the Accept demo, tag `m2`.
 
 ## Gotchas found at this checkpoint
 

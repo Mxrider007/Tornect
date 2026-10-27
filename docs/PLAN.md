@@ -152,7 +152,7 @@ deleting their setup pain (pairing PINs on a web UI, port forwarding, VPNs).
 | D3 | Identity | **Onion v3 address = host identity**; separate per-device ed25519 keys for client devices, pinned at pairing | Self-authenticating, zero-infrastructure, human-shareable (56 chars, QR) | Custom PKI (needs infrastructure); iroh EndpointIds (ties identity to iroh) |
 | D4 | Signaling | Length-prefixed **CBOR** messages over an onion stream (versioned envelope) | Tor circuit is already E2E-encrypted+authenticated to the onion key; CBOR = compact, schema-evolvable, great serde support | JSON (fine, fatter); protobuf (codegen friction for little gain here) |
 | D5 | Media transport | **QUIC via `quinn`**: unreliable **datagrams** for A/V, reliable streams for control and input, and one reliable services stream for chat, clipboard text and files (decision M1-76, §B.4); TLS 1.3 with both ends pinning the peer's Tornect keys (no CA; RFC 7250 raw public keys, §B.6) | One connection, E2E-encrypted, congestion-controlled, punchable; matches iroh/MoQ direction | str0m WebRTC (keep as documented plan-B; needed only for future browser client); raw UDP + custom crypto (reinventing TLS) |
-| D6 | NAT traversal | ICE-style candidate gathering (host addrs + **UPnP/NAT-PMP/PCP** port mapping + server-reflexive via a **user-editable public STUN list**), exchange over Tor, simultaneous-open punch (STUN-style probes outside QUIC on the media socket, §B.2), then QUIC | Maximizes direct-connect rate with zero owned infra; STUN is stateless free public infrastructure and is *optional* | Own STUN/TURN (violates "no servers"); iroh as connectivity backend (excellent, but pulls in n0's relay/discovery plane by default — keep as an optional feature-flagged backend for de-risking) |
+| D6 | NAT traversal | ICE-style candidate gathering (host addrs + **UPnP/NAT-PMP/PCP** port mapping + server-reflexive via a **user-editable public STUN list**), exchange over Tor, simultaneous-open punch (STUN-style probes outside QUIC on the media socket, §B.2), then QUIC. *M2 (decisions M1-78, M1-80, M1-81):* the addresses are exchanged only after `SESSION_ACCEPT`, the viewer first; the probes are 40-byte HMAC datagrams; STUN is a hand-written RFC 8489 Binding codec, not the `stun` crate. Phase A (built, checkpoint `m2a`) offers same-site candidates only (on-link private IPv4, unique-local IPv6); Phase B adds the public, server-reflexive and mapped ones | Maximizes direct-connect rate with zero owned infra; STUN is stateless free public infrastructure and is *optional* | Own STUN/TURN (violates "no servers"); iroh as connectivity backend (excellent, but pulls in n0's relay/discovery plane by default — keep as an optional feature-flagged backend for de-risking) |
 | D7 | Fallback path | **Stream over the Tor circuit itself** (TCP-like onion stream): capped preset ~1–6 Mbit/s, H.264, aggressive downscale, "relayed via Tor" badge | Guarantees Tornect *always* connects — the killer differentiator; also doubles as "paranoid mode" (peers never learn each other's IP) | TURN (needs servers); giving up (Moonlight's answer) |
 | D8 | Video pipeline | Capture→encode zero-copy on GPU per §A.2; **the OS and vendor codec APIs directly behind `tornect-codec`'s trait** (r7, decision M1-56): Media Foundation + NVENC on Windows, **OpenH264 always**, VA-API designed behind the same trait but not shipped in v1, **no FFmpeg in v1**; one wire format, H.264 Constrained Baseline (§B.5); decode→render via **wgpu** (Vulkan/Metal/D3D12) with NV12/P010 shaders | Nothing codec-related ships (Media Foundation comes with Windows, the NVENC runtime with the driver); FFmpeg does not build on the dev VM and breaks ABI between majors (§A.2); Constrained Baseline keeps every existing viewer compatible; wgpu = one renderer for all OSes | GStreamer (capable, but heavy runtime dependency + plugin hell for end-users); FFmpeg in v1 (r6's choice: build, ABI, shipping and licence surface — r7); AMD AMF and Intel VPL directly (reached through Media Foundation on Windows; no test machine) |
 | D9 | Audio | **Opus** 48 kHz, 10 ms frames (`Application::LowDelay`, in-band FEC off, previous-frame redundancy — §B.4), in QUIC datagrams; WASAPI loopback / ScreenCaptureKit audio / PipeWire capture | The only sane real-time audio codec; `libopus` 1.6.1 bundled by the **`opus` crate** (`=0.4.0` → `opusic-sys`, built with cmake, no pkg-config/bindgen), round-trip verified on the dev VM (docs/research/codecs.md §5) | `audiopus`/`audiopus_sys` (stale since 2021) |
@@ -173,6 +173,11 @@ deleting their setup pain (pairing PINs on a web UI, port forwarding, VPNs).
    + LAN + Tor fallback. This trade-off is documented in-app ("Network" settings).
 4. **Direct mode reveals IPs to each other** (that's what "direct" means). Paranoid
    mode = force Tor relay path, media quality capped. Explicit toggle, clear copy.
+   *M2 (decisions M1-78, M1-84, M1-86):* direct connections are on by default (`network.paranoid = false`);
+   the addresses go only to a peer the host accepted, after `SESSION_ACCEPT`, and the host is told so where it
+   decides (the consent sheet, the CLI prompt, the unattended grant sheet); direct connections are off while Tor
+   reaches the network through a bridge (a direct flow would show the network the Tornect use the bridge hides;
+   `network.direct_with_bridges` overrides). Phase A (checkpoint `m2a`) reveals local-network addresses only.
 5. **CGNAT + symmetric NAT both sides**: punch success will fail for some pairs
    (industry direct-connect rates are roughly 80–90 %); those users live on the Tor
    fallback until we ship optional user-hosted relay ("bring your own relay") in v2.
@@ -386,26 +391,43 @@ HELLO_ACK{v chosen, host_nonce} ──►                                   (sig
    └─ unattended branch (§B.8.4), no popup: AUTH_CHALLENGE{ke2} ──►  ◄── AUTH_RESPONSE{ke3}
       pinned device key + per-grant password (OPAQUE) replace the click; block window
       with [Block] on the host; indicator + log unchanged
-SESSION_ACCEPT{caps chosen, session_token | token_confirm, quic_spki, session_type, mode, elevation? (r7, §B.2.1)}
-◄── CANDIDATES{[]}  ──── both sides gather in parallel ────  CANDIDATES{[]} ──►
-        host: local addrs, UPnP/NAT-PMP mapped, STUN reflexive (if enabled)
-punch: STUN-style probes *outside QUIC*, both sides at once on the shared media socket
-       (ICE pacing: one probe per Ta = 50 ms, RTO ≥ 500 ms doubling; the checklist is pruned to ≈ 20 pairs by the
-       RFC 8445 §6.1.2.3 pair-priority ordering — ICE's 100 default is far above what 4 s at Ta = 50 ms can sweep
-       with ~3 retransmits, nat.md §5.3 — and ≤ 8 pairs are in flight at once; trickle ok);
-       the first pair validated in both directions is nominated, then exactly one QUIC dial:
+SESSION_ACCEPT{caps chosen, session_token | token_confirm, quic_spki, session_type, mode, elevation? (r7, §B.2.1),
+               transport_policy (signed; an unattended session's from its grant's receipt)}
+── path phase (M2, decisions M1-78…M1-86; only when both HELLO.feats and HELLO_ACK.feats hold `dir1`) ──
+   T0 = the client's receipt of SESSION_ACCEPT; the client decides from the host's signed policy and its own
+   (Paranoid, a bridge in use, `connect --tor-only`), and answers at once with TOR_FALLBACK{reason} — no
+   interface read, nothing bound — for a Tor-only side, an old host (no `dir1`: the M1 bytes, no delay),
+   this same device, or a session without media; where either side is `lan_only`, the first three end the
+   session with BYE{NO_LAN_PATH} instead (decision M1-85)
+◄── CANDIDATES{[same-site…], scope}  ── client first: the host binds and reveals nothing before it ──
+        (the client opens the onion media stream in parallel: the fallback's stream, used if younger than 8 s)
+CANDIDATES{[same-site…], scope echoed} ──►    CANDIDATES_DONE both ways (trickle, ≤ 6 CANDIDATES per side)
+punch: 40-byte HMAC probes *outside QUIC* on the one session socket, both sides at once, no constant magic
+       (lead byte 0x04–0x3F: neither QUIC with the grease bit off nor STUN); Ta = 20 ms, ≤ 8 targets in
+       flight, same-site schedule 0/200/400/800 ms (failed at 1 200 ms), peer-reflexive learning, triggered
+       checks, ≤ 480 B to an unvalidated address and ≤ 5 760 B per session; a source gate hides from quinn
+       every datagram not from a validated address; then exactly one QUIC dial, to a validated address:
        the side with the numerically lower device public key is the QUIC client
        (`connect_with`, per-peer pin) and the other only accepts — no concurrent Initials,
        no duplicate connections (docs/research/nat.md §5, quic.md §5, §12.14; one-socket demux
        needs `EndpointConfig::grease_quic_bit(false)` on both ends, RFC 9443)
-═══════ direct QUIC established (TLS 1.3 raw public keys, both SPKIs pinned) ════════
-        first frame on ctrl, both directions: BIND{mac} over the TLS exporter keyed by session_token
-        (§B.8.4.3); nothing else is accepted, and capture never starts, before a valid BIND
-        └─ if no pair succeeds within 4 s: TOR_FALLBACK{} → open second onion
-           stream and carry the same QUIC connection (and thus the BIND check)
-           over a length-framed tunnel (transport choice pending §B.8.17 item 7, decided at M2)
-media flows (datagrams) + control/input (streams); Tor circuit kept as low-rate
-heartbeat + renegotiation channel; teardown on BYE or circuit loss
+═══════ direct QUIC established (TLS 1.3 raw public keys, both SPKIs pinned; no ALPN, no SNI, no tickets,
+        no 0-RTT, no migration) ════════
+◄── Bind{session_id, mac} first on the one bidirectional stream: HMAC over th_final ‖ the TLS exporter,
+        keyed from session_token (§B.8.4.3) — the client's commit point: no Tor fallback after it, except
+        for a connection closed by a TLS alert before any host stream byte (the host never claimed)
+BindProof{mac} ──► (the host's own exporter-bound MAC, checked in constant time), then capture opens and
+        BindOk follows the first picture; nothing else is accepted, and capture never starts, before a valid Bind
+        └─ if no direct path is ready network.punch_timeout_ms (4 s; 1–10 s) after T0, or the checklist
+           fails early: the client closes its link, sends TOR_FALLBACK{reason} and binds the onion media
+           stream exactly as at M1 (`MEDIA_PORT` 4001, the onion Bind MAC; decisions M1-39, M1-41) — no QUIC
+           over Tor (decision M1-79, §B.8.17 item 7); the host closes its link at the TOR_FALLBACK, or at
+           the onion claim, and 20 s after its bind without a Bind
+media flows on the bound stream (M3 adds datagrams) + control/input; Tor circuit kept as low-rate
+heartbeat + renegotiation channel; no switch between the paths mid-session; teardown on BYE or circuit loss
+Phase A (built, checkpoint `m2a`): same-site candidates only — on-link private IPv4 and unique-local IPv6.
+Phase B (not built): + one public IPv4, one global IPv6, one server-reflexive (one public STUN server per side)
+and one router mapping per side; internet schedule 0/500/1000/2000 ms (failed at 3 000 ms)
 ```
 
 Key properties: for attended sessions the consent popup **always** runs on the host
@@ -914,9 +936,33 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
   sent file's host path (§B.8.13). Unattended sessions follow the grant's signed mode with the same switches and the
   same input gate (no new grant field). Wherever Control is given, the host says what control also gives: the session
   sheet, the "Ask before starting" sheet, the wizard's ① and ⑤ (§B.8.7.1) and the block window.
-- **Privacy modes**: Default (signaling via Tor, media direct — peers see each
-  other's IP, stated in UI) · **Paranoid** (everything via Tor, quality capped) ·
-  LAN-only toggle.
+- **Privacy modes**: Default (signaling via Tor, media direct when the two computers can reach each other,
+  otherwise relayed through Tor — peers see each other's IP, stated in UI and at consent) · **Paranoid**
+  (everything via Tor, quality capped; `network.paranoid`, the switch of Settings > Connection, *Direct connections*) ·
+  LAN-only (`network.lan_only`, config only: same-site direct, no Tor media fallback, for both roles,
+  decision M1-85). Direct is off while Tor uses a bridge (decision M1-86).
+- **The direct path** (M2; decisions M1-77…M1-86; design `direct`; Phase A built, checkpoint `m2a`):
+  **who learns what** — a stranger, an unpaired, denied or blocked peer learns only that the build supports direct
+  (`dir1` in `HELLO_ACK`); the accepted peer, view-only included, learns this computer's local addresses (Phase B:
+  also its public IPv4 and one global IPv6), after `SESSION_ACCEPT` and the viewer first; a side whose signed or
+  effective policy is Tor-only (Paranoid, an unattended grant's `require_tor_only`, a bridge, `--tor-only`) reads no
+  interface, binds nothing and sends no UDP. **Policy:** the host enforces the policy its written accept signed
+  (`LiveSession.transport`; for an unattended session the grant's receipt), on both paths: a direct `Bind` is refused
+  for `tor_only`, an onion one for `lan_only`; the `Bind` is single-use across the paths. **Authentication:** raw
+  public keys pinned both ways (no CA, no resumption, no 0-RTT), plus `Bind` and `BindProof` MACs over `th_final` and
+  the TLS exporter keyed from `session_token`; a stolen device key without the token binds nothing. **No reflector:**
+  40-byte probes answered only to admitted, authenticated sources; at most 480 B to any unvalidated address, 5 760 B
+  of probes per session, 2 bytes out per spoofed byte in; nothing reaches quinn from, and quinn sends nothing to, an
+  unvalidated address. **Never logged** (decision M1-83): no address, port or device key; the network crates'
+  targets (`quinn`, `quinn_proto`, `quinn_udp`, `rustls` — which logs both device keys at TRACE — `netdev`,
+  `netlink_*`, `igd_next`, `crab_nat`, `hyper`, `hyper_util`, `h2`, `xmltree`, `xml`) are dropped unless identifiers
+  are opted in; `sessions.log` keeps the route kind and a `path_summary` (outcome, winner kind, IPv6 or not, ms).
+  **Residuals:** an on-path observer (ISP, Wi-Fi, VPN provider) sees two addresses exchange UDP — fixed 40-byte
+  probes, then a QUIC v1 handshake without SNI or ALPN carrying RFC 7250 certificate types, a pattern few programs
+  produce — and may recognise Tornect; hence no direct path while Tor uses a bridge, and the Privacy copy says so. A
+  lost local network ends the media about 10 s later (QUIC idle timeout; no mid-session switch, decision M1-79). One
+  device key signs Tornect envelopes and TLS `CertificateVerify`; the prefixes differ in their first byte, so neither
+  signature verifies in the other context (`docs/research/quic.md` §3.5).
 - **No telemetry.** Crash dumps opt-in, written locally.
 - Threats explicitly *out of scope* v1: compromised endpoints, Tor global passive
   adversary deanonymization, side-channels in shared GPU environments.
@@ -1591,9 +1637,14 @@ services stream binds with caps ⊆ `CHAT`, and a clipboard or file frame on it 
 `Close{NOT_OFFERED}` before its body is read (the session goes on); `ctrl` accepts only
 bitrate/IDR/cursor-shape (unchanged); the mode is signed into `SESSION_ACCEPT` and enforced host-side from
 the `PolicyReceipt`. **Transport policy** (signed): `tor_only` ⇒ neither side sends
-`CANDIDATES`, host sends `TOR_FALLBACK` immediately (the relative never learns the owner's
-IP); `lan_only` ⇒ link-local candidates only, no Tor media fallback, failure ⇒
-`BYE{NO_LAN_PATH}`; signaling always traverses Tor in v1.
+`CANDIDATES`, host sends `TOR_FALLBACK{OFF}` immediately (the relative never learns the owner's
+IP; the host reads no interface and binds nothing, even against a client that sends `CANDIDATES` anyway,
+and refuses a direct `Bind` with `TRANSPORT`); `lan_only` ⇒ same-site candidates only (inside one of this
+computer's on-link private IPv4 prefixes or its unique-local /48, never link-local, never a STUN server or the
+router), no Tor media fallback (an onion `Bind` is refused with `TRANSPORT`, and no onion services stream binds),
+failure ⇒ `BYE{NO_LAN_PATH}`; the same holds for a client whose own `network.lan_only` is set (decision M1-85: it
+offers only same-site candidates and ends the session `BYE{NO_LAN_PATH}` rather than take Tor media); signaling
+always traverses Tor in v1.
 
 #### B.8.7 Host-side UX
 
@@ -2137,8 +2188,8 @@ client's `sessions.log` line carries `elevation`.
 
 | Combo | Behaviour |
 |---|---|
-| Unattended + Paranoid / per-grant `require_tor_only` | `transport_policy = tor_only`: no candidates either way, media over the Tor tunnel (720p30 cap); the other party never learns your IP. |
-| Unattended + LAN-only | `lan_only`: link-local candidates only, no Tor media fallback; remote clients get `BYE{NO_LAN_PATH}` post-auth. |
+| Unattended + Paranoid / per-grant `require_tor_only` | `transport_policy = tor_only`: no candidates either way, media over the onion media stream (decision M1-79; the Tor presets' caps, M1-74); the other party never learns your IP, also when it sends `CANDIDATES` anyway (the host follows the policy its accept signed). Tor in use through a bridge has the same effect on that side (decision M1-86). |
+| Unattended + LAN-only | `lan_only`: same-site candidates only (on-link private IPv4, the unique-local /48; never link-local, STUN or the router), no Tor media fallback; a client with no same-site path gets `BYE{NO_LAN_PATH}` post-auth. A client's own `network.lan_only` means the same for its side (decision M1-85). |
 | Unattended + restricted discovery (optional, power-user; `tor.restricted_discovery`) | The client generates its x25519 client-auth keypair (Arti keymgr) and sends the public key in `PAIR_REQUEST.client_auth_pk`; the host stores it with the pairing and rebuilds the descriptor on revoke. Pairing a new device needs local **Pairing mode** (re-auth; unrestricted descriptor for 10 min; logged). Caveats shown in-app: ≤ 160 clients, removal not guaranteed until descriptor rotation (~3 h), arti-client feature still `__is_experimental` (pinned; Part E). |
 
 "Stealth unattended" (one-click recommendation card, not a preset default) = restricted discovery
@@ -2205,7 +2256,7 @@ the stop code, IPs beyond `transport`. The Sessions page (M-UI-5) shows, newest 
 |---|---|---|---|
 | M1 | `tornect-core` | `UnattendedStore`/`Grant`/`FailState` + AEAD codec + generation anchor + migrations; `K_master`/`K_unatt`; `keyring-core` backend behind a feature with file fallback; `SessionEvent` variants, hash chain, rotation; `Paths::unattended_store()`; fix the `trusted_devices_file` doc (pairings there, grants in the store); `unattended::{GrantStore, MutationGuard}` with the `ReAuth` and `RemoteSessionActivity` traits **defined here** (`MutationGuard::new(store, reauth: Arc<dyn ReAuth>, activity: Arc<dyn RemoteSessionActivity>)`, *Ownership* below — `tornect-platform` depends on core, so core cannot import them from platform; B.8.6.2 — the single entry point for UI, IPC and CLI); `ReadinessSnapshot`/`Probe` types with the all-unknown M1 stub (field list in the Rust block below); the `Presence` trait (M1 stub: `Unknown` ⇒ present; OS impls in `tornect-platform` at M6); `unattended::ipc` — the B.8.7.4 IPC message types + CBOR codec, no I/O (fuzz target F4); client-side `hosts.toml` per-host record `{remember, server_s_pk_pin, suite, ua_worked_before}` + `Paths::hosts_file()` (`server_s_pk` pin set at the first `SESSION_ACCEPT`, checked in `ClientLogin::finish`; the keychain-remembered password stays M8) | round-trip, tamper, rollback and permission tests; guard refuses without re-auth / during a remote session (A8 store/IPC parts); pin change ⇒ client abort (A16); `cargo check` on all targets |
 | M1 | `tornect-signal`, `apps/tornect` (CLI), `tornect-platform` (scaffold only) | `research-verifier` note (`docs/research/crypto.md` §8 re-pin, suite decision, sizes, Argon2 timing, GPU figure, circuit-teardown API); envelope `sig`; kinds/bodies; strict-alternation transcript; `HELLO_ACK`; signed `SESSION_REQUEST`; one envelope/transcript golden vector (B.8.4.3) committed; `OpaqueAuthenticator` (+ `Spake2Authenticator` under `pake-fallback`); `AttemptLimiter` with persistence (charge/settle/pending, B.8.5.1), generic over the `tornect-core::unattended::Clock` trait (`wall()`/`mono()`, B.8.5.3; production = OS clocks, tests = a scripted `FakeClock`, the F3 loaders take the same trait); `ConsentProof`/`PolicyReceipt` (private constructors) and `SessionAccept::build(ConsentProof, …)` as the **only** constructor; admin intent + scope; `tornect unattended` CLI (`apps/tornect`) + the host-role IPC dispatch loop over the B.8.7.4 message set (types + codec in `tornect-core::unattended::ipc`, *Ownership* below); M1 scaffolds `tornect-platform` with two modules only — `ipc` (Unix socket / named pipe per B.8.7.4) and `reauth`, the OS implementation of the `tornect-core::unattended::ReAuth` trait (M1: polkit on the Linux dev machine — **not** PAM, which polkit already runs out of process, B.8.8 — plus a debug-build-only `TORNECT_DEV_REAUTH=allow` escape, refused in release builds; M6: the Windows/macOS backends of the B.8.8 table); the B.8.4.5 host FSM (`HelloVerified` … `Accepting`/`Closing`) behind the injected `BlockWindow`/`LocalAllow` traits with headless defaults (see *Ownership* below); `fuzz/` targets F1–F4 added to the existing workspace-excluded fuzz crate + `tests/integration` workspace member; property + adversarial suite | headless unattended handshake ending in `SESSION_ACCEPT` over the localhost-Tor mock and between two machines; U1–U7, P1–P4, F1–F4 green; adversarial A1–A6, A8 (store/IPC parts), A13, A14, A15, A16, A17 and the signaling half of A7 green; I1, I8, I10, I11 (signaling half), I12 green; fuzz 10 min clean; counters survive `kill -9` |
-| M2 | `tornect-net` | the `BIND` exchange of B.8.4.3 (first frame on `ctrl` both ways: HMAC over the TLS exporter keyed by `session_token`, labelled by Tornect role — dialer = "client", host = "server" — not by QUIC role; constant-time verify, close on mismatch; no other stream/datagram accepted before it) consumes the derived token; `transport_policy` honoured by candidate gathering; the Tor fallback tunnels the *same* QUIC connection, so the `BIND` check applies unchanged on both transports (transport choice pending §B.8.17 item 7, decided at M2) | token mismatch ⇒ `BIND` fails and the connection is closed before any media, on the direct path and over the Tor tunnel alike (I7 sub-case); `tor_only` sends zero candidates; I7 green |
+| M2 | `tornect-net` | the `BIND` exchange of B.8.4.3 (first frame on `ctrl` both ways: HMAC over the TLS exporter keyed by `session_token`, labelled by Tornect role — dialer = "client", host = "server" — not by QUIC role; constant-time verify, close on mismatch; no other stream/datagram accepted before it) consumes the derived token; `transport_policy` honoured by candidate gathering; the Tor fallback tunnels the *same* QUIC connection, so the `BIND` check applies unchanged on both transports (transport choice pending §B.8.17 item 7, decided at M2). *As built (M2 Phase A; decisions M1-79, M1-80, M1-82):* the direct `Bind` is the first frame of the media stream, a MAC over `th_final` and the TLS exporter keyed from `session_token`, answered by the host's `BindProof`; the Tor fallback is the onion media stream with its own `Bind` MAC (no QUIC over Tor), so the token is checked on both paths; the policy the accept signed (for an unattended session the grant's receipt) rules both paths; no `SessionTransport` trait (the seam is `AsyncRead + AsyncWrite` streams) | token mismatch ⇒ `BIND` fails and the connection is closed before any media, on the direct path and over the Tor tunnel alike (I7 sub-case); `tor_only` sends zero candidates; I7 green. *As built:* I7 lives in `tornect-session` tests (decision M1-82): a wrong token, `ekm`, device or session id is refused before capture on the direct path, the onion path keeps its M1 check, and a `require_tor_only` grant sends nothing but `TOR_FALLBACK{OFF}` against a client that sends `CANDIDATES` (`docs/VERIFICATION.md`, *Direct connections, Phase A*) |
 | M4 | `tornect-session`, app (minimal) | UI-backed `BlockWindow`/`LocalAllow` implementations for the `tornect-signal` FSM (incl. the `AwaitLocalAllow` popup) and the host FSM from the `Candidates` state on; block window (CLI / the minimal shell of Part C M4) + Block; indicator copy; `sessions.log` events; session-end semantics (revoke/off/expiry/schedule/lock); one-session rules (`BYE{REPLACED}`); `Presence` (the `tornect-core::unattended` trait, M1 stub) wired into the away card and `require_absent` | WAN, nobody present, block window 0/3 s ⇒ first frame ≤ 8 s p50 / 12 s p95 from Connect; Block ends the session before the first frame; A7 (live-session replacement), A8 (post-session timing), A10, A12 green; I3–I5, I11 (live kill) green |
 | M5 | `tornect-input`, `tornect-session` | view-only enforced at the inject and stream layers (`input` refused; the services stream, built on Tor by M1-76, maps onto one QUIC stream and binds a view-only session with caps ⊆ `CHAT`, its clipboard and file frames ending it with `NOT_OFFERED`); panic-key semantics (end + suspend; double-press ⇒ master off) via physical events | a view-only session injects zero events, clip/file streams refused; panic ⇒ session gone < 100 ms, grant suspended; A11, I2 green |
 | M6 | **`tornect-platform`** (OS backends; crate scaffolded in M1) | presence (the `tornect-core::unattended::Presence` impls), lock state/lock, idle-lock probe, keep-awake/idle inhibit, autostart installers, wake hooks, OS re-auth backends of the B.8.8 table, global hotkey (incl. GlobalShortcuts portal), capture-excluded windows, IPC endpoint per OS, readiness probes; B.8.8 rows → `PLATFORM_MATRIX.md` (columns: OS/compositor, portal restore token (RemoteDesktop session, §B.5), lock-screen capture, lock-screen input, presence source, lock mechanism, re-auth mechanism, hotkey) | reboot with auto-login configured ⇒ dialog-free unattended session ≤ 3 min per OS (NEEDS-DEVICE recipes); readiness rows truthful; A9 (platform half: injected input ignored, panic fires, indicator re-asserted), I6, I9 green |
@@ -2331,7 +2382,7 @@ A18 and A19 are used in docs/VERIFICATION.md.
 4. Argon2id 64 MiB on future mobile clients ⇒ new suite id with re-registration, not a negotiation; decide when a mobile client exists.
 5. Keychain user-presence gating (Touch ID / Windows Hello) for the remembered password — v1 where `keyring-core` stores expose it cheaply, else post-v1; headless Linux re-auth without a polkit agent (PAM vs a weaker Tornect-only passphrase) decided at M6. A presence-gated store would not by itself allow keeping a password whose `grant_reach` is 1 or 2; that needs a plan change (decision M1-67).
 6. Service mode: Windows is roadmap M-SVC-W, after the initial release (decision M1-61), with its own threat model before any code — a LocalSystem service parsing network input in session 0, per-session processes through `CreateProcessAsUser`, the Winlogon desktop, `SendSAS`, keys in machine scope, OS re-auth as "an administrator of this PC", multi-user hosts, its update path; other OSes unscoped. Also whether lock-on-disconnect should default on wherever the M6 matrix proves remote unlock.
-7. Tor fallback transport: the same QUIC connection over a length-framed onion-stream tunnel (uniform `BIND`/exporter check — §B.2, B.8.4.2, Part C M2) vs. the session protocol directly over the onion stream (quic.md §0/§9: double congestion control, wasted 1200 B Initial padding and DPLPMTUD probes, extra handshake RTTs over 0.5–1.5 s circuits) — decide at M2 with a measured onion-stream throughput; if direct, define the `BIND` equivalent over the onion stream (e.g. an HMAC over `th` + `session_token`, both directions, before any media) so the token check stays uniform. Also a Part E row.
+7. Tor fallback transport: the same QUIC connection over a length-framed onion-stream tunnel (uniform `BIND`/exporter check — §B.2, B.8.4.2, Part C M2) vs. the session protocol directly over the onion stream (quic.md §0/§9: double congestion control, wasted 1200 B Initial padding and DPLPMTUD probes, extra handshake RTTs over 0.5–1.5 s circuits) — decide at M2 with a measured onion-stream throughput; if direct, define the `BIND` equivalent over the onion stream (e.g. an HMAC over `th` + `session_token`, both directions, before any media) so the token check stays uniform. Also a Part E row. **Decided at M2 (decision M1-79):** the session protocol directly over the onion stream — the existing onion media stream on `MEDIA_PORT` 4001 with its onion `Bind` MAC (decisions M1-39, M1-41; an HMAC over `th_final` keyed from `session_token`, before any media), unchanged; no QUIC over Tor. The client decides within `network.punch_timeout_ms` (4 s) of its receipt of `SESSION_ACCEPT`, writing its direct `Bind` is the commit point (no fallback after it, except a TLS-alert close before any host stream byte), the onion stream is opened in parallel, and there is no switch mid-session either way.
 8. The administrator helper's residual (r7): while an admin grant exists, any program running as the user can start the helper task, so every Control session on that host can reach administrator windows (T9, B.8.7.5). Accepted for v1 with the wizard warning (decision M1-62); administrator access in attended sessions only stays the alternative if the Windows tests show more.
 
 ---
@@ -2397,6 +2448,25 @@ established where theoretically possible, Tor fallback engages within 4 s otherw
 a mismatched unattended token fails the `BIND` exchange and closes the connection before any
 media (on the direct path and over the Tor tunnel alike — the tunnel carries the same QUIC
 connection) and `tor_only` sends zero candidates.
+*Amended at M2 (decisions M1-77…M1-86; design `direct`, revision 4).* Two phases in one milestone. **Phase A** (built;
+checkpoint `m2a`, tagged by the owner after its dev-VM demo, fuzz runs and release zips, M1-77) is the same-site path:
+on-link private IPv4 and unique-local IPv6 candidates only, no third party contacted
+(`tornect_session::direct::INTERNET_DIRECT = false`). **Phase B** (not built) adds the internet candidates: one public IPv4, one global IPv6, a
+server-reflexive one from one public STUN server per side (a hand-written RFC 8489 Binding codec, not the `stun`
+crate) and one router mapping per side (`crab_nat` PCP/NAT-PMP, `igd-next` UPnP); the gateway from `netdev`'s
+`gateway` feature on Linux and macOS and from `GetBestRoute2` on Windows (M1-81). Candidate gathering reads the
+interfaces with `netdev` (no default features), not `if-addrs`. The Tor fallback is the onion media stream, not
+QUIC over Tor (M1-79), so there is no `SessionTransport` trait: the seam is `AsyncRead + AsyncWrite` streams; no
+migration (a lost path ends the media). The accept is amended (M1-82): the netns NAT matrix is replaced by
+in-process `MemNet` tests (Phase A: the same-site table; Phase B: the NAT matrix) plus NEEDS-DEVICE two-network runs,
+the netns harness waiting for CI; "fallback within 4 s" is measured from the client's receipt of `SESSION_ACCEPT`;
+the 1 GiB transfer runs over the loopback pair with a checksum; "measured punch success logged" is the
+`path_summary` of each `session_ended` line in `sessions.log` (outcome, winner kind, IPv6 or not, ms) plus a
+`docs/VERIFICATION.md` row collecting the device runs; the token check is I7 in `tornect-session` tests; the
+stand-in for `tornect demo --loopback --headless-stats` on the direct path is the ignored test
+`direct_loopback_stats`. The deferred M2.x items (`doctor --network-check`, the extended fake-router cases, an
+installer firewall rule, a direct-over-bridges switch, per-device overrides, a "LAN with Tor fallback" mode, the
+netns harness, mid-session migration) are not required for `m2`.
 
 **M3 — Video pipeline, single platform (pick the OS Claude Code is running on)**
 *r7:* the FFmpeg wrappers below leave v1 (D8, decision M1-56); hardware encode and decode are M-CODEC-1…3 of
@@ -2535,16 +2605,20 @@ beside it. The Windows PC is needed in batches: after M-FEAT-3 (elevation), afte
 after M-CODEC-3 (codecs), the final pass (row 15a), then the console check.
 
 **The release's limits** (stated in the README and the release notes): every session is relayed through Tor (decision
-M1-60), and the 20-unit ack window caps any encoder at about **16 fps** at 1.2 s round trips (13.2 fps measured for the
-1280×720 test card, M1-47); hardware encoding lifts large desktops toward that cap and frees the host CPU but does not
-raise it — direct connections (M2, next after the release) do; AMD and Intel on Windows are designed through Media
+M1-60) unless the two computers can reach each other directly (decision M1-78, which amends M1-60: direct connections
+join the release; as built at checkpoint `m2a`, only when both are on the same local network — the internet path is
+M2 Phase B), and the 20-unit ack window caps any encoder on the Tor path at about **16 fps** at 1.2 s round trips (13.2
+fps measured for the 1280×720 test card, M1-47); hardware encoding lifts large desktops toward that cap and frees the
+host CPU but does not raise it — a direct connection does, once the quality presets gain their direct row (M2 step
+B10; until then a direct session encodes with the Tor presets, 12–20 fps, M1-84); a direct connection shows the other
+computer this computer's address (local at `m2a`), said at consent, and is off while Tor uses a bridge (M1-86); AMD and Intel on Windows are designed through Media
 Foundation and untested (NEEDS-DEVICE(windows-amd), NEEDS-DEVICE(windows-intel)); Linux has software encoding only;
 files and clipboard text move at most one Tor stream window (≈ 243 KiB) per round trip, about 200 KB/s at 1.2 s
 (decision M1-76, `docs/research/services.md` R4); a GNOME Wayland host shares no clipboard until gates G1 and G2 pass
 (`[services] wayland_clipboard`, off);
 "starts with the computer" means starts at sign-in (§B.1.1); code signing is open until the pre-tag pass (Part F.8).
-**Not in this release:** direct connections (Part C M2 — next, decision M1-60), Windows service mode (M-SVC-W, after the
-release, decision M1-61), Android (backlog).
+**Not in this release:** direct connections across the internet until M2 Phase B lands (decision M1-78; Part C M2),
+Windows service mode (M-SVC-W, after the release, decision M1-61), Android (backlog).
 
 **Post-v1 backlog (tracked, not planned here):** Android (entry below) · "bring your
 own relay" · per-app window streaming · virtual display driver (headless hosts) ·
@@ -2553,7 +2627,10 @@ feature flag · MoQT alignment once RFC · Windows service mode M-SVC-W (entry b
 
 Roadmap entries of r7:
 - **Direct connections (M2)** — next after the desktop release (decision M1-60); they expose IP addresses to the peer
-  and change the threat model, so they get their own security pass.
+  and change the threat model, so they get their own security pass. *Amended by decision M1-78 (the owner's scope):*
+  direct connections join the release in two phases; Phase A, the same-site path, is built (checkpoint `m2a`, Part G),
+  with its security review; Phase B, the internet path, follows, and the M2 close runs the security review again
+  (decision M1-77).
 - **M-SVC-W, Windows service mode** — after the initial release (decision M1-61): a LocalSystem service started at boot
   hosts the onion service in session 0; a per-session process is launched into the active console session
   (`WTSGetActiveConsoleSessionId`, a SYSTEM token given that session id, `CreateProcessAsUser`) and follows the input
@@ -2726,7 +2803,7 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 | Risk | L×I | Mitigation |
 |---|---|---|
 | Arti API churn / embedding edge cases | M×H | Pin minor version; wrap all Arti in `tornect-signal` behind our trait; research-verifier watches release notes; worst case: external `arti` process mode behind same trait |
-| Punch success below expectations (CGNAT-heavy regions like BR mobile ISPs) | M×M | Tor fallback is first-class UX, not an error; collect (local-only) success stats; v2 BYO-relay |
+| Punch success below expectations (CGNAT-heavy regions like BR mobile ISPs) | M×M | Tor fallback is first-class UX, not an error; collect (local-only) success stats; v2 BYO-relay. *M2 (decisions M1-79, M1-82):* the onion stream is opened beside the punch, so a failed attempt costs at most `network.punch_timeout_ms` (4 s) and usually less (early failure); the window says why a session is relayed; each `session_ended` line keeps a `path_summary` (outcome, winner kind, ms; no address), and a `docs/VERIFICATION.md` row collects the device runs |
 | Wayland portal/compositor variance (GNOME vs KDE vs wlroots quirks, token invalidation on session change) | H×M | `platform-wayland` maintains a compositor quirk table; SHM fallback; test on GNOME+KDE+Hyprland in M6 |
 | macOS TCC + notarization friction | M×M | Onboarding walks Screen Recording + Accessibility grants with live status checks; document notarization in xtask even before certs exist |
 | Hardware encoder behaviour differs per vendor and driver (r7; replaces r6's FFmpeg interop row) | M×M | The conformance harness (M-CODEC-1), a per-backend deny list, one wire format (Constrained Baseline), OpenH264 always compiled in |
@@ -2739,7 +2816,8 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 | Fake or altered invitations: a look-alike ID, a download link to a malicious copy, coached sharing (M1-73) | M×H | The look-alike alarm and SAS pairing (§B.6.1); a text whose visible ID and link differ is refused (`Several`); Tornect never opens a URL from text; README, SECURITY.md and the release notes name the one download location, https://github.com/Mxrider007/Tornect/releases; the consent sheet on the host |
 | The repository owner name changes, or a stale one is taken over, so invitations point at someone else's downloads (M1-73) | L×H | One source, the workspace `repository` field, from which the invitation's download URL is derived and pinned by a test (`DOWNLOAD_URL`); never rename the repository; if it is renamed, keep the old name registered so nobody else can take it |
 | Unattended-access abuse or lockout DoS (stolen/cloned device keys, coached relatives, a hostile Control session, the owner locking themselves out, keychain unusable at autostart, lock-screen dead ends) | M×H | §B.8: two factors + per-grant OPAQUE; count-based ladder with lifetime budget, per-grant scope, no global breaker; remote revoke/unlock from another *My machines* Control device + emergency stop code; OS re-authentication for every access-increasing change through Tornect's own surfaces (endpoint-level rewrites by a Control session are out of scope, T9); file-keystore fallback with a stricter password policy; honest per-OS readiness (§B.8.8); the adversarial A-suite is cumulative — each milestone's rows are listed in §B.8.14 and gate it |
-| Tor fallback transport contradicts the research: §B.2/§B.8.4.2/M2 tunnel the same QUIC connection through the onion stream for a uniform `BIND` check, while quic.md §0/§9 argues for the session protocol directly over the onion stream (double congestion control, wasted Initial padding/DPLPMTUD probes, extra handshake RTTs) | M×M | §B.8.17 item 7: decide at M2 with a measured onion-stream throughput; if direct, a `BIND` equivalent over the onion stream (HMAC over `th` + `session_token`) keeps the token check uniform; the M2 accept row for the Tor tunnel is then re-worded, not dropped |
+| Tor fallback transport contradicts the research: §B.2/§B.8.4.2/M2 tunnel the same QUIC connection through the onion stream for a uniform `BIND` check, while quic.md §0/§9 argues for the session protocol directly over the onion stream (double congestion control, wasted Initial padding/DPLPMTUD probes, extra handshake RTTs) | M×M | **Decided** (decision M1-79, §B.8.17 item 7): the session protocol directly over the onion media stream, whose onion `Bind` MAC (an HMAC over `th_final` keyed from `session_token`, decisions M1-39, M1-41) keeps the token check on both paths; no QUIC over Tor; the M2 accept row is re-worded (Part C M2, decision M1-82), not dropped |
+| Direct connections (M2, decisions M1-78 … M1-86): the accepted peer learns this computer's addresses, and an on-path observer may recognise Tornect's UDP pattern | M×M | Disclosed where the person decides (the consent sheet, the CLI prompt, the grant sheet) and in Settings and Privacy; one switch (Paranoid) and a grant's `require_tor_only` turn it off; nothing before `SESSION_ACCEPT`, the client reveals first, and a Tor-only side touches no interface; off while Tor uses a bridge (M1-86); no address or device key in any log (M1-83); amplification bounded (≤ 480 B per unvalidated address, ≤ 2:1); the security review at `m2a` and again at the M2 close (M1-77) |
 
 ## Part F — Open product decisions (answer before/at M0)
 
@@ -2781,7 +2859,7 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 
 ## Part G — Execution status (kept current at every session hand-off)
 
-Last update: **2026-09-27** (plan r7 and the UI foundation; before them the sessions of 2026-09-23 and 2026-09-24). Repository: https://github.com/Mxrider007/Tornect (public,
+Last update: **2026-10-27** (direct connections, Phase A; the feature rows below each carry their own date; plan r7 and the UI foundation on 2026-09-27). Repository: https://github.com/Mxrider007/Tornect (public,
 branch `main`). Per-milestone detail lives in `docs/notes/m<N>-state.md`; every acceptance
 check with its real status is in `docs/VERIFICATION.md`; every deviation from this plan is a
 numbered row in `docs/notes/decisions.md`.
@@ -2811,7 +2889,8 @@ numbered row in `docs/notes/decisions.md`.
 | Quality presets (2026-10-24, decision M1-74) | **Built; the preset table provisional until the live Tor run** (`765bdec1` … `31c75b7b`) | Three presets, Best quality, Balanced and Best performance, picked by the viewer (the stream window's Quality menu, Settings > Display, `tornect connect --quality`) and applied by the host from its own table, which it reports back; capture opens once at the host's rate and a pick never reopens it. A desktop above 3840×2160 is scaled whole, never cropped, and the pointer lands where it points; the pipeline reuses its buffers and times every stage; wire codes 0x50–0x52 and a 50-byte `Bind`, with version skew refused legibly; the Wayland stream asks the desktop for at most the host's rate (`maxFramerate`), once more without it if the desktop refuses it; the viewer converts a picture of any width eight pixels at a time; `tornect demo --loopback --headless-stats` measures the pipeline, its numbers and §B.7 misses in `docs/notes/m1-media-evidence.md`. Open: the live per-preset Tor run that freezes the table, the live and GUI checks, `maxFramerate` on real desktops, the encoder threads' ten-minute run (`docs/VERIFICATION.md`, "Quality presets") |
 | Monitor switching (2026-10-24, decision M1-75) | **Part 1 built; Part 2 (Wayland) deferred** (`e457eaa1` … `13b357d7`) | On Windows (GDI) and X11 the viewer shows Screen 1 … n or All screens (the stream window's Screens menu, `tornect connect --screen`), the session opening on the primary; `SelectMonitor` 0x53 and `Monitors` 0x54 on the Tor media stream (§B.4); the viewer's pointer lands on the host pixel under it, on the screen it was shown, through the host's `Viewport`, the `VideoAck` barrier, the window's hold and the sinks' live checks; an injector that cannot follow ends the session's input (notice 0x10); the indicator follows the monitor shown (§B.6 *Screens*); `--capture test-screens` shares two synthetic screens. Open: Part 2 (Wayland multi-stream: its research and a GNOME run), the Windows mixed-DPI run (`rcMonitor`, `SendInput`'s corners and seams, the helper, the indicator), a real X11 desktop, the live Tor demo, the window's screenshots and live run, the 10-minute `media` fuzz run (`docs/VERIFICATION.md`, "Monitor switching") |
 | Session services (2026-10-26, decision M1-76) | **Built on the Tor path; the live checks open; GNOME's clipboard off until gates G1 and G2** (`5f14adb4` … `d7a329db`) | Chat in every session, and in a Control session whose input reaches the desktop clipboard text both ways, files sent into `<Downloads>/Tornect` and the host's files browsed and copied, on a third bound onion stream (`SERVICES_PORT` 4002, behind the signed `svc1`; §B.4) under the rules of §B.6 *Session services*: the head-only gate (view-only and no-input sessions get chat only, nothing else is decoded), services following capture, the lock pause, the host's switches and one-way turn-off, host-issued handles behind a place allowlist and a deny-list, SHA-256-verified uploads, and the consent copy wherever Control is given. The viewer's clipboard starts off (the cross-feature rule; `[viewer] clipboard_sync`). The terminal host advertises `svc1` and refuses every services stream. The Windows build cross-compiles whole and its files, store and browse tests pass under Wine. Open: the live Tor runs (files both ways with the picture's rate, the panic key mid-transfer, a lock mid-download, view-only), the GNOME clipboard gates G1 and G2 (`[services] wayland_clipboard`), the Windows recipes (VSS, integrity level, a volume mounted into a folder), the 10-minute `services` fuzz run (`docs/VERIFICATION.md`, "Session services") |
-| M2–M8 | Not started | Research decisions already made for M2 (raw-public-key TLS, punch outside QUIC, `grease_quic_bit(false)`, `stun` 0.17 / `crab_nat` / `igd-next`), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`, through Media Foundation and NVENC since r7, D8; VM-scoped acceptance defined in Part C M3, r6), M5 (`opus` 0.4, in-band FEC off), UI (egui everywhere on a manual winit loop, no eframe, the indicator in process — D10 as amended in r7; wgpu 30 / winit 0.30 / egui 0.36; `u1` placement per Part F.6). |
+| Direct connections, Phase A (2026-10-27, decisions M1-77 … M1-86) | **Built; checkpoint `m2a` not tagged: it waits for the dev-VM demo, the fuzz campaigns and the release zips** (`34e5bfbd` … `a1f0dd96` and the close's commits) | M2's same-site half, design `direct` revision 4: after `SESSION_ACCEPT` the two computers exchange their local-network addresses over the signaling stream (`CANDIDATES`, the client first, behind the signed `dir1`), punch with 40-byte HMAC probes and connect over QUIC with both device keys pinned as raw public keys; the media binds on the direct stream (`Bind` and `BindProof` over the TLS exporter); otherwise the onion media stream, opened in parallel, carries it within 4 s of the accept (decision M1-79; no QUIC over Tor). Paranoid, a bridge in use (M1-86), `connect --tor-only` and an unattended grant's `require_tor_only` read no interface and bind nothing; `lan_only` ends the session rather than relay (M1-85). Seen by people: `ROUTE`/`PATH`/`SESSION ROUTE` lines, `doctor`'s direct and network lines, the window's route badge and details, Settings > Connection's *Direct connections* switch, the consent sheet's and CLI prompt's disclosure, the grant sheet's Tor-only help, the Privacy line; `sessions.log` gains `transport` and `path_summary`. The cancel-safe signaling channel (every handshake read) landed first. Third-party network crates never log (M1-83; the redaction e2e over a whole loopback session at `trace`). A direct session still encodes with the Tor presets until step B10. Open before `m2a` (the dev VM): the live demo, the 10-minute fuzz runs, `cargo xtask dist`, the 1 GiB rerun, the dual-stack tests; after it, NEEDS-DEVICE rows (Windows, macOS, roaming, two machines). Phase B (internet: STUN, router mapping, public addresses; steps B1–B13) and the close (C1, C2) are not started (`docs/notes/m2-state.md`; `docs/VERIFICATION.md`, *Direct connections, Phase A*) |
+| M2 Phase B, M3–M8 | Not started | Research decisions already made for M2 Phase B (`crab_nat` / `igd-next`; a hand-written STUN codec in place of `stun` 0.17, decision M1-81), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`, through Media Foundation and NVENC since r7, D8; VM-scoped acceptance defined in Part C M3, r6), M5 (`opus` 0.4, in-band FEC off), UI (egui everywhere on a manual winit loop, no eframe, the indicator in process — D10 as amended in r7; wgpu 30 / winit 0.30 / egui 0.36; `u1` placement per Part F.6). |
 
 **Verified-on-hardware honesty.** Everything above was run on one Ubuntu 26.04 VM (GNOME/
 Wayland, no GPU encoder, no sudo, no second machine). Windows is cross-built and linked, and run
