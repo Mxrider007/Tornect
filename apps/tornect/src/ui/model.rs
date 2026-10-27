@@ -1960,8 +1960,11 @@ mod tests {
         assert_eq!(route(&model), None);
     }
 
-    /// The policy the sessions read, as Settings shows it: `lan_only` wins,
-    /// then direct connections off or a bridge in use relay through Tor.
+    /// The policy the sessions read, as Settings shows it: direct
+    /// connections off win over `lan_only` (`TransportPolicy::from_privacy`;
+    /// `Config::validate` refuses both at once), and a bridge in use relays
+    /// an `any` policy through Tor while `lan_only` keeps its LAN path
+    /// (decision M1-86).
     #[test]
     fn the_settings_say_the_policy_the_sessions_read() {
         let mut cfg = tornect_core::Config::default();
