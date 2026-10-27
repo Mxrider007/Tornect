@@ -343,6 +343,12 @@ async fn the_proof_is_written_before_the_source_opens() {
 
 /// A session that ends while the proof waits on a viewer that does not
 /// read ends the stream at once, with nothing opened.
+///
+/// The end comes only once the viewer has read the proof's first bytes:
+/// the write has started and is stalled on the rest, past `send`'s first
+/// look at the session's end. An end that came between the claim and that
+/// look would end the stream before the proof (also with nothing opened),
+/// which is not the case this test is about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_end_while_the_proof_waits_opens_nothing() {
     let rig = direct_rig(TestBackend::default());
@@ -363,12 +369,15 @@ async fn an_end_while_the_proof_waits_opens_nothing() {
         wr
     });
     let _wr = writer.await.unwrap();
-    // The 37-byte proof fills the 8-byte pipe and waits; the session ends.
-    let claimed = tokio::time::Instant::now();
-    while rig.host.route(&viewer.id).is_none() {
-        assert!(claimed.elapsed() < WAIT, "never claimed");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    // The 37-byte proof fills the 8-byte pipe and waits: its first 8 bytes
+    // are read, the next 8 fill the pipe again and 21 are left.
+    let mut head = [0u8; 8];
+    tokio::time::timeout(WAIT, rd.read_exact(&mut head))
+        .await
+        .expect("the proof's write started")
+        .unwrap();
+    assert_eq!(&head[..5], &[0, 0, 0, 33, 0x04], "the proof's first bytes");
+    assert_eq!(rig.host.route(&viewer.id), Some(TransportKind::Direct));
     rig.host.on_end(&viewer.id, None);
     let outcome = tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
     assert_eq!(
@@ -376,9 +385,7 @@ async fn an_end_while_the_proof_waits_opens_nothing() {
         MediaOutcome::NotStarted(MediaEnd::SessionOver(reason::SESSION_OVER))
     );
     assert_eq!(rig.sources(), 0, "nothing opened");
-    let mut head = [0u8; 8];
-    rd.read_exact(&mut head).await.unwrap();
-    assert_eq!(&head[..5], &[0, 0, 0, 33, 0x04], "the proof's first bytes");
+    assert!(rig.routes.started().is_empty());
 }
 
 /// The direct design §12.1: a wrong `ekm`, device, token, transcript or
@@ -636,6 +643,34 @@ async fn a_stream_closed_before_any_byte_is_abandoned() {
         .unwrap();
     drop(onion);
     served.await.unwrap();
+}
+
+/// A `lan_only` session refuses its onion services stream as it refuses
+/// its onion media (`Proof::allowed_by` applies to both kinds): until step
+/// B10 adds the direct services stream, a `lan_only` session has no chat,
+/// files or clipboard (decision M1-85). An `any` or `tor_only` session's
+/// onion services stream binds under the same MAC.
+#[tokio::test]
+async fn a_lan_only_session_binds_no_onion_services_stream() {
+    let rig = direct_rig(TestBackend::default());
+    let services_mac =
+        |v: &Viewer| tornect_proto::services::services_bind_mac(v.token.bytes(), &v.th_final);
+    let lan_only = start_direct(&rig.host, 75, TransportPolicy::LanOnly);
+    assert!(
+        rig.host
+            .claim_services(&lan_only.id, &services_mac(&lan_only))
+            .is_none()
+    );
+    for (seed, policy) in [(76, TransportPolicy::Any), (77, TransportPolicy::TorOnly)] {
+        let viewer = start_direct(&rig.host, seed, policy);
+        assert!(
+            rig.host
+                .claim_services(&viewer.id, &services_mac(&viewer))
+                .is_some(),
+            "{policy:?}"
+        );
+    }
+    assert_eq!(rig.sources(), 0);
 }
 
 /// The claim channel follows the session: `None` for a session not
@@ -896,10 +931,11 @@ async fn a_refused_direct_viewer_opens_nothing_on_the_host() {
     conn.served.await.unwrap();
 }
 
-/// Revision 1 blocker 1 (the direct design §4, §12.1): the viewer's bind
-/// wait, never the 4 s punch window, covers the host's source open, so a
-/// 5 s open (a dialog the user takes time to answer) on the direct path
-/// still binds.
+/// Revision 1 blocker 1 (the direct design §4, §12.1), at the viewer's API
+/// only: a direct `MediaViewer::bind` given a wait longer than the host's
+/// source open (a 5 s dialog the user takes time to answer) binds. That the
+/// caller passes its bind wait here, never the 4 s punch window, is
+/// `choose_path`'s to show (step A17).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_five_second_open_on_the_direct_path_still_binds() {
     let rig = direct_rig(TestBackend {

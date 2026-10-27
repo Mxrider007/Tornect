@@ -17,7 +17,7 @@
 //! host → client   BindOk          width u32 · height u32 · codec u8 · mode u8 · QualityInfo
 //! host → client   BindRefused     reason u16
 //! host → client   BindProof       mac[32] (direct path)
-//! host → client   Video         seq u32 · flags u8 · ts_ms u32 · Annex-B access unit
+//! host → client   Video           seq u32 · flags u8 · ts_ms u32 · Annex-B access unit
 //! client → host   VideoAck        seq u32
 //! client → host   Input           16-byte event (tornect-input)
 //! client → host   KeyframeRequest —

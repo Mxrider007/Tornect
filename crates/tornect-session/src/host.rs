@@ -3268,12 +3268,20 @@ mod tests {
             runtime.block_on(async {
                 // Closed at once: no time passes, so all 50 fall in one window.
                 // Closed before their first byte, they are abandoned
-                // pre-opens (the direct design §8.5), within the same budget.
-                for _ in 0..50 {
-                    let (client, server) = tokio::io::duplex(64);
+                // pre-opens (the direct design §8.5); closed after one or
+                // two bytes of their length prefix, they are cut short. Both
+                // ways draw on the same budget.
+                for i in 0..50 {
+                    let (mut client, server) = tokio::io::duplex(64);
+                    let sent = i % 3;
+                    client.write_all(&[0; 2][..sent]).await.unwrap();
                     drop(client);
                     let outcome = host.serve(server).await;
-                    assert!(matches!(outcome, MediaOutcome::Abandoned), "{outcome:?}");
+                    if sent == 0 {
+                        assert!(matches!(outcome, MediaOutcome::Abandoned), "{outcome:?}");
+                    } else {
+                        assert!(matches!(outcome, MediaOutcome::NotBound), "{outcome:?}");
+                    }
                 }
                 tokio::time::advance(PRE_BIND_WINDOW).await;
                 let ping = Msg::Ping { nonce: 1 }.encode();
