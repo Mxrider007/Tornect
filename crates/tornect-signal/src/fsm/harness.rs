@@ -332,6 +332,29 @@ pub async fn raw_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    raw_session_with(client_end, host_end, &[], 0).await
+}
+
+/// [`raw_session`] with the host's signed `HELLO_ACK.feats` (`host_feats`,
+/// [`crate::messages::feats`] tokens) and `SESSION_ACCEPT.transport_policy`
+/// (`transport_policy`, a [`crate::messages::transport`] code): for tests of a
+/// viewer's direct path against a host played by hand (design `direct`
+/// §8.5), which [`ClientSession::host_has`] and
+/// [`ClientSession::transport_policy`] answer from. The host's device key is
+/// [`host_device_pk`].
+///
+/// # Panics
+///
+/// As [`raw_session`].
+pub async fn raw_session_with<S>(
+    client_end: S,
+    host_end: DuplexStream,
+    host_feats: &[&str],
+    transport_policy: u8,
+) -> (ClientSession<S>, Channel<DuplexStream>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     const STEP: Duration = Duration::from_secs(5);
     let host = host_identity();
     let device = client_identity();
@@ -352,7 +375,7 @@ where
         let ack = HelloAck {
             v: 1,
             host_nonce: vectors::HOST_NONCE,
-            feats: vec![],
+            feats: host_feats.iter().map(|&f| f.to_owned()).collect(),
         };
         chan.send(&ack, Some(&host)).await.expect("HELLO_ACK");
         chan.set_version(1);
@@ -368,7 +391,7 @@ where
             quic_spki: ed25519_spki(&host_device_pk()),
             session_type: 0,
             mode: 0,
-            transport_policy: 0,
+            transport_policy,
             session_token: Some(vectors::SESSION_TOKEN),
             token_confirm: None,
             block_window_s: 0,
