@@ -50,6 +50,7 @@ use tokio::time::{Instant, Sleep};
 use crate::addr::{self, AddrClass, canon, canon_ip, to_socket_family};
 use crate::env::NetEnv;
 use crate::local::{IfaceAddr, IfaceKind, RouteSources};
+use crate::mapping::{NoMapper, PortMapper};
 use crate::socket::{BoundSocket, RECV_BUFFER};
 use crate::udp::{BoundUdp, is_probe, is_stun};
 use crate::{BoxFuture, NetError};
@@ -137,6 +138,17 @@ impl NetEnv for LoopbackNet {
             sock,
             dual_stack: false,
         })
+    }
+
+    /// No name resolves here (the loopback STUN servers of step B3 are
+    /// given as addresses).
+    fn resolve(&self, _host: &str, _port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    /// No router: [`NoMapper`].
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        Arc::new(NoMapper)
     }
 
     fn admit_loopback(&self) -> bool {
@@ -625,6 +637,18 @@ impl NetEnv for MemHost {
             errors: Arc::default(),
         })
     }
+
+    /// No name resolves on an in-memory network yet: its STUN servers
+    /// arrive at step B8.
+    fn resolve(&self, _host: &str, _port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    /// No router yet ([`NoMapper`]): the in-memory routers arrive at step
+    /// B8.
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        Arc::new(NoMapper)
+    }
 }
 
 impl fmt::Debug for MemHost {
@@ -934,6 +958,10 @@ pub struct EnvCalls {
     pub route_sources: usize,
     /// [`NetEnv::bind`].
     pub binds: usize,
+    /// [`NetEnv::resolve`].
+    pub resolves: usize,
+    /// [`NetEnv::mapper`].
+    pub mappers: usize,
     /// [`NetEnv::admit_loopback`].
     pub admit_loopback: usize,
 }
@@ -942,19 +970,26 @@ impl EnvCalls {
     /// Every call.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.interfaces + self.route_sources + self.binds + self.admit_loopback
+        self.interfaces
+            + self.route_sources
+            + self.binds
+            + self.resolves
+            + self.mappers
+            + self.admit_loopback
     }
 }
 
 /// A [`NetEnv`] that counts every call to the one it wraps (design §8.3
-/// `CountingEnv`). Phase B adds `resolve` and `mapper` here; its STUN sends
-/// are read from the link's socket counters.
+/// `CountingEnv`). The STUN requests a link sends are not environment
+/// calls: they are read from the link's socket counters.
 #[derive(Debug)]
 pub struct CountingEnv<E> {
     inner: E,
     interfaces: AtomicUsize,
     route_sources: AtomicUsize,
     binds: AtomicUsize,
+    resolves: AtomicUsize,
+    mappers: AtomicUsize,
     admit_loopback: AtomicUsize,
 }
 
@@ -967,6 +1002,8 @@ impl<E: NetEnv> CountingEnv<E> {
             interfaces: AtomicUsize::new(0),
             route_sources: AtomicUsize::new(0),
             binds: AtomicUsize::new(0),
+            resolves: AtomicUsize::new(0),
+            mappers: AtomicUsize::new(0),
             admit_loopback: AtomicUsize::new(0),
         })
     }
@@ -978,6 +1015,8 @@ impl<E: NetEnv> CountingEnv<E> {
             interfaces: self.interfaces.load(Ordering::SeqCst),
             route_sources: self.route_sources.load(Ordering::SeqCst),
             binds: self.binds.load(Ordering::SeqCst),
+            resolves: self.resolves.load(Ordering::SeqCst),
+            mappers: self.mappers.load(Ordering::SeqCst),
             admit_loopback: self.admit_loopback.load(Ordering::SeqCst),
         }
     }
@@ -1003,6 +1042,16 @@ impl<E: NetEnv> NetEnv for CountingEnv<E> {
     fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp> {
         self.binds.fetch_add(1, Ordering::SeqCst);
         self.inner.bind(port)
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        self.inner.resolve(host, port)
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        self.mappers.fetch_add(1, Ordering::SeqCst);
+        self.inner.mapper()
     }
 
     fn admit_loopback(&self) -> bool {

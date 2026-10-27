@@ -865,3 +865,97 @@ async fn print_this_machines_reading() {
         );
     }
 }
+
+/// Step B1: netdev's gateway (Linux and macOS) reaches every address of
+/// its interface, the first usable IPv4 one; an unspecified next hop or a
+/// gateway with only IPv6 addresses is none.
+#[cfg(not(windows))]
+#[test]
+fn the_netdev_gateway_reaches_every_address_of_its_interface() {
+    let mut i = iface("wlan0", InterfaceType::Wireless80211);
+    i.index = 3;
+    i.ipv4 = vec!["192.168.77.203/24".parse::<Ipv4Net>().unwrap()];
+    i.ipv6 = vec!["fd12:3456:789a:1::203/64".parse::<Ipv6Net>().unwrap()];
+    i.ipv6_addr_flags = vec![flags6(false, false, false, false)];
+    let mut device = netdev::NetworkDevice::new();
+    device.ipv4 = vec![Ipv4Addr::UNSPECIFIED, "192.168.77.1".parse().unwrap()];
+    device.ipv6 = vec!["fe80::1".parse().unwrap()];
+    i.gateway = Some(device.clone());
+    let addrs = iface_addrs(&i, IfaceKind::Physical);
+    assert_eq!(addrs.len(), 2);
+    assert!(
+        addrs
+            .iter()
+            .all(|a| a.gateway_v4 == Some("192.168.77.1".parse().unwrap()))
+    );
+    device.ipv4 = vec![Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST];
+    i.gateway = Some(device.clone());
+    assert!(
+        iface_addrs(&i, IfaceKind::Physical)
+            .iter()
+            .all(|a| a.gateway_v4.is_none())
+    );
+    device.ipv4.clear();
+    i.gateway = Some(device);
+    assert!(
+        iface_addrs(&i, IfaceKind::Physical)
+            .iter()
+            .all(|a| a.gateway_v4.is_none())
+    );
+    i.gateway = None;
+    assert!(
+        iface_addrs(&i, IfaceKind::Physical)
+            .iter()
+            .all(|a| a.gateway_v4.is_none())
+    );
+}
+
+#[test]
+fn only_a_unicast_address_is_a_gateway() {
+    for usable in ["192.168.1.1", "10.0.0.138", "100.64.0.1", "169.254.1.1"] {
+        assert!(usable_gateway(usable.parse().unwrap()), "{usable}");
+    }
+    for unusable in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255"] {
+        assert!(!usable_gateway(unusable.parse().unwrap()), "{unusable}");
+    }
+}
+
+/// Step B1 (design §7.1, the Windows gateway): the lookup is asked once
+/// per interface that has no gateway yet, never for a loopback interface;
+/// a gateway already read stays, and an unusable answer is none.
+#[test]
+fn the_gateway_lookup_fills_each_interface_once() {
+    let mut read = a("192.168.77.203", 24, 5, IfaceKind::Physical);
+    read.gateway_v4 = Some("192.168.77.1".parse().unwrap());
+    let mut addrs = vec![
+        a("127.0.0.1", 8, 1, IfaceKind::Loopback),
+        a("192.168.50.20", 24, 3, IfaceKind::Physical),
+        a("fd12:3456:789a:1::20", 64, 3, IfaceKind::Physical),
+        read,
+        a("10.8.0.2", 24, 7, IfaceKind::Tunnel),
+        a("172.17.0.1", 16, 9, IfaceKind::Virtual),
+    ];
+    let asked = Mutex::new(Vec::new());
+    fill_gateways(&mut addrs, &|index| {
+        asked.lock().unwrap().push(index);
+        match index {
+            3 => Some("192.168.50.1".parse().unwrap()),
+            7 => Some(Ipv4Addr::UNSPECIFIED),
+            9 => Some("172.17.0.254".parse().unwrap()),
+            _ => Some("198.51.100.1".parse().unwrap()),
+        }
+    });
+    assert_eq!(*asked.lock().unwrap(), vec![3, 7, 9]);
+    let gateways: Vec<Option<Ipv4Addr>> = addrs.iter().map(|a| a.gateway_v4).collect();
+    assert_eq!(
+        gateways,
+        vec![
+            None,
+            Some("192.168.50.1".parse().unwrap()),
+            Some("192.168.50.1".parse().unwrap()),
+            Some("192.168.77.1".parse().unwrap()),
+            None,
+            Some("172.17.0.254".parse().unwrap()),
+        ]
+    );
+}

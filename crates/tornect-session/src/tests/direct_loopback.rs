@@ -19,7 +19,7 @@ use tornect_core::session_log::TransportKind;
 use tornect_core::telemetry::{IDENTIFIERS_ENV, LogOptions};
 use tornect_net::mem::LoopbackNet;
 use tornect_net::udp::BoundUdp;
-use tornect_net::{BoxFuture, IfaceAddr, NetEnv, NetError, Route, RouteSources};
+use tornect_net::{BoxFuture, IfaceAddr, NetEnv, NetError, PortMapper, Route, RouteSources};
 use tornect_signal::HandshakeError;
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::fsm::client::ClientSession;
@@ -64,6 +64,14 @@ impl NetEnv for Noting {
         let bound = self.inner.bind(port)?;
         self.bound.lock().unwrap().push(bound.inner.local_addr()?);
         Ok(bound)
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        self.inner.resolve(host, port)
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        self.inner.mapper()
     }
 
     fn admit_loopback(&self) -> bool {

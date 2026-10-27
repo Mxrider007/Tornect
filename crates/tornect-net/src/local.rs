@@ -4,10 +4,14 @@
 //!
 //! Only [`read_interfaces`] and [`route_sources`] touch the OS; everything
 //! else is a pure function of their results, so the tables are tested
-//! without a network. Neither sends a packet: netdev is built without its
-//! `gateway` feature (its Windows path may send ARP), and the route sources
-//! come from a UDP `connect()` to documentation addresses, which only asks
-//! the kernel for a route.
+//! without a network. Neither sends a packet. netdev's `gateway` feature
+//! (step B1) is compiled only off Windows, where it reads each interface's
+//! default gateway from the kernel's tables (a netlink route and neighbour
+//! dump on Linux, a routing sysctl on macOS); its Windows path may send ARP
+//! through `SendARP`, so Windows fills the gateway through a route lookup
+//! the app hands in ([`fill_gateways`]). The route sources come from a UDP
+//! `connect()` to documentation addresses, which only asks the kernel for a
+//! route. docs/research/nat-traversal.md §1.6 and §5.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -187,8 +191,11 @@ pub struct IfaceAddr {
     pub iface_kind: IfaceKind,
     /// The interface is up and running.
     pub up: bool,
-    /// The interface's IPv4 default gateway, when known (Phase B; netdev's
-    /// `gateway` feature is off in Phase A, so always `None` here).
+    /// The interface's IPv4 default gateway, when known: the router a port
+    /// mapping asks (design §7.1, §7.4). From netdev's `gateway` feature on
+    /// Linux and macOS, from the lookup [`fill_gateways`] is given on
+    /// Windows; only a [`usable_gateway`]. The same on every address of the
+    /// interface.
     pub gateway_v4: Option<Ipv4Addr>,
 }
 
@@ -292,6 +299,7 @@ pub fn route_sources() -> RouteSources {
 #[must_use]
 pub fn iface_addrs(iface: &netdev::Interface, kind: IfaceKind) -> Vec<IfaceAddr> {
     let up = iface.is_up() && iface.is_running();
+    let gateway_v4 = netdev_gateway_v4(iface);
     let base = |ip: IpAddr, prefix_len: u8| IfaceAddr {
         ip,
         prefix_len,
@@ -304,7 +312,7 @@ pub fn iface_addrs(iface: &netdev::Interface, kind: IfaceKind) -> Vec<IfaceAddr>
         iface_index: iface.index,
         iface_kind: kind,
         up,
-        gateway_v4: None,
+        gateway_v4,
     };
     let mut out: Vec<IfaceAddr> = iface
         .ipv4
@@ -328,6 +336,50 @@ pub fn iface_addrs(iface: &netdev::Interface, kind: IfaceKind) -> Vec<IfaceAddr>
         );
     }
     out
+}
+
+/// `ip` when it can be a router to ask for a port mapping: not
+/// unspecified (a route to the local link has no next hop), loopback,
+/// multicast or broadcast. `tornect_platform::route::usable_gateway` is the
+/// same rule on the Windows side.
+#[must_use]
+pub fn usable_gateway(ip: Ipv4Addr) -> bool {
+    !(ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast())
+}
+
+/// The first usable IPv4 gateway netdev read for `iface`.
+#[cfg(not(windows))]
+fn netdev_gateway_v4(iface: &netdev::Interface) -> Option<Ipv4Addr> {
+    let device = iface.gateway.as_ref()?;
+    device.ipv4.iter().copied().find(|ip| usable_gateway(*ip))
+}
+
+/// None: netdev's Windows gateway read is never compiled (it may send ARP).
+#[cfg(windows)]
+fn netdev_gateway_v4(_iface: &netdev::Interface) -> Option<Ipv4Addr> {
+    None
+}
+
+/// Fills [`IfaceAddr::gateway_v4`] of every address whose interface has
+/// none from `lookup`, asked once per interface index and never for a
+/// loopback interface; an answer that is not a [`usable_gateway`] counts as
+/// none. A gateway already read is kept.
+pub fn fill_gateways(addrs: &mut [IfaceAddr], lookup: &dyn Fn(u32) -> Option<Ipv4Addr>) {
+    let mut asked: Vec<(u32, Option<Ipv4Addr>)> = Vec::new();
+    for addr in addrs
+        .iter_mut()
+        .filter(|a| a.gateway_v4.is_none() && a.iface_kind != IfaceKind::Loopback)
+    {
+        let gateway = match asked.iter().find(|(index, _)| *index == addr.iface_index) {
+            Some(&(_, gateway)) => gateway,
+            None => {
+                let gateway = lookup(addr.iface_index).filter(|ip| usable_gateway(*ip));
+                asked.push((addr.iface_index, gateway));
+                gateway
+            }
+        };
+        addr.gateway_v4 = gateway;
+    }
 }
 
 /// Every address of `ifaces`, each interface's kind decided with whether

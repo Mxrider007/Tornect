@@ -441,16 +441,35 @@ async fn counting_env_counts_every_call() {
         50_000
     );
     assert!(!env.admit_loopback());
+    let resolved = env.resolve("stun.example.net", 3478).await;
+    assert_eq!(
+        resolved.expect_err("no names").kind(),
+        io::ErrorKind::NotFound
+    );
+    let request = crate::MapRequest {
+        gateway: Ipv4Addr::new(192, 168, 1, 1),
+        client: Ipv4Addr::new(192, 168, 1, 10),
+        internal_port: std::num::NonZeroU16::new(50_000).unwrap(),
+        lease: crate::MAP_LEASE,
+        protocols: crate::MapProtocols::ALL,
+        deadline: Instant::now().into_std(),
+    };
+    assert_eq!(
+        env.mapper().map(request).await.expect_err("no router yet"),
+        crate::MapFail::NoGateway
+    );
     assert_eq!(
         env.calls(),
         EnvCalls {
             interfaces: 1,
             route_sources: 2,
             binds: 1,
+            resolves: 1,
+            mappers: 1,
             admit_loopback: 1,
         }
     );
-    assert_eq!(env.calls().total(), 5);
+    assert_eq!(env.calls().total(), 7);
     assert_eq!(env.inner().counters().binds, 1);
     let loopback = CountingEnv::new(LoopbackNet::new(2));
     assert!(loopback.admit_loopback());

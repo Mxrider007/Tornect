@@ -22,6 +22,7 @@ pub mod checklist;
 pub mod env;
 pub mod link;
 pub mod local;
+pub mod mapping;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mem;
 pub mod probe;
@@ -40,6 +41,10 @@ pub use link::{
     LocalBatch, QuicStream, Route,
 };
 pub use local::{IfaceAddr, IfaceKind, RouteSources};
+pub use mapping::{
+    MAP_LEASE, MapEvent, MapEvents, MapFail, MapProtocols, MapRequest, MapVia, Mapping,
+    MappingHandle, NoMapper, PortMapper,
+};
 pub use probe::{Probe, ProbeDrop, ProbeKey, Txid};
 pub use quic::{
     DeviceKeySigner, PeerRefusal, PinnedVerifier, QuicError, QuicIdentity, check_peer,
@@ -62,7 +67,7 @@ pub enum TornectRole {
 }
 
 /// A boxed, sendable future: the return type of the [`NetEnv`] calls that
-/// wait.
+/// wait and of the [`PortMapper`] and [`MappingHandle`] calls.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What can go wrong in this crate. No message names an address, a port or

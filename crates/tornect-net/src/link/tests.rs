@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::NetError;
 use crate::local::{IfaceAddr, IfaceKind, RouteSources};
+use crate::mapping::{NoMapper, PortMapper};
 use crate::mem::LoopbackNet;
 use crate::udp::BoundUdp;
 
@@ -290,6 +291,14 @@ impl NetEnv for Untouchable {
     fn bind(&self, _port: Option<u16>) -> io::Result<BoundUdp> {
         panic!("a socket was bound")
     }
+
+    fn resolve(&self, _host: &str, _port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        panic!("a name was resolved")
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        panic!("the router mapper was asked for")
+    }
 }
 
 /// Decision M1-80: a device never connects directly to itself; the link
@@ -324,6 +333,14 @@ impl NetEnv for Scripted {
     fn bind(&self, _port: Option<u16>) -> io::Result<BoundUdp> {
         self.binds.fetch_add(1, Ordering::SeqCst);
         (self.bind)()
+    }
+
+    fn resolve(&self, _host: &str, _port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        Arc::new(NoMapper)
     }
 }
 
