@@ -942,14 +942,24 @@ pub struct GatherStats {
     pub done: bool,
 }
 
-/// What the gathering tells the link's checklist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the gathering tells the link's checklist. Its `Debug` prints the
+/// address's family and class only (decision M1-83).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gathered {
     /// A public IPv4 address of this side (mapped or server-reflexive),
     /// for the ranks of design §7.6.
     Public(IpAddr),
     /// Gathering is over.
     Done,
+}
+
+impl fmt::Debug for Gathered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Public(ip) => f.debug_tuple("Public").field(&RedactedIp(*ip)).finish(),
+            Self::Done => f.write_str("Done"),
+        }
+    }
 }
 
 /// The gathering of one link (see the module documentation), spawned by

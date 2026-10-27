@@ -988,7 +988,8 @@ async fn nothing_to_ask_means_no_traffic() {
     assert_eq!(env.calls().resolves, 0);
 }
 
-/// Decision M1-83: the report and the request print no address.
+/// Decision M1-83: the report, the request, the name cache and what the
+/// gathering tells the checklist print no address.
 #[tokio::test(start_paused = true)]
 async fn no_debug_prints_an_address() {
     let world = World::new();
@@ -1007,10 +1008,13 @@ async fn no_debug_prints_an_address() {
     };
     let dns = StunDns::new();
     dns.put("stun.example.org", 3478, vec![s1.addr]);
+    // What the gathering tells the checklist: this side's public address.
+    let gathered = Gathered::Public(at(NAT).ip());
     for text in [
         format!("{report:?}"),
         format!("{ask:?}"),
         format!("{dns:?}"),
+        format!("{gathered:?}"),
     ] {
         for needle in ["81.2", "40000", "64.0", "192.168", "10.8", "stun.example"] {
             assert!(!text.contains(needle), "{needle} in {text}");
