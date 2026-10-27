@@ -548,7 +548,8 @@ fn named<'a>(log: &str, secrets: &'a [(String, String)]) -> Option<&'a (String, 
 /// rustls (through the `log` bridge) all log. Neither its stderr (text,
 /// then JSON) nor its file log names an address or port either machine
 /// bound, the forced destination, or either device key as hex, base32 or a
-/// decimal byte list, while Tornect's own lines get through. With
+/// decimal byte list, while Tornect's own lines get through (the viewer's
+/// `direct path open` with the link's counters among them). With
 /// identifiers opted in, the same run's stderr does name them: the capture
 /// would see a leak. The file log never does. FakeIgd and FakePcp (igd-next
 /// and crab_nat) are Phase B's (step B9).
@@ -565,6 +566,16 @@ fn a_direct_session_logs_no_address_port_or_key() {
         ] {
             assert!(run.stderr.contains(said), "{case}: {said:?} missing");
         }
+        // The viewer's debug line carries the link's counters (the device
+        // rows of design §13 read them), and the checks below find no
+        // address in it. The host's `direct link closed` comes from a task
+        // that may outlive the child's end, so it is not waited for.
+        assert!(
+            run.stderr
+                .lines()
+                .any(|l| l.contains("direct path open") && l.contains("v4_mapped_sends")),
+            "{case}: no counters on the viewer's `direct path open` line"
+        );
         assert!(
             run.file_log.contains("e2e: the direct session is over"),
             "{case}: the file log holds our lines"

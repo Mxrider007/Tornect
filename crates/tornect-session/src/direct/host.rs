@@ -774,6 +774,9 @@ impl Task {
             return;
         };
         let stats = open.link.stats();
+        // Counts only (decision M1-83): the whole session's socket counters
+        // for the device rows of the direct design §13.
+        tracing::debug!(session = %self.id, ?stats, "direct link closed");
         if stats.handshakes_refused > 0 || stats.dial_failed == Some(DialFailure::Crypto) {
             let ms = ms_since(self.accepted);
             self.shared.note(&self.id, |r| {

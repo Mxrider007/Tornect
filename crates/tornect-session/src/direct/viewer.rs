@@ -624,10 +624,13 @@ where
             };
             let binding = Binding::direct(&at.token, &session.th(), &ekm);
             let elapsed = at.accepted.elapsed();
+            // Counts only (decision M1-83): the device rows of the direct
+            // design §13 read `dual_stack` and the send counters here.
             tracing::debug!(
                 ms = elapsed.as_millis(),
                 winner = ?established.winner(),
                 route = ?established.route(),
+                stats = ?established.stats(),
                 "direct path open"
             );
             Step::Open(Box::new(DirectMedia {
