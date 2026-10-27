@@ -5,7 +5,7 @@ with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-contai
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-is under way: B1 to B3 are done (2026-10-27; "OPEN, owned by Phase B steps" below).
+is under way: B1 to B5 are done (2026-10-27; "OPEN, owned by Phase B steps" below).
 
 ## What Phase A does
 
@@ -139,7 +139,19 @@ and the crates below ring check here).
   note when the list is not the default); C1 puts the same-list condition into M1-81's final text
   and the plan's threat model, and §13 rows 10/11 (B13) include the split-tunnel case whose recipe
   is in the ledger.
-- B4/B5: router mapping (UPnP, PCP, NAT-PMP) as `RealMapper` in place of `NoMapper`, the `router_port` ledger sweep.
+- B4/B5 (done 2026-10-27, `48626004`, `5209419a`, `798fb61a`; ledger rows "Step B4", "Step B5" and
+  "Steps B4 and B5", decision M1-81's step note): `RealMapper` (PCP with our own nonce and NAT-PMP
+  through crab_nat, UPnP-IGD through igd-next with the unicast search first and the gateway check),
+  `MappingLedger` under `Paths::router_ports_dir()` (one locked list per running process),
+  `renewal_delay` and `Mapping::keep_renewed`, release on drop through `ReleaseTracker`,
+  `RealMapper::sweep`, `RealNet::with_router` and `RealNet::sweep_leftovers`, `FakePcp` and
+  `FakeIgd` (`tornect_net::mapping::fake`, also under `test-support` for B9). Nothing calls them yet:
+  the app still builds `RealNet::new()` (mapper `NoMapper`). Owed by B6 (or B11): the app's
+  `RealNet::with_router(paths.router_ports_dir(), <sessions.log router_port sink>)` once per
+  process, `sweep_leftovers()` at GUI, `host` and `connect` start, `releases().wait(
+  SHUTDOWN_RELEASE_WAIT)` at exit, and the link holding the `Mapping` with `keep_renewed` beside
+  the session. Left as NEEDS-DEVICE: the `FakePcp` tests on Windows (Wine cannot run them) and on
+  macOS (`lo0` aliases), and real routers (design §13 row 4, after B12).
 - B7/B8: the internet-scope ranks in `MemNet`; `NatBox`, `MemStun`, `MemMapper`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
 - B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
@@ -166,5 +178,7 @@ and the crates below ring check here).
 - The redaction e2e re-runs its own test binary as a child; run the session tests through cargo or
   the built binary, not through a wrapper that changes `current_exe()`.
 - The loopback session tests use `127.0.0.20` to `.41`; macOS needs `lo0` aliases for those.
+- The mapping tests give each fake router its own `127.0.0.N` from `.40` up (crab_nat always
+  sends to port 5351); under Wine they fail (shared loopback port, answers from `127.0.0.1`).
 - The app's tests still run as `tester` (copy the binary from `cargo test -p tornect --no-run` to
   `/home/tester`, run with `runuser`, delete it afterwards).
