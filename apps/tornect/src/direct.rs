@@ -112,6 +112,7 @@ impl DirectWiring {
                 Mine::from_knob(&self.knobs.transport)
             },
             device_pk: self.device_pk(),
+            on_route: None,
         }
     }
 
@@ -137,8 +138,13 @@ pub fn no_network() -> Arc<dyn NetEnv> {
     Arc::new(tornect_net::mem::MemNet::new(1).machine(tornect_net::mem::MachineSpec::default()))
 }
 
-/// One viewer session's direct path (design `direct` §8.6; the window's
-/// `on_route` callback joins at step A20 with the route it shows).
+/// Where a viewer session's route goes as soon as it is known (design
+/// `direct` §3.1, §8.6 `on_route`; the window's model): the path the path
+/// phase chose, then, when a direct connection the host's TLS refused falls
+/// back (DIRECT-2's one exception), the Tor route that replaced it.
+pub type OnRoute = Arc<dyn Fn(PathEnd) + Send + Sync>;
+
+/// One viewer session's direct path (design `direct` §8.6).
 pub struct DirectCtx {
     /// The viewer's half of the path.
     pub viewer: ViewerDirect,
@@ -147,6 +153,25 @@ pub struct DirectCtx {
     /// This device's public key: a host with the same key is this computer
     /// (the decision's `same_key`).
     pub device_pk: [u8; 32],
+    /// Who is told the session's route ([`OnRoute`]); `None` on the
+    /// command line, which prints its `ROUTE` line once the media is bound.
+    pub on_route: Option<OnRoute>,
+}
+
+impl DirectCtx {
+    /// This context, telling `on_route` the session's route.
+    #[must_use]
+    pub fn reporting(mut self, on_route: OnRoute) -> Self {
+        self.on_route = Some(on_route);
+        self
+    }
+
+    /// Tell the session's route, if anyone listens.
+    pub(crate) fn tell(&self, end: PathEnd) {
+        if let Some(on_route) = &self.on_route {
+            on_route(end);
+        }
+    }
 }
 
 impl std::fmt::Debug for DirectCtx {
@@ -154,6 +179,7 @@ impl std::fmt::Debug for DirectCtx {
         f.debug_struct("DirectCtx")
             .field("mine", &self.mine)
             .field("viewer", &self.viewer.stats())
+            .field("reports_route", &self.on_route.is_some())
             .finish_non_exhaustive()
     }
 }

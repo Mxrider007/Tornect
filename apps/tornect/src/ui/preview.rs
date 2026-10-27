@@ -248,8 +248,8 @@ fn sample_stream() -> StreamInfo {
     stream
 }
 
-/// A live session viewed at the control level, of the made-up "Office
-/// PC", for the stream window's sheets.
+/// A live session viewed at the control level, directly on the local
+/// network, of the made-up "Office PC", for the stream window's sheets.
 fn viewed(now: Instant) -> Viewing {
     Viewing {
         host: "Office PC".to_owned(),
@@ -262,6 +262,10 @@ fn viewed(now: Instant) -> Viewing {
         stream: sample_stream(),
         services: None,
         screens: Some(sample_screens()),
+        route: crate::ui::model::RouteView::Direct {
+            same_site: true,
+            ipv6: false,
+        },
     }
 }
 
@@ -516,6 +520,10 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                     stream: StreamInfo::default(),
                     services: None,
                     screens: None,
+                    route: crate::ui::model::RouteView::Direct {
+                        same_site: true,
+                        ipv6: false,
+                    },
                 })
             };
         }
@@ -622,6 +630,10 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
             stream: StreamInfo::default(),
             services: None,
             screens: None,
+            route: crate::ui::model::RouteView::Direct {
+                same_site: true,
+                ipv6: false,
+            },
         }),
         Sheet::StageUnreachable => ClientStage::Ended(
             "The host is offline or has not finished publishing its Tornect ID.".to_owned(),
@@ -947,9 +959,10 @@ mod tests {
     /// and the stream window opens pinned, with its Quality menu and a pick
     /// of Balanced on its way ("Changing…" under it, the applied Best
     /// performance checked), or with its details and their Quality and
-    /// Timing rows. `--sheet viewer-screens` (the monitors design §2): its
-    /// Screens menu, two screens and all of them, the main one shown. No
-    /// other sheet opens the stream window so.
+    /// Timing rows, on a direct route (design `direct` §3.1).
+    /// `--sheet viewer-screens` (the monitors design §2): its Screens menu,
+    /// two screens and all of them, the main one shown. No other sheet opens
+    /// the stream window so.
     #[test]
     fn the_stream_sheets_show_the_quality_menu_and_the_timing_rows() {
         use super::super::pages::viewer::testing::Window;
@@ -959,9 +972,10 @@ mod tests {
             "Balanced",
             "Best performance",
             "Changing…",
-            "Tor relay · Best performance · 0 fps · 1280×720",
+            "Direct · Best performance · 0 fps · 1280×720",
         ];
         let details: &[&str] = &[
+            "Direct (local network)",
             "Best performance · up to 20 fps · 1.0 Mbit/s",
             "Scaled down from 2560×1440",
             "Remote computer: capture 4.0 ms · scale 2.1 ms · convert 1.5 ms · encode 9.8 ms · \

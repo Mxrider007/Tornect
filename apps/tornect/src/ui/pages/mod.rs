@@ -1966,9 +1966,10 @@ mod tests {
     }
 
     /// §B.8.10: the unattended stepper's own steps (the password, then the
-    /// computer's checks, generic, no countdown; no direct path in this
-    /// version), the badge from the signed accept, the failed attempts, and
-    /// the withheld level, naming the computer only while not shared.
+    /// computer's checks, generic, no countdown; the picture directly where
+    /// it can, design `direct` §3.2), the badge from the signed accept, the
+    /// failed attempts, and the withheld level, naming the computer only
+    /// while not shared.
     #[test]
     fn the_unattended_stepper_and_badge() {
         use super::super::model::{ClientStage, Dial, StreamInfo, UaLive, Viewing};
@@ -1987,7 +1988,7 @@ mod tests {
         for said in [
             "Checking the password",
             "Someone at the computer can still block this, or must allow it",
-            "No direct path in this version: relayed through Tor",
+            home::OPENING_DIRECT,
         ] {
             assert!(has_text(&window, said), "{said}");
         }
@@ -2002,6 +2003,7 @@ mod tests {
             stream: StreamInfo::default(),
             services: None,
             screens: None,
+            route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
         });
         model.ua_live = Some(UaLive {
             withheld: true,
@@ -2511,6 +2513,89 @@ mod tests {
         }
     }
 
+    /// Design `direct` §3.2: "Opening the picture" says how the picture
+    /// opens with this computer's settings, in both steppers: directly where
+    /// it can (Phase A: on the same network), through Tor when direct
+    /// connections are off or a bridge turns them off, and the end of the
+    /// session under `network.lan_only`. The line this version used to show
+    /// is gone.
+    #[test]
+    fn the_picture_step_says_how_it_opens_with_these_settings() {
+        use super::super::model::{ClientStage, Dial};
+        use tornect_signal::consent::TransportPolicy;
+        assert!(home::OPENING_DIRECT.contains("same network"));
+        const { assert!(!tornect_session::INTERNET_DIRECT) };
+        // A name, the settings, the note, the policy the sessions read.
+        type Case = (&'static str, fn(&mut Model), &'static str, TransportPolicy);
+        let id = TornectId::from_bytes([0x42; 32]);
+        let cases: [Case; 4] = [
+            (
+                "direct on",
+                |_| {},
+                home::OPENING_DIRECT,
+                TransportPolicy::Any,
+            ),
+            (
+                "direct off",
+                |m| m.settings.direct = false,
+                home::OPENING_TOR,
+                TransportPolicy::TorOnly,
+            ),
+            (
+                "a bridge in use",
+                |m| m.settings.bridged_off = true,
+                home::OPENING_TOR,
+                TransportPolicy::TorOnly,
+            ),
+            (
+                "lan_only",
+                |m| m.settings.lan_only = true,
+                home::OPENING_LAN_ONLY,
+                TransportPolicy::LanOnly,
+            ),
+        ];
+        for (case, set, note, policy) in cases {
+            for unattended in [false, true] {
+                let mut model = at_rest();
+                set(&mut model);
+                assert_eq!(model.settings.direct_policy(), policy, "{case}");
+                assert_eq!(home::opening_note(policy), note, "{case}");
+                model.dial = Dial {
+                    id: Some(id),
+                    since: Some(Instant::now()),
+                    paired_now: false,
+                    failed: None,
+                    unattended,
+                    went_live: false,
+                };
+                model.client = if unattended {
+                    ClientStage::Checking
+                } else {
+                    ClientStage::Asking
+                };
+                let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+                assert!(has_text(&window, "Opening the picture"), "{case}");
+                assert!(has_text(&window, note), "{case} {unattended}");
+                for other in [
+                    home::OPENING_DIRECT,
+                    home::OPENING_TOR,
+                    home::OPENING_LAN_ONLY,
+                ] {
+                    if other != note {
+                        assert!(!has_text(&window, other), "{case}: {other}");
+                    }
+                }
+                assert!(
+                    !has_text(
+                        &window,
+                        "No direct path in this version: relayed through Tor"
+                    ),
+                    "{case}"
+                );
+            }
+        }
+    }
+
     /// The connect stepper: the four steps and the one the connection is on,
     /// the code on step 2 while pairing, the level from the signed accept once
     /// live, and every error of the taxonomy in plain words, with Try again
@@ -2569,6 +2654,7 @@ mod tests {
             stream: StreamInfo::default(),
             services: None,
             screens: None,
+            route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
         });
         live.dial = dial(None);
         let window = Window::new(live.clone(), Page::Home, egui::Theme::Dark, WIDE);

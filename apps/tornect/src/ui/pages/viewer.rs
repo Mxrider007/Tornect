@@ -2,7 +2,10 @@
 //! fills the window; a floating toolbar at the top centre hides itself a
 //! while after the pointer last moved (2.5 s unless Settings, Display and
 //! quality says otherwise) and comes back at the top edge or on the
-//! viewer's chord; the relay line stays below the picture.
+//! viewer's chord; a relayed session's route line stays below the picture.
+//! The badge and the details say how the pictures come (design `direct`
+//! §3.1): looked for, direct, or relayed through Tor and why, in words that
+//! are functions of the path phase's reasons only.
 //! Drawn from the session's `Viewing` and the window's own [`ViewerState`],
 //! which lives in the app's stream window of one session and dies with it,
 //! so nothing in it outlives the session. What the user asks for comes back
@@ -33,12 +36,13 @@ use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 use tornect_core::config::{Picture, QualityPreset, ToolbarHides, Viewer};
 use tornect_proto::services::caps;
 use tornect_proto::{ALL_MONITORS, HostStats, MonitorEntry, QualityInfo, monitor_status};
+use tornect_session::{FallbackWhy, INTERNET_DIRECT, TorWhy};
 use tornect_signal::messages::notice;
 
 pub use self::clip::{Board, Ends};
 pub use self::panels::{FileOp, FilesTab, cut as cut_name, limit_text, percent, size_text};
 
-use super::super::model::{Ewma, ScreenNote, ScreensView, ViewerServices, Viewing};
+use super::super::model::{Ewma, RouteView, ScreenNote, ScreensView, ViewerServices, Viewing};
 use super::super::screenshot;
 use super::super::services::ServicesState;
 use super::super::theme::{self, Face, Tokens};
@@ -49,8 +53,55 @@ use super::super::widgets;
 /// back.
 const TOP_EDGE: f32 = 8.0;
 
-/// The relay line: the picture comes through Tor (always shown).
+/// The relay line: the picture comes through Tor (below the picture of a
+/// relayed session, and in its details).
 const RELAY_LINE: &str = "Relayed via Tor: quality limited";
+
+/// The strip's line, and the details' title, of a session relayed because
+/// the host allows only Tor (design `direct` §3.1).
+const RELAY_POLICY_LINE: &str = "Relayed by policy";
+
+/// Under [`RELAY_POLICY_LINE`] in the details.
+const POLICY_LINE: &str = "The other computer allows only connections relayed through Tor.";
+
+/// The details' title of a session relayed through Tor for any other
+/// reason, and the line under it.
+const RELAYED: (&str, &str) = (
+    "Relayed through Tor",
+    "private, and slower than a direct link",
+);
+
+/// The route while the path phase has not chosen yet: the details' line
+/// and the badge.
+const FINDING: &str = "Looking for a direct path…";
+
+/// The details of a direct route on this computer's own network: the
+/// title, and the line under it.
+const DIRECT_LAN: (&str, &str) = (
+    "Direct (local network)",
+    "The two computers talk directly on your local network; each sees the other's local address.",
+);
+
+/// The details of a direct route across the internet (design `direct`
+/// Phase B).
+const DIRECT_INTERNET: (&str, &str) = (
+    "Direct (internet)",
+    "The two computers talk directly over the internet, end-to-end encrypted; each sees the \
+     other's internet address.",
+);
+
+/// A direct attempt that found no path (`no-path`): what this build can
+/// try, same-site only until the internet scope is on.
+const NO_PATH_LINE: &str = if INTERNET_DIRECT {
+    "The two computers could not reach each other directly: a router or firewall is in the way."
+} else {
+    "The two computers are not on the same local network, or a firewall blocks the direct path."
+};
+
+/// After [`NO_PATH_LINE`] when the host's probes came but none of this
+/// computer's was answered (`no-path-firewall`).
+const FIREWALL_LINE: &str = "The other computer's firewall may be blocking Tornect. On Windows, \
+     choose \"Allow access\" when Windows asks about Tornect.";
 
 /// The strip's line while a session of this computer's own host is live:
 /// the strip stays on screen in full screen too, where the window may cover
@@ -1012,16 +1063,127 @@ pub fn chip_text(v: &Viewing) -> &'static str {
 
 /// The badge: the route, the preset the host applies once it said (from
 /// `BindOk` on), the frame rate measured here and the decoded picture's
-/// size: `Tor relay · Balanced · 30 fps · 1600×900`.
+/// size: `Tor relay · Balanced · 30 fps · 1600×900`, `Direct · 30 fps ·
+/// 1600×900` (design `direct` §3.1). Until the path phase chose, when no
+/// picture can have come yet: "Looking for a direct path…".
 #[must_use]
 pub fn badge_text(v: &Viewing, rate: u64) -> String {
     let (w, h) = v.size;
+    let route = match v.route {
+        RouteView::Finding => return FINDING.to_owned(),
+        RouteView::Direct { .. } => "Direct",
+        RouteView::Tor(_) => "Tor relay",
+    };
     match v.stream.applied_preset() {
-        Some(preset) => format!(
-            "Tor relay · {} · {rate} fps · {w}×{h}",
-            quality_name(preset)
-        ),
-        None => format!("Tor relay · {rate} fps · {w}×{h}"),
+        Some(preset) => format!("{route} · {} · {rate} fps · {w}×{h}", quality_name(preset)),
+        None => format!("{route} · {rate} fps · {w}×{h}"),
+    }
+}
+
+/// The line below the picture for `route` (design `direct` §3.1): only a
+/// relayed session's, "Relayed by policy" when the host allows only Tor.
+#[must_use]
+pub fn strip_line(route: &RouteView) -> Option<&'static str> {
+    match route {
+        RouteView::Tor(TorWhy::HostPolicy) => Some(RELAY_POLICY_LINE),
+        RouteView::Tor(_) => Some(RELAY_LINE),
+        RouteView::Finding | RouteView::Direct { .. } => None,
+    }
+}
+
+/// The details' Route title (design `direct` §3.1): " · IPv6" after a
+/// direct route over IPv6.
+#[must_use]
+pub fn route_title(route: &RouteView) -> String {
+    match route {
+        RouteView::Finding => FINDING.to_owned(),
+        RouteView::Direct { same_site, ipv6 } => {
+            let (title, _) = if *same_site {
+                DIRECT_LAN
+            } else {
+                DIRECT_INTERNET
+            };
+            if *ipv6 {
+                format!("{title} · IPv6")
+            } else {
+                title.to_owned()
+            }
+        }
+        RouteView::Tor(TorWhy::HostPolicy) => RELAY_POLICY_LINE.to_owned(),
+        RouteView::Tor(_) => RELAYED.0.to_owned(),
+    }
+}
+
+/// Why a session is relayed through Tor, in the window's words (design
+/// `direct` §3.1; the CLI's name for the same reason is
+/// [`TorWhy::cli_name`]): one line, two when the host's probes came but
+/// none of this computer's was answered. None for the host's policy, which
+/// the title says.
+#[must_use]
+pub fn tor_reason(why: TorWhy) -> &'static [&'static str] {
+    match why {
+        TorWhy::HostPolicy => &[],
+        TorWhy::HereOff => {
+            &["Direct connections are off on this computer (Settings > Connection)."]
+        }
+        TorWhy::Bridge => &[
+            "Direct connections are off while Tor uses a bridge on this computer (Settings > \
+             Connection).",
+        ],
+        TorWhy::OldHost => {
+            &["The other computer runs an older Tornect that cannot connect directly."]
+        }
+        TorWhy::SameDevice => &["This computer is connecting to itself."],
+        TorWhy::Fallback(why) => match why {
+            FallbackWhy::HereNoAddresses => {
+                &["This computer has no network address a direct connection can use."]
+            }
+            FallbackWhy::HostNoAddresses => {
+                &["The other computer has no network address a direct connection can use."]
+            }
+            FallbackWhy::HereSocket => {
+                &["This computer could not open a network port for a direct connection."]
+            }
+            FallbackWhy::HostSocket => {
+                &["The other computer could not open a network port for a direct connection."]
+            }
+            FallbackWhy::HostSilent => &["The other computer did not answer in time."],
+            FallbackWhy::NoPath { heard: false } => &[NO_PATH_LINE],
+            FallbackWhy::NoPath { heard: true } => &[NO_PATH_LINE, FIREWALL_LINE],
+            FallbackWhy::Quic => {
+                &["The computers found each other, but the secure direct connection failed."]
+            }
+        },
+    }
+}
+
+/// The details' Route rows for `route`: its title, the line under it, and
+/// for a relayed session the reason and the relay line.
+fn route_detail(ui: &mut egui::Ui, route: &RouteView, t: &Tokens) {
+    let muted = |text: &str| RichText::new(text).color(t.text_muted).small();
+    // The reasons wrap rather than widen the details.
+    ui.set_max_width(380.0);
+    ui.label(route_title(route));
+    match route {
+        RouteView::Finding => {}
+        RouteView::Direct { same_site, .. } => {
+            let (_, line) = if *same_site {
+                DIRECT_LAN
+            } else {
+                DIRECT_INTERNET
+            };
+            ui.add(egui::Label::new(muted(line)).wrap());
+        }
+        RouteView::Tor(TorWhy::HostPolicy) => {
+            ui.add(egui::Label::new(muted(POLICY_LINE)).wrap());
+        }
+        RouteView::Tor(why) => {
+            ui.label(muted(RELAYED.1));
+            for line in tor_reason(*why) {
+                ui.add(egui::Label::new(muted(line)).wrap());
+            }
+            ui.label(RichText::new(RELAY_LINE).small().color(t.warn));
+        }
     }
 }
 
@@ -1270,30 +1432,34 @@ pub fn stream_window(
         ui.ctx().request_repaint_after(left);
     }
     let sharing = viewer.sharing;
+    let line = match viewing {
+        Some(v) => strip_line(&v.route).map(|line| RichText::new(line).small().color(t.warn)),
+        None => Some(RichText::new("The session has ended.").small()),
+    };
     // Outside the picture, so no press there reaches the remote computer;
-    // shown whether or not the toolbar is, and in full screen.
-    egui::Panel::bottom("viewer-relay")
-        .frame(
-            egui::Frame::new()
-                .fill(t.bg_sidebar)
-                .inner_margin(egui::Margin::symmetric(12, 4)),
-        )
-        .show(ui, |ui| {
-            let line = if viewing.is_some() {
-                RichText::new(RELAY_LINE).small().color(t.warn)
-            } else {
-                RichText::new("The session has ended.").small()
-            };
-            ui.label(line);
-            if sharing {
-                ui.label(
-                    RichText::new(SHARING_LINE)
-                        .small()
-                        .strong()
-                        .color(t.danger_text),
-                );
-            }
-        });
+    // shown whether or not the toolbar is, and in full screen, while it has
+    // something to say.
+    if line.is_some() || sharing {
+        egui::Panel::bottom("viewer-relay")
+            .frame(
+                egui::Frame::new()
+                    .fill(t.bg_sidebar)
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
+            )
+            .show(ui, |ui| {
+                if let Some(line) = line {
+                    ui.label(line);
+                }
+                if sharing {
+                    ui.label(
+                        RichText::new(SHARING_LINE)
+                            .small()
+                            .strong()
+                            .color(t.danger_text),
+                    );
+                }
+            });
+    }
     let mut drawn = None;
     egui::CentralPanel::no_frame()
         .frame(egui::Frame::new().fill(Color32::BLACK))
@@ -1512,8 +1678,12 @@ fn toolbar(
                         }
                         if !viewer.badge_off {
                             let badge = badge_text(v, rate);
+                            let color = match v.route {
+                                RouteView::Direct { .. } => t.ok,
+                                RouteView::Finding | RouteView::Tor(_) => t.warn,
+                            };
                             let badge = ui.add(
-                                egui::Label::new(RichText::new(badge).small().color(t.warn))
+                                egui::Label::new(RichText::new(badge).small().color(color))
                                     .sense(egui::Sense::click()),
                             );
                             if badge.clicked() {
@@ -2060,11 +2230,7 @@ fn details(
                         .spacing(vec2(16.0, 6.0))
                         .show(ui, |ui| {
                             ui.label(muted("Route"));
-                            ui.vertical(|ui| {
-                                ui.label("Relayed through Tor");
-                                ui.label(muted("private, and slower than a direct link").small());
-                                ui.label(RichText::new(RELAY_LINE).small().color(t.warn));
-                            });
+                            ui.vertical(|ui| route_detail(ui, &v.route, t));
                             ui.end_row();
                             ui.label(muted("Picture"));
                             ui.label(format!("{}×{} · {rate} fps", v.size.0, v.size.1));
@@ -2225,7 +2391,7 @@ pub(crate) mod testing {
     use std::time::{Duration, Instant};
 
     use super::{ViewerState, stream_window};
-    use crate::ui::model::{StreamInfo, ViewerServices, Viewing};
+    use crate::ui::model::{RouteView, StreamInfo, ViewerServices, Viewing};
     use crate::ui::view::Action;
 
     /// The services of a host that granted `caps`, with a host's default
@@ -2277,6 +2443,8 @@ pub(crate) mod testing {
                     stream: StreamInfo::default(),
                     services: None,
                     screens: None,
+                    // Relayed, as every session was before the direct path.
+                    route: RouteView::Tor(tornect_session::TorWhy::OldHost),
                 },
                 viewer: ViewerState::default(),
                 input_sent: 0,
@@ -2715,6 +2883,293 @@ mod tests {
         w.pass(ms(3000), Vec::new());
         assert!(!w.viewer.toolbar_shown());
         assert!(w.has("Relayed via Tor: quality limited"), "{:?}", w.texts());
+    }
+
+    /// Every reason a session is relayed, as `tornect_session` names them.
+    fn every_tor_why() -> Vec<TorWhy> {
+        let mut all = vec![
+            TorWhy::HostPolicy,
+            TorWhy::HereOff,
+            TorWhy::Bridge,
+            TorWhy::OldHost,
+            TorWhy::SameDevice,
+        ];
+        all.extend(
+            [
+                FallbackWhy::HereNoAddresses,
+                FallbackWhy::HostNoAddresses,
+                FallbackWhy::HereSocket,
+                FallbackWhy::HostSocket,
+                FallbackWhy::HostSilent,
+                FallbackWhy::NoPath { heard: false },
+                FallbackWhy::NoPath { heard: true },
+                FallbackWhy::Quic,
+            ]
+            .map(TorWhy::Fallback),
+        );
+        all
+    }
+
+    const LAN: RouteView = RouteView::Direct {
+        same_site: true,
+        ipv6: false,
+    };
+
+    /// Design `direct` §3.1: the badge names the route, "Direct" or the
+    /// relay as before, with the preset, the rate and the size after it;
+    /// until the path phase chose, it says a direct path is being looked
+    /// for. Direct is drawn in the colour of a good state.
+    #[test]
+    fn the_badge_names_the_route() {
+        let mut w = Window::new(true);
+        w.viewing.route = LAN;
+        assert_eq!(badge_text(&w.viewing, 30), "Direct · 30 fps · 1600×900");
+        w.viewing.route = RouteView::Direct {
+            same_site: false,
+            ipv6: true,
+        };
+        assert_eq!(badge_text(&w.viewing, 24), "Direct · 24 fps · 1600×900");
+        for why in every_tor_why() {
+            w.viewing.route = RouteView::Tor(why);
+            assert_eq!(
+                badge_text(&w.viewing, 30),
+                "Tor relay · 30 fps · 1600×900",
+                "{why:?}"
+            );
+        }
+        w.viewing.route = RouteView::Finding;
+        assert_eq!(badge_text(&w.viewing, 0), "Looking for a direct path…");
+        w.viewing.route = LAN;
+        w.viewing.stream.applied = Some(applied(QualityPreset::Balanced));
+        assert_eq!(
+            badge_text(&w.viewing, 30),
+            "Direct · Balanced · 30 fps · 1600×900"
+        );
+        w.viewing.stream.applied = None;
+        for k in 0..=10u64 {
+            w.viewing.pictures = 1 + 3 * k;
+            w.pass(ms(100 * k), Vec::new());
+        }
+        assert!(w.has("Direct · 30 fps · 1600×900"), "{:?}", w.texts());
+        assert!(
+            !w.texts().iter().any(|t| t.contains("Tor relay")),
+            "{:?}",
+            w.texts()
+        );
+        // A click on it opens the details as the relay badge's did.
+        assert_eq!(
+            w.click(ms(1100), "Direct · 30 fps · 1600×900"),
+            vec![Action::Viewer(ViewerAction::Details(true))]
+        );
+    }
+
+    /// Design `direct` §3.1: the line below the picture is a relayed
+    /// session's only ("Relayed by policy" when the host allows only Tor),
+    /// with the toolbar hidden too; a direct session, or one still looking,
+    /// shows none, and the screen-shared line stays whatever the route.
+    #[test]
+    fn the_relay_line_is_a_relayed_sessions_only() {
+        for why in every_tor_why() {
+            let mut w = Window::new(true);
+            w.viewing.route = RouteView::Tor(why);
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(3000), Vec::new());
+            assert!(!w.viewer.toolbar_shown());
+            let (shown, absent) = if why == TorWhy::HostPolicy {
+                ("Relayed by policy", RELAY_LINE)
+            } else {
+                (RELAY_LINE, "Relayed by policy")
+            };
+            assert!(w.has(shown), "{why:?}: {:?}", w.texts());
+            assert!(!w.has(absent), "{why:?}: {:?}", w.texts());
+            assert_eq!(strip_line(&w.viewing.route), Some(shown));
+        }
+        for route in [
+            LAN,
+            RouteView::Direct {
+                same_site: false,
+                ipv6: false,
+            },
+            RouteView::Finding,
+        ] {
+            let mut w = Window::new(true);
+            w.viewing.route = route;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(3000), Vec::new());
+            assert_eq!(strip_line(&route), None);
+            for line in [RELAY_LINE, "Relayed by policy", SHARING_LINE] {
+                assert!(!w.has(line), "{route:?}: {line}: {:?}", w.texts());
+            }
+            w.viewer.sharing = true;
+            w.pass(ms(3100), Vec::new());
+            assert!(w.has(SHARING_LINE), "{route:?}: {:?}", w.texts());
+            assert!(!w.has(RELAY_LINE), "{route:?}");
+        }
+    }
+
+    /// Design `direct` §3.1: the reasons a session is relayed, in the
+    /// design's words, one line each (two when the host's probes came but
+    /// none of ours was answered); the host's policy is said by the title
+    /// alone. No line names an address.
+    #[test]
+    fn each_reason_reads_as_the_design_words_it() {
+        let table: [(TorWhy, &[&str]); 13] = [
+            (TorWhy::HostPolicy, &[]),
+            (
+                TorWhy::HereOff,
+                &["Direct connections are off on this computer (Settings > Connection)."],
+            ),
+            (
+                TorWhy::Bridge,
+                &[
+                    "Direct connections are off while Tor uses a bridge on this computer \
+                   (Settings > Connection).",
+                ],
+            ),
+            (
+                TorWhy::OldHost,
+                &["The other computer runs an older Tornect that cannot connect directly."],
+            ),
+            (
+                TorWhy::SameDevice,
+                &["This computer is connecting to itself."],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::HereNoAddresses),
+                &["This computer has no network address a direct connection can use."],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::HostNoAddresses),
+                &["The other computer has no network address a direct connection can use."],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::HereSocket),
+                &["This computer could not open a network port for a direct connection."],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::HostSocket),
+                &["The other computer could not open a network port for a direct connection."],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::HostSilent),
+                &["The other computer did not answer in time."],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::NoPath { heard: false }),
+                &[
+                    "The two computers are not on the same local network, or a firewall blocks \
+                   the direct path.",
+                ],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::NoPath { heard: true }),
+                &[
+                    "The two computers are not on the same local network, or a firewall \
+                     blocks the direct path.",
+                    "The other computer's firewall may be blocking Tornect. On Windows, choose \
+                     \"Allow access\" when Windows asks about Tornect.",
+                ],
+            ),
+            (
+                TorWhy::Fallback(FallbackWhy::Quic),
+                &["The computers found each other, but the secure direct connection failed."],
+            ),
+        ];
+        assert_eq!(table.len(), every_tor_why().len());
+        for (why, lines) in table {
+            assert_eq!(tor_reason(why), lines, "{why:?}");
+            for line in lines {
+                assert!(
+                    !line.chars().any(|c| c.is_ascii_digit()),
+                    "{why:?} names no address: {line}"
+                );
+            }
+        }
+        // Phase A: the internet copy waits for Phase B (B11).
+        const { assert!(!INTERNET_DIRECT) };
+    }
+
+    /// Design `direct` §3.1: the details' Route row says the route, what
+    /// each computer learns on a direct one, and on a relayed one the
+    /// reason and the relay line; " · IPv6" after a direct route over IPv6.
+    #[test]
+    fn the_details_say_the_route_and_why_it_is_relayed() {
+        let open = |route: RouteView| {
+            let mut w = Window::new(true);
+            w.viewing.route = route;
+            w.viewer.details = true;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert!(w.has("Route"), "{route:?}: {:?}", w.texts());
+            w
+        };
+        let w = open(LAN);
+        for text in [
+            "Direct (local network)",
+            "The two computers talk directly on your local network; each sees the other's \
+             local address.",
+        ] {
+            assert!(w.has(text), "{text}: {:?}", w.texts());
+        }
+        for text in [RELAY_LINE, "Relayed through Tor", "Direct (internet)"] {
+            assert!(!w.has(text), "{text}: {:?}", w.texts());
+        }
+        let w = open(RouteView::Direct {
+            same_site: true,
+            ipv6: true,
+        });
+        assert!(w.has("Direct (local network) · IPv6"), "{:?}", w.texts());
+        let w = open(RouteView::Direct {
+            same_site: false,
+            ipv6: false,
+        });
+        for text in [
+            "Direct (internet)",
+            "The two computers talk directly over the internet, end-to-end encrypted; each \
+             sees the other's internet address.",
+        ] {
+            assert!(w.has(text), "{text}: {:?}", w.texts());
+        }
+        assert_eq!(
+            route_title(&RouteView::Direct {
+                same_site: false,
+                ipv6: true
+            }),
+            "Direct (internet) · IPv6"
+        );
+        let w = open(RouteView::Tor(TorWhy::HostPolicy));
+        for text in [
+            "Relayed by policy",
+            "The other computer allows only connections relayed through Tor.",
+        ] {
+            assert!(w.has(text), "{text}: {:?}", w.texts());
+        }
+        assert!(!w.has(RELAY_LINE) && !w.has("Relayed through Tor"));
+        for why in every_tor_why()
+            .into_iter()
+            .filter(|w| *w != TorWhy::HostPolicy)
+        {
+            let w = open(RouteView::Tor(why));
+            for text in [
+                "Relayed through Tor",
+                "private, and slower than a direct link",
+                RELAY_LINE,
+            ]
+            .into_iter()
+            .chain(tor_reason(why).iter().copied())
+            {
+                assert!(w.has(text), "{why:?}: {text}: {:?}", w.texts());
+            }
+            let firewall = w.texts().iter().any(|t| t.contains("Allow access"));
+            assert_eq!(
+                firewall,
+                why == TorWhy::Fallback(FallbackWhy::NoPath { heard: true }),
+                "{why:?}"
+            );
+        }
+        let w = open(RouteView::Finding);
+        assert!(w.has("Looking for a direct path…"), "{:?}", w.texts());
+        assert!(!w.has(RELAY_LINE), "{:?}", w.texts());
     }
 
     /// End session ends the session with one click, as Stop did.

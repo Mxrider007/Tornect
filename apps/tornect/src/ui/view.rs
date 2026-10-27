@@ -3040,6 +3040,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: None,
                 screens: None,
+                route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
             }),
             ClientStage::Ended("SESSION ENDED by the host".to_owned()),
         ] {
@@ -3070,6 +3071,7 @@ mod tests {
             stream: StreamInfo::default(),
             services: None,
             screens: None,
+            route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
         };
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -3325,6 +3327,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: None,
                 screens: None,
+                route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
             };
             let mut nodes = Vec::new();
             for _ in 0..2 {
@@ -3401,6 +3404,7 @@ mod tests {
             stream: StreamInfo::default(),
             services: None,
             screens: None,
+            route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
         };
         for shared in [false, true] {
             let mut viewer = ViewerState::default();

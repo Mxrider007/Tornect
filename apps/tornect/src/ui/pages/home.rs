@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
 use tornect_core::invite;
+use tornect_session::INTERNET_DIRECT;
+use tornect_signal::consent::TransportPolicy;
 
 use super::super::icons::{self, Icon};
 use super::super::model::{ClientStage, Computer, Failure, Hosting, Model, Setup, TorState};
@@ -954,6 +956,30 @@ fn setup_card(ui: &mut Ui, t: &Tokens, setup: &Setup, sharing: bool, actions: &m
 /// sheet; step 2 shows the code and points there. The dialed ID is shown,
 /// never a name the host sent before pairing, and nothing of it while this
 /// screen is shared.
+/// The fourth step's note when the picture opens directly where it can
+/// (design `direct` §3.2, Phase A; the Phase B line is keyed on
+/// `INTERNET_DIRECT`).
+pub(super) const OPENING_DIRECT: &str = if INTERNET_DIRECT {
+    "Directly if the two computers can reach each other, otherwise relayed through Tor"
+} else {
+    "Directly if both computers are on the same network, otherwise relayed through Tor"
+};
+/// The fourth step's note when direct connections are off here (the Settings
+/// switch, or a bridge in use).
+pub(super) const OPENING_TOR: &str = "Relayed through Tor: private, and slower than a direct link";
+/// The fourth step's note under `network.lan_only`: a session that cannot
+/// connect directly ends instead of going through Tor.
+pub(super) const OPENING_LAN_ONLY: &str = "Directly if both computers are on the same network, otherwise the session ends (network.lan_only)";
+
+/// "Opening the picture" for this computer's direct-connection settings.
+pub(super) fn opening_note(policy: TransportPolicy) -> &'static str {
+    match policy {
+        TransportPolicy::Any => OPENING_DIRECT,
+        TransportPolicy::TorOnly => OPENING_TOR,
+        TransportPolicy::LanOnly => OPENING_LAN_ONLY,
+    }
+}
+
 fn connect_stepper(
     ui: &mut Ui,
     t: &Tokens,
@@ -1016,6 +1042,7 @@ fn connect_stepper(
                 .color(t.text_muted),
         );
     }
+    let opening = opening_note(model.settings.direct_policy());
     // An unattended connect's own steps (§B.8.10): the password, then the
     // computer's checks, where someone there can still block (or must allow)
     // — generic, with no countdown, since the grant's policy is disclosed
@@ -1033,10 +1060,7 @@ fn connect_stepper(
             "Someone at the computer can still block this, or must allow it",
             "No countdown: the computer's own settings decide",
         ),
-        (
-            "Opening the picture",
-            "No direct path in this version: relayed through Tor",
-        ),
+        ("Opening the picture", opening),
     ];
     let attended_steps: [(&str, &str); 4] = [
         (
@@ -1055,10 +1079,7 @@ fn connect_stepper(
             "Waiting for approval",
             "The person at the computer allows control or view only (up to 110 s)",
         ),
-        (
-            "Opening the picture",
-            "Relayed through Tor: private, and slower than a direct link",
-        ),
+        ("Opening the picture", opening),
     ];
     let steps = if dial.unattended {
         unattended_steps

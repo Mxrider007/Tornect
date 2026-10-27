@@ -44,9 +44,9 @@ use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
     Candidate, CaptureNote, Check, ClientStage, DeviceCard, Dial, Failure, GrantLevel,
     GrantRequest, GrantRow, HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd,
-    PolicyInputs, RotateFailed, Settings, SettingsChange, Shared, Sharing, StreamInfo, TorState,
-    UnattendedBanner, ViewOnly, ViewerServices, Viewing, Wake, WizardAnswer, WizardChoice,
-    WizardView,
+    PolicyInputs, RotateFailed, RouteView, Settings, SettingsChange, Shared, Sharing, StreamInfo,
+    TorState, UnattendedBanner, ViewOnly, ViewerServices, Viewing, Wake, WizardAnswer,
+    WizardChoice, WizardView,
 };
 use super::recognize::Lookalike;
 use super::services::GuiServices;
@@ -589,6 +589,14 @@ fn first_run(paths: &Paths) -> bool {
         mark_first_run(paths);
     }
     first
+}
+
+/// What the window says of direct connections, from the knobs the
+/// sessions read (design `direct` §3.2, §3.3): whether the bridge rule
+/// turns them off now (decision M1-86), after the start, each Tor bootstrap
+/// and each save.
+fn follow_knobs(m: &mut super::model::Model, knobs: &crate::direct::DirectKnobs) {
+    m.settings.bridged_off = knobs.transport.off_by_bridge();
 }
 
 /// The settings page's line when a change was not saved because this screen
@@ -2833,6 +2841,9 @@ async fn take_host_role(b: &Backend, early: JoinHandle<()>) -> Option<Hosted> {
 
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
 pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
+    // What the window says of direct connections follows the knobs the
+    // sessions read: they took the command line's bridge choice too.
+    b.shared.update(|m| follow_knobs(m, &b.knobs));
     let Some((first, early)) = before_the_start(&mut b, &mut commands).await else {
         b.shared.update(|m| m.closed = true);
         return;
@@ -2925,6 +2936,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     // whether direct paths are off for the bridge (decision
                     // M1-86): before the onion service is published again.
                     b.knobs.bootstrapped(started.rung(), &b.cfg.tor);
+                    b.shared.update(|m| follow_knobs(m, &b.knobs));
                     refresh_diagnostics(&b);
                     let started = Arc::new(started);
                     b.shared.update(|m| m.tor_retry = None);
@@ -4238,18 +4250,20 @@ async fn viewed(
         })
     });
     let services = services.map(|(start, _)| start);
+    let since = Instant::now();
     b.shared.update(|m| {
         m.go_live(Viewing {
             host: host.clone(),
             control,
             administrator,
             unattended,
-            since: Instant::now(),
+            since,
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
             services: card,
             screens: None,
+            route: RouteView::Finding,
         });
     });
     // The day of the visit, if history is kept; nothing otherwise.
@@ -4260,8 +4274,12 @@ async fn viewed(
     }
     // The path phase runs first in `watch`, at once (design `direct` §4): its
     // answer stops the host's orphan timer. The policy is read now, after
-    // the last bootstrap set the bridge state.
-    let direct = b.direct().ctx(false);
+    // the last bootstrap set the bridge state. The stream window shows the
+    // route as soon as it is chosen (§3.1), on this session's window only.
+    let told = Arc::clone(&b.shared);
+    let direct = b.direct().ctx(false).reporting(Arc::new(move |end| {
+        told.update(|m| m.set_route(since, &end))
+    }));
     let input = control.then(|| {
         let (tx, rx) = mpsc::channel(INPUT_QUEUE);
         b.link.set_input(Some(tx));
@@ -6647,6 +6665,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: None,
                 screens: None,
+                route: RouteView::Tor(tornect_session::TorWhy::OldHost),
             });
         });
         let popups = Popups::new(Arc::clone(&shared));
@@ -9603,6 +9622,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: None,
                 screens,
+                route: RouteView::Tor(tornect_session::TorWhy::OldHost),
             })
         };
         let switching = |shared: &Shared| {
@@ -9858,6 +9878,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: Some(Box::new(ViewerServices::opening(true))),
                 screens: None,
+                route: RouteView::Tor(tornect_session::TorWhy::OldHost),
             });
         });
         let card = |shared: &Shared| {
@@ -10160,6 +10181,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: Some(Box::new(ViewerServices::opening(false))),
                 screens: None,
+                route: RouteView::Tor(tornect_session::TorWhy::OldHost),
             });
         });
         let link = StreamLink::default();

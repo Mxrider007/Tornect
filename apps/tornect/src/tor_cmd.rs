@@ -1658,6 +1658,10 @@ fn into_path(choice: PathChoice) -> Result<PathChoice, End> {
 /// - the path phase ended the session ([`End::Refused`] when this side
 ///   owes the host `BYE{NO_LAN_PATH}`), or the host ended it, or it broke.
 ///
+/// `direct`'s [`OnRoute`](crate::direct::OnRoute) is told the route as soon
+/// as it is chosen, before the bind's wait: the direct route, then the Tor
+/// route that replaced it when DIRECT-2's exception falls back.
+///
 /// [`ViewerDirect::choose_path`]: tornect_session::ViewerDirect::choose_path
 pub(crate) async fn bind_media<S, O, F, Fut>(
     session: &mut ClientSession<S>,
@@ -1697,6 +1701,9 @@ where
         PathChoice::Direct(media) => {
             preopen = Preopen::None;
             let (route, winner, elapsed) = (media.route, media.winner, media.elapsed);
+            // The connection is up with the host's key pinned: the window
+            // says so while the host opens its capture.
+            direct.tell(PathEnd::Direct(route));
             match unless_interrupted(media.bind(MEDIA_BIND_WAIT), interrupted).await {
                 None => return Err(End::You),
                 Some(Ok(viewer)) => {
@@ -1751,6 +1758,7 @@ where
             )));
         }
     };
+    direct.tell(PathEnd::Tor(why));
     let opened = async {
         let stream = preopen.take(&open_onion).await?;
         MediaViewer::bind(stream, onion, MEDIA_BIND_WAIT)
@@ -4408,6 +4416,14 @@ mod tests {
         .ctx(tor_only)
     }
 
+    /// Who is told a session's route ([`crate::direct::OnRoute`]), and
+    /// what it was told, in order.
+    fn told() -> (crate::direct::OnRoute, Arc<std::sync::Mutex<Vec<PathEnd>>>) {
+        let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&ends);
+        (Arc::new(move |end| seen.lock().unwrap().push(end)), ends)
+    }
+
     /// One LAN segment: the viewer's machine at `.10` and the host's at
     /// `.20`.
     fn lan_pair(seed: u64) -> (MemHost, Arc<dyn tornect_net::NetEnv>) {
@@ -4592,7 +4608,9 @@ mod tests {
         let session = &mut rig.session;
         assert!(session.host_has(feats::DIR1));
         let sid = session.session_token().session_id();
-        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let (on_route, ends) = told();
+        let ctx =
+            viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false).reporting(on_route);
         let log = OnionLog::default();
         let binding = Binding::new(session.session_token(), &session.th());
         let (_stop, stopped) = watch::channel(false);
@@ -4601,6 +4619,15 @@ mod tests {
             .unwrap_or_else(|end| panic!("not bound: {end:?}"));
         assert!(matches!(bound.media, MediaPath::Direct(_)));
         assert_eq!(crate::direct::route_line(&bound.end), "ROUTE direct lan");
+        // The window is told the route the CLI prints, once.
+        assert_eq!(*ends.lock().unwrap(), vec![bound.end]);
+        assert_eq!(
+            bound.end,
+            PathEnd::Direct(tornect_net::Route {
+                same_site: true,
+                ipv6: false
+            })
+        );
         assert_eq!(bound.winner, Some(CandidateKind::Host));
         assert!(
             bound.elapsed < Duration::from_secs(4),
@@ -4635,7 +4662,9 @@ mod tests {
         let session = &mut rig.session;
         let sid = session.session_token().session_id();
         // The link presents device 0x23's key; the session is 0x22's.
-        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x23, false);
+        let (on_route, ends) = told();
+        let ctx =
+            viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x23, false).reporting(on_route);
         let log = OnionLog::default();
         let binding = Binding::new(session.session_token(), &session.th());
         let (_stop, stopped) = watch::channel(false);
@@ -4644,6 +4673,18 @@ mod tests {
             .unwrap_or_else(|end| panic!("not bound: {end:?}"));
         assert!(matches!(bound.media, MediaPath::Onion(_)));
         assert_eq!(crate::direct::route_line(&bound.end), "ROUTE tor quic");
+        // The window was told the direct choice, then the fallback that
+        // replaced it: the last word is the route the CLI prints.
+        assert_eq!(
+            *ends.lock().unwrap(),
+            vec![
+                PathEnd::Direct(tornect_net::Route {
+                    same_site: true,
+                    ipv6: false
+                }),
+                bound.end,
+            ]
+        );
         assert_eq!(bound.winner, None);
         assert!(crate::direct::path_line(bound.winner, bound.elapsed).starts_with("PATH - "));
         assert_eq!(media.route(&sid), Some(TransportKind::TorRelay));
@@ -4668,7 +4709,9 @@ mod tests {
         let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
         let session = &mut rig.session;
         let sid = session.session_token().session_id();
-        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let (on_route, ends) = told();
+        let ctx =
+            viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false).reporting(on_route);
         let log = OnionLog::default();
         let binding = Binding::new(session.session_token(), &session.th());
         let (_stop, stopped) = watch::channel(false);
@@ -4680,6 +4723,7 @@ mod tests {
             crate::direct::route_line(&bound.end),
             "ROUTE tor host-no-addresses"
         );
+        assert_eq!(*ends.lock().unwrap(), vec![bound.end]);
         assert_eq!(bound.winner, None);
         assert_eq!(media.route(&sid), Some(TransportKind::TorRelay));
         assert_eq!(

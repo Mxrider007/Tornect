@@ -1146,6 +1146,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: None,
                 screens: None,
+                route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
             }),
             ..Model::default()
         };
@@ -1261,6 +1262,7 @@ mod tests {
                 stream: StreamInfo::default(),
                 services: None,
                 screens: None,
+                route: crate::ui::model::RouteView::Tor(tornect_session::TorWhy::OldHost),
             }),
             ..Model::default()
         };

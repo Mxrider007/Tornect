@@ -19,6 +19,8 @@ use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
 use tornect_input::Rect;
 use tornect_proto::{HostStats, MonitorEntry, QualityInfo};
+use tornect_session::{PathEnd, TorWhy};
+use tornect_signal::consent::TransportPolicy;
 
 use super::backend::Secret;
 pub use super::services::{HostServices, ViewerServices};
@@ -356,6 +358,17 @@ impl Model {
         self.host_notice = None;
         self.dial.went_live = true;
         self.client = ClientStage::Live(viewing);
+    }
+
+    /// The path phase of the session that went live at `since` chose
+    /// `end` (design `direct` §3.1): its stream window says so. A later
+    /// session, or none, is left alone.
+    pub fn set_route(&mut self, since: Instant, end: &PathEnd) {
+        if let (ClientStage::Live(viewing), Some(route)) = (&mut self.client, RouteView::of(end))
+            && viewing.since == since
+        {
+            viewing.route = route;
+        }
     }
 
     /// The viewed session's watch returned: its host's notice code goes, so
@@ -955,6 +968,48 @@ pub struct Viewing {
     /// `services` §7.1): `None` when the host's signed `HELLO_ACK` does not
     /// offer them. Boxed: the stage's other variants are small.
     pub services: Option<Box<ViewerServices>>,
+    /// How the session's pictures come (design `direct` §3.1): looked for
+    /// until the path phase chose, then direct or relayed through Tor and
+    /// why. Display only.
+    pub route: RouteView,
+}
+
+/// How a viewed session's pictures come, as the stream window says it
+/// (design `direct` §3.1): from the path phase's [`PathEnd`] alone, so the
+/// window's words and the CLI's `ROUTE` line say the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteView {
+    /// The path phase has not chosen yet.
+    #[default]
+    Finding,
+    /// Directly between the two computers.
+    Direct {
+        /// The host is on this computer's own network (one of its on-link
+        /// prefixes, or behind the same router): never guessed from the
+        /// address class alone.
+        same_site: bool,
+        /// Over IPv6.
+        ipv6: bool,
+    },
+    /// Relayed through Tor, and why.
+    Tor(TorWhy),
+}
+
+impl RouteView {
+    /// The route a path phase that ended in `end` gives a session with
+    /// media; `None` for an end that carries none (no media, or a
+    /// `lan_only` session that found no path and ends).
+    #[must_use]
+    pub fn of(end: &PathEnd) -> Option<Self> {
+        match end {
+            PathEnd::Direct(route) => Some(Self::Direct {
+                same_site: route.same_site,
+                ipv6: route.ipv6,
+            }),
+            PathEnd::Tor(why) => Some(Self::Tor(*why)),
+            PathEnd::NoMedia | PathEnd::LanRefused => None,
+        }
+    }
 }
 
 /// The host's monitors as the stream window shows them (the monitors
@@ -1663,6 +1718,16 @@ pub struct Settings {
     /// switch only `config.toml` sets. The session sheet's services line and
     /// the viewer's own download limits follow it.
     pub services: Services,
+    /// Direct connections are allowed (`network.paranoid` off; design
+    /// `direct` §3.3), as saved.
+    pub direct: bool,
+    /// `network.lan_only` (config.toml only): direct connections on this
+    /// network only, in both roles, with no Tor fallback (decision M1-85).
+    pub lan_only: bool,
+    /// Direct connections are allowed but off while Tor reaches the network
+    /// through a bridge (decision M1-86): from the configuration until Tor
+    /// starts, then from the way it went in (the knobs the sessions read).
+    pub bridged_off: bool,
     /// Why the last save from the window was not made, in plain words;
     /// `None` once one was.
     pub problem: Option<&'static str>,
@@ -1688,8 +1753,26 @@ impl Settings {
                 pow_defense: cfg.tor.pow_defense,
             },
             services: cfg.services,
+            direct: !cfg.network.paranoid,
+            lan_only: cfg.network.lan_only,
+            bridged_off: crate::direct::DirectKnobs::new(cfg)
+                .transport
+                .off_by_bridge(),
             problem: None,
         }
+    }
+
+    /// This computer's policy for the direct path as the sessions read it
+    /// ([`tornect_signal::consent::TransportKnob::get`]): the privacy
+    /// switches ([`TransportPolicy::from_privacy`]: direct connections off
+    /// wins over `lan_only`), then Tor only while a bridge turns direct
+    /// connections off.
+    #[must_use]
+    pub fn direct_policy(&self) -> TransportPolicy {
+        if self.bridged_off {
+            return TransportPolicy::TorOnly;
+        }
+        TransportPolicy::from_privacy(!self.direct, self.lan_only)
     }
 }
 
@@ -1791,6 +1874,128 @@ impl SettingsChange {
 mod tests {
     use super::*;
 
+    /// Design `direct` §3.1: the route is the path phase's end, read once
+    /// it chose, and only for the session that went live at that instant: a
+    /// later session's window, or an ended one, is left alone. An end with no
+    /// media changes nothing.
+    #[test]
+    fn the_route_follows_the_path_phase_of_its_own_session() {
+        use tornect_net::Route;
+        use tornect_session::FallbackWhy;
+        let lan = Route {
+            same_site: true,
+            ipv6: false,
+        };
+        assert_eq!(
+            RouteView::of(&PathEnd::Direct(lan)),
+            Some(RouteView::Direct {
+                same_site: true,
+                ipv6: false
+            })
+        );
+        assert_eq!(
+            RouteView::of(&PathEnd::Tor(TorWhy::HostPolicy)),
+            Some(RouteView::Tor(TorWhy::HostPolicy))
+        );
+        assert_eq!(RouteView::of(&PathEnd::NoMedia), None);
+        assert_eq!(RouteView::of(&PathEnd::LanRefused), None);
+        assert_eq!(RouteView::default(), RouteView::Finding);
+        let since = Instant::now();
+        let viewing = Viewing {
+            host: "Office PC".to_owned(),
+            control: true,
+            administrator: false,
+            unattended: false,
+            since,
+            pictures: 0,
+            size: (0, 0),
+            stream: StreamInfo::default(),
+            services: None,
+            screens: None,
+            route: RouteView::Finding,
+        };
+        let route = |m: &Model| match &m.client {
+            ClientStage::Live(v) => Some(v.route),
+            _ => None,
+        };
+        let mut model = Model::default();
+        model.go_live(viewing.clone());
+        model.set_route(since, &PathEnd::Direct(lan));
+        assert_eq!(
+            route(&model),
+            Some(RouteView::Direct {
+                same_site: true,
+                ipv6: false
+            })
+        );
+        // A fallback after the direct try (the host refused the link).
+        let quic = PathEnd::Tor(TorWhy::Fallback(FallbackWhy::Quic));
+        model.set_route(since, &quic);
+        assert_eq!(
+            route(&model),
+            Some(RouteView::Tor(TorWhy::Fallback(FallbackWhy::Quic)))
+        );
+        model.set_route(since, &PathEnd::NoMedia);
+        assert_eq!(
+            route(&model),
+            Some(RouteView::Tor(TorWhy::Fallback(FallbackWhy::Quic)))
+        );
+        // An earlier session's path phase does not reach this one.
+        let later = Viewing {
+            since: since + Duration::from_secs(5),
+            route: RouteView::Finding,
+            ..viewing
+        };
+        model.go_live(later);
+        model.set_route(since, &PathEnd::Direct(lan));
+        assert_eq!(route(&model), Some(RouteView::Finding));
+        model.client = ClientStage::Ended("over".to_owned());
+        model.set_route(since + Duration::from_secs(5), &PathEnd::Direct(lan));
+        assert_eq!(route(&model), None);
+    }
+
+    /// The policy the sessions read, as Settings shows it: `lan_only` wins,
+    /// then direct connections off or a bridge in use relay through Tor.
+    #[test]
+    fn the_settings_say_the_policy_the_sessions_read() {
+        let mut cfg = tornect_core::Config::default();
+        assert_eq!(Settings::of(&cfg).direct_policy(), TransportPolicy::Any);
+        cfg.network.paranoid = true;
+        let s = Settings::of(&cfg);
+        assert!(!s.direct);
+        assert_eq!(s.direct_policy(), TransportPolicy::TorOnly);
+        cfg.network.paranoid = false;
+        cfg.tor.bridges = BridgeMode::Snowflake;
+        let s = Settings::of(&cfg);
+        assert!(s.direct && s.bridged_off);
+        assert_eq!(s.direct_policy(), TransportPolicy::TorOnly);
+        cfg.network.direct_with_bridges = true;
+        assert_eq!(Settings::of(&cfg).direct_policy(), TransportPolicy::Any);
+        cfg.network.lan_only = true;
+        assert_eq!(Settings::of(&cfg).direct_policy(), TransportPolicy::LanOnly);
+        // Each matches the knob the sessions read.
+        for (paranoid, lan_only, snowflake) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (false, true, true),
+            (true, true, false),
+        ] {
+            let mut cfg = tornect_core::Config::default();
+            cfg.network.paranoid = paranoid;
+            cfg.network.lan_only = lan_only;
+            if snowflake {
+                cfg.tor.bridges = BridgeMode::Snowflake;
+            }
+            assert_eq!(
+                Settings::of(&cfg).direct_policy(),
+                crate::direct::DirectKnobs::new(&cfg).transport.get(),
+                "{paranoid} {lan_only} {snowflake}"
+            );
+        }
+    }
+
     /// A new viewed session starts with no notice code, whatever the last
     /// host said, and the code goes once the session's watch returned.
     #[test]
@@ -1806,6 +2011,7 @@ mod tests {
             stream: StreamInfo::default(),
             services: None,
             screens: None,
+            route: RouteView::Tor(TorWhy::OldHost),
         };
         let mut model = Model {
             host_notice: Some(0x07),
