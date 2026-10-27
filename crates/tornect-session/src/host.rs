@@ -93,7 +93,7 @@ use tornect_proto::{
 use tornect_signal::consent::{SessionToken, TransportPolicy, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
 use tornect_signal::messages::notice;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::direct::DirectStream;
 use crate::flow::{
@@ -608,8 +608,9 @@ struct Claimed {
     capture: Arc<watch::Sender<CaptureState>>,
     /// The `BindProof` MAC a direct bind is answered with
     /// ([`tornect_proto::bind_mac_direct`], [`BindSide::Server`]); `None`
-    /// on the onion path.
-    proof: Option<[u8; 32]>,
+    /// on the onion path. Wiped when dropped, as every bind MAC the host
+    /// holds (the direct design §9.1, invariant 8).
+    proof: Option<Zeroizing<[u8; 32]>>,
 }
 
 enum Lookup {
@@ -858,6 +859,7 @@ impl MediaHost {
                     .unwrap_or(Err(reason::BAD_BIND))
             }
         };
+        drop(mac);
         let claimed = match claimed {
             Ok(claimed) => claimed,
             Err(code) => {
@@ -958,7 +960,7 @@ impl MediaHost {
         } else {
             Lookup::Refused(reason::BAD_BIND)
         };
-        drop(ekm);
+        drop((mac, ekm));
         let claimed = match lookup {
             Lookup::Bound(claimed) => claimed,
             Lookup::Refused(code) => {
@@ -1097,12 +1099,12 @@ impl MediaHost {
             return Lookup::Refused(reason::BAD_BIND);
         }
         let proof_mac = match proof {
-            Proof::Direct { ekm, .. } => Some(tornect_proto::bind_mac_direct(
+            Proof::Direct { ekm, .. } => Some(Zeroizing::new(tornect_proto::bind_mac_direct(
                 token,
                 th_final,
                 ekm,
                 BindSide::Server,
-            )),
+            ))),
             Proof::Onion { .. } => None,
         };
         match kind {
@@ -1194,10 +1196,12 @@ impl MediaHost {
         // A direct bind is answered with the host's proof before anything
         // opens (the direct design §6.6): the viewer reads it before
         // `BindOk`, so it never waits on the desktop's dialog for it.
-        if let Some(mac) = proof
-            && let Err(stop) = send(&mut wr, &Msg::BindProof { mac }, &mut end, None).await
-        {
-            return MediaOutcome::NotStarted(stop.end);
+        if let Some(mac) = proof {
+            let proof = WipedProof(Msg::BindProof { mac: *mac });
+            drop(mac);
+            if let Err(stop) = send(&mut wr, &proof.0, &mut end, None).await {
+                return MediaOutcome::NotStarted(stop.end);
+            }
         }
 
         // Capture starts here, after a verified bind (§B.6, decision M1-39).
@@ -1705,8 +1709,23 @@ impl SessionSink for MediaHost {
     }
 }
 
-/// What a `Bind` carries: the session id, the MAC and the viewer's preset.
-type Bound = (String, [u8; 32], QualityPreset);
+/// What a `Bind` carries: the session id, the MAC (wiped when dropped, the
+/// direct design §9.1 invariant 8) and the viewer's preset.
+type Bound = (String, Zeroizing<[u8; 32]>, QualityPreset);
+
+/// The host's `BindProof` frame, its MAC wiped when the frame is dropped:
+/// once written, and when the write is given up or its task dropped (the
+/// direct design §9.1 invariant 8). The bytes `write_msg` encodes it into
+/// are not wiped (decision M1-80).
+struct WipedProof(Msg);
+
+impl Drop for WipedProof {
+    fn drop(&mut self) {
+        if let Msg::BindProof { mac } = &mut self.0 {
+            mac.zeroize();
+        }
+    }
+}
 
 /// How a bound stream is served: the quality route its listener says, the
 /// preset its `Bind` names, and the path it was claimed on.
@@ -1765,15 +1784,16 @@ async fn read_bind<R: AsyncRead + Unpin>(
         }
         return Err(ProtoError::Size(len));
     }
-    let mut frame = [0u8; BIND_LEN];
-    r.read_exact(&mut frame).await?;
-    match Msg::decode(&frame)? {
+    // The frame holds the MAC: wiped when dropped, as the MAC itself.
+    let mut frame = Zeroizing::new([0u8; BIND_LEN]);
+    r.read_exact(&mut *frame).await?;
+    match Msg::decode(&*frame)? {
         Msg::Bind {
             session_id,
             mac,
             quality,
         } => quality::preset(quality)
-            .map(|preset| Some((session_id, mac, preset)))
+            .map(|preset| Some((session_id, Zeroizing::new(mac), preset)))
             .ok_or(ProtoError::Malformed("Bind")),
         _ => Err(ProtoError::Malformed("Bind")),
     }
@@ -3367,7 +3387,7 @@ mod tests {
             read,
             Some((
                 "0123456789abcdef".to_owned(),
-                [7; 32],
+                Zeroizing::new([7; 32]),
                 QualityPreset::BestQuality
             ))
         );
@@ -3395,7 +3415,11 @@ mod tests {
             let (read, lines, at) = read_bind_of(&frame);
             assert_eq!(
                 read.unwrap(),
-                Some(("0123456789abcdef".to_owned(), [7; 32], preset))
+                Some((
+                    "0123456789abcdef".to_owned(),
+                    Zeroizing::new([7; 32]),
+                    preset
+                ))
             );
             assert!(lines.is_empty(), "{lines:?}");
             assert_eq!(at, frame.len() as u64);
