@@ -611,9 +611,16 @@ const NOT_SAVED_FILE: &str = "Not saved: the settings file could not be read or 
 
 /// Save one settings change: `config.toml` as it is now, with the change,
 /// checked and written back; the model then holds what was saved, which is
-/// returned. Nothing is saved while this screen may be in a picture that
-/// leaves it.
-fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) -> Option<Config> {
+/// returned. The `[network]` part reaches `knobs` at once (design `direct`
+/// §3.3), so both roles' next sessions read the saved switches; a live
+/// session keeps the policy it was signed with. Nothing is saved while this
+/// screen may be in a picture that leaves it.
+fn save_settings(
+    paths: &Paths,
+    shared: &Shared,
+    knobs: &crate::direct::DirectKnobs,
+    change: &SettingsChange,
+) -> Option<Config> {
     if shared.read(|m| m.screen_shared(Instant::now())) {
         shared.update(|m| m.settings.problem = Some(NOT_SAVED_SHARED));
         return None;
@@ -625,7 +632,11 @@ fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) -> Opt
     });
     match saved {
         Ok(cfg) => {
-            shared.update(|m| m.settings = Settings::of(&cfg));
+            knobs.set_from(&cfg.network);
+            shared.update(|m| {
+                m.settings = Settings::of(&cfg);
+                follow_knobs(m, knobs);
+            });
             Some(cfg)
         }
         // No error text: it may name the path, which names the account.
@@ -2741,12 +2752,17 @@ async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Co
         match commands.recv().await {
             Some(Command::FirstRunName(name)) => {
                 if let Some(name) = name {
-                    let _ = save_settings(&b.paths, &b.shared, &SettingsChange::DeviceName(name));
+                    let _ = save_settings(
+                        &b.paths,
+                        &b.shared,
+                        &b.knobs,
+                        &SettingsChange::DeviceName(name),
+                    );
                 }
                 break;
             }
             Some(Command::SaveSettings(change)) => {
-                let _ = save_settings(&b.paths, &b.shared, &change);
+                let _ = save_settings(&b.paths, &b.shared, &b.knobs, &change);
             }
             Some(Command::SetHistory(on)) => change_book(b, &Change::History(on)),
             Some(Command::ClearHistory) => change_book(b, &Change::Clear),
@@ -3187,7 +3203,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => {
-                        let saved = save_settings(&b.paths, &b.shared, &change);
+                        let saved = save_settings(&b.paths, &b.shared, &b.knobs, &change);
                         if let (Some(saved), Some(hosted)) = (saved, &hosted) {
                             let lacks = b.shared.read(|m| m.portal_lacks_clipboard());
                             republish(&hosted.policy, &saved, lacks);
@@ -6909,12 +6925,19 @@ mod tests {
             },
             Arc::new(|_| {}),
         );
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
         save_settings(
             &paths,
             &shared,
+            &knobs,
             &SettingsChange::DeviceName("Desk by the window".to_owned()),
         );
-        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Light));
+        save_settings(
+            &paths,
+            &shared,
+            &knobs,
+            &SettingsChange::Theme(Theme::Light),
+        );
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.general.device_name, "Desk by the window");
         assert_eq!(cfg.general.theme, Theme::Light);
@@ -6929,7 +6952,7 @@ mod tests {
         });
 
         shared.update(|m| m.hosted_elsewhere = true);
-        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Dark));
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Theme(Theme::Dark));
         assert_eq!(
             Config::load(&path).unwrap(),
             cfg,
@@ -6942,7 +6965,7 @@ mod tests {
 
         shared.update(|m| m.hosted_elsewhere = false);
         std::fs::write(&path, "this is = not [valid").unwrap();
-        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Dark));
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Theme(Theme::Dark));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "this is = not [valid"
@@ -6985,6 +7008,7 @@ mod tests {
             },
             Arc::new(|_| {}),
         );
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
         // What the session sheet and the block window say control also
         // gives (`strip::sheet_services_line` of it names the clipboard
         // exactly when this is true).
@@ -6997,7 +7021,7 @@ mod tests {
             browse_files: false,
             ..ServicesSettings::of(&on_disk.services)
         };
-        save_settings(&paths, &shared, &SettingsChange::Services(switches));
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Services(switches));
         shared.read(|m| {
             assert!(!m.settings.services.wayland_clipboard, "the file reloaded");
             assert!(m.portal_clipboard);
@@ -7016,7 +7040,7 @@ mod tests {
         );
         on_disk.services.wayland_clipboard = true;
         on_disk.save(&path).unwrap();
-        save_settings(&paths, &shared, &SettingsChange::Services(switches));
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Services(switches));
         shared.read(|m| {
             assert!(m.settings.services.wayland_clipboard, "the file reloaded");
             assert!(!clipboard(m), "the running portal does not ask for it");
@@ -7036,12 +7060,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().join("home"));
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
         let choice = TorChoice {
             bridges: BridgeMode::Snowflake,
             bridge_lines: BridgeLines(vec![LINE.to_owned()]),
             pow_defense: false,
         };
-        save_settings(&paths, &shared, &SettingsChange::Tor(choice.clone()));
+        save_settings(
+            &paths,
+            &shared,
+            &knobs,
+            &SettingsChange::Tor(choice.clone()),
+        );
         let cfg = Config::load(&paths.config_file()).unwrap();
         assert_eq!(cfg.tor.bridges, BridgeMode::Snowflake);
         assert_eq!(cfg.tor.bridge_lines, [LINE]);
@@ -7092,7 +7122,8 @@ mod tests {
         paths.ensure().unwrap();
         std::fs::write(paths.config_file(), "this is = not [valid").unwrap();
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
-        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Dark));
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Theme(Theme::Dark));
         assert_eq!(shared.read(|m| m.settings.problem), Some(NOT_SAVED_FILE));
         let logged = String::from_utf8(
             buffer
@@ -7107,6 +7138,75 @@ mod tests {
             !logged.contains(&*home) && !logged.contains("config.toml"),
             "{logged}"
         );
+    }
+
+    /// Design `direct` §3.3: Settings, Connection's switch reaches
+    /// `config.toml` and, at once, the knobs both roles' next sessions read
+    /// (a clone, as the host role holds them): off relays every session
+    /// through Tor, on allows direct again, the file's `[network]` options
+    /// come along, and `lan_only` stays the file's. The bridge state stays
+    /// what the last bootstrap said, and the window says it. While this
+    /// screen is shared nothing is saved and the knobs keep their policy.
+    #[test]
+    fn a_saved_direct_switch_reaches_the_knobs_the_sessions_read() {
+        use tornect_signal::consent::TransportPolicy;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let path = paths.config_file();
+        let mut on_disk = Config::default();
+        on_disk.network.punch_timeout_ms = 2500;
+        on_disk.save(&path).unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        let held = knobs.clone();
+        assert_eq!(held.transport.get(), TransportPolicy::Any);
+
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Direct(false));
+        assert!(Config::load(&path).unwrap().network.paranoid);
+        assert_eq!(held.transport.get(), TransportPolicy::TorOnly);
+        assert_eq!(held.direct.get().punch_timeout, Duration::from_millis(2500));
+        shared.read(|m| {
+            assert!(!m.settings.direct);
+            assert_eq!(m.settings.direct_policy(), TransportPolicy::TorOnly);
+            assert_eq!(m.settings.problem, None);
+        });
+
+        // Tor went in through a bridge since the start: on again, the
+        // bridge rule still turns direct connections off, and the window
+        // says why although the file names no bridge.
+        held.transport.set_bridged(true);
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Direct(true));
+        assert!(!Config::load(&path).unwrap().network.paranoid);
+        assert!(held.transport.off_by_bridge());
+        assert_eq!(held.transport.get(), TransportPolicy::TorOnly);
+        shared.read(|m| {
+            assert!(m.settings.direct && m.settings.bridged_off);
+            assert_eq!(m.settings.direct_policy(), held.transport.get());
+        });
+        held.transport.set_bridged(false);
+
+        // Shared: nothing saved, the knobs keep allowing direct paths.
+        shared.update(|m| m.hosted_elsewhere = true);
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Direct(false));
+        assert!(!Config::load(&path).unwrap().network.paranoid);
+        assert_eq!(held.transport.get(), TransportPolicy::Any);
+        shared.update(|m| m.hosted_elsewhere = false);
+
+        // `lan_only` is config.toml's: a save keeps it, and the sessions
+        // read it from the save on.
+        let mut lan = Config::load(&path).unwrap();
+        lan.network.lan_only = true;
+        lan.save(&path).unwrap();
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Direct(true));
+        assert!(Config::load(&path).unwrap().network.lan_only);
+        assert_eq!(held.transport.get(), TransportPolicy::LanOnly);
+        shared.read(|m| assert_eq!(m.settings.direct_policy(), TransportPolicy::LanOnly));
+        // Both at once do not validate: the switch cannot turn paranoid on
+        // under lan_only, and the knobs keep the file's rule.
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Direct(false));
+        assert!(!Config::load(&path).unwrap().network.paranoid);
+        assert_eq!(held.transport.get(), TransportPolicy::LanOnly);
+        shared.read(|m| assert_eq!(m.settings.problem, Some(NOT_SAVED_FILE)));
     }
 
     /// A window's backend for the first run's tests, in a fresh home under

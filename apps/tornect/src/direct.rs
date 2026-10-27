@@ -50,6 +50,15 @@ impl DirectKnobs {
     pub fn bootstrapped(&self, rung: Rung, tor: &config::Tor) {
         self.transport.set_bridged(bridged(rung, tor));
     }
+
+    /// The `[network]` settings saved now (design `direct` §3.3: after each
+    /// save from the window): the privacy switches, the bridge override and
+    /// the path's options, for the sessions that start from now on. The
+    /// bridge state stays what the last bootstrap said.
+    pub fn set_from(&self, net: &Network) {
+        self.transport.set_from(net);
+        self.direct.set_from(net);
+    }
 }
 
 /// Whether Tor reaches the network through a bridge (decision M1-86): the
@@ -398,6 +407,36 @@ mod tests {
             TransportPolicy::Any,
             "the override"
         );
+    }
+
+    /// Design `direct` §3.3: a save from the window reaches every clone of
+    /// the knobs (the host role holds one): the privacy switches, the
+    /// bridge override and the path's options; the bridge state stays what
+    /// the last bootstrap said.
+    #[test]
+    fn a_saved_network_reaches_every_clone_of_the_knobs() {
+        let cfg = Config::default();
+        let knobs = DirectKnobs::new(&cfg);
+        let held = knobs.clone();
+        let mut net = cfg.network.clone();
+        net.paranoid = true;
+        net.punch_timeout_ms = 3000;
+        knobs.set_from(&net);
+        assert_eq!(held.transport.get(), TransportPolicy::TorOnly);
+        assert_eq!(held.direct.get().punch_timeout, Duration::from_millis(3000));
+        // A bridge since the last bootstrap: on again, still off by the
+        // bridge rule until the override is saved too.
+        knobs.bootstrapped(Rung::Snowflake, &cfg.tor);
+        net.paranoid = false;
+        knobs.set_from(&net);
+        assert!(held.transport.off_by_bridge());
+        assert_eq!(held.transport.get(), TransportPolicy::TorOnly);
+        net.direct_with_bridges = true;
+        knobs.set_from(&net);
+        assert_eq!(held.transport.get(), TransportPolicy::Any);
+        net.lan_only = true;
+        knobs.set_from(&net);
+        assert_eq!(held.transport.get(), TransportPolicy::LanOnly);
     }
 
     /// Design `direct` §3.5: the host's `SESSION ROUTE` line names the

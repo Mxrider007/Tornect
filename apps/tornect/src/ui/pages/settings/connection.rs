@@ -4,10 +4,13 @@
 //! Tornect starts (the configuration is read once). A private line is never
 //! shown in a message, logged or put into a picture of this screen: a line
 //! that does not parse is named by its number only, and while this screen
-//! is shared the lines give way to the hidden card.
+//! is shared the lines give way to the hidden card. Then direct connections
+//! (design `direct` §3.3): the switch and what each computer learns, from
+//! the next session on.
 
 use egui::{RichText, Ui};
 use tornect_core::config::BridgeMode;
+use tornect_session::INTERNET_DIRECT;
 use tornect_signal::tor::Ladder;
 
 use super::super::super::model::{BridgeLines, Model, SettingsChange, TorChoice};
@@ -37,8 +40,72 @@ pub(in super::super) const POW: &str = "Proof-of-work defence";
 /// When the defence applies.
 pub(in super::super) const POW_NEXT_START: &str = "Takes effect the next time Tornect starts.";
 
-/// The M2 note.
-pub(in super::super) const NO_DIRECT: &str = "Direct connections are not available yet.";
+/// The direct connections section's header.
+pub(in super::super) const DIRECT_HEADER: &str = "Direct connections";
+
+// Design `direct` §3.3, Phase A: the switch and the lines under it while
+// it is on are revision 2's (local network only); the rest is the design's
+// own. The Phase B copy (internet addresses, STUN, the router) lands with
+// internet direct connections (step B11): this build must not say less
+// than it does.
+const _: () = assert!(!INTERNET_DIRECT, "the Phase B copy is not written yet");
+
+/// The switch (bound to `!network.paranoid`).
+pub(in super::super) const DIRECT_SWITCH: &str = "Connect directly when both computers are on the \
+                                                  same local network (faster; the other \
+                                                  computer learns this computer's local address)";
+
+/// How a direct connection comes about, while the switch is on.
+pub(in super::super) const DIRECT_HOW: &str = "After the other computer accepts, the two computers \
+                                               exchange their local network addresses over Tor \
+                                               and try to reach each other directly for a \
+                                               moment. If they are not on the same network, the \
+                                               session is relayed through Tor.";
+
+/// What stays private, while the switch is on.
+pub(in super::super) const DIRECT_PRIVATE: &str = "Only local addresses (like 192.168.1.20) are \
+                                                   exchanged: no outside server is asked, your \
+                                                   router is left alone, and your internet \
+                                                   address stays hidden.";
+
+/// While the switch is off.
+pub(in super::super) const DIRECT_OFF: &str = "Every session is relayed through Tor: computers you \
+                                               connect to never learn this computer's address, \
+                                               and pictures are slower.";
+
+/// While Tor uses a bridge and `network.direct_with_bridges` is off
+/// (decision M1-86): the switch keeps its saved value.
+pub(in super::super) const BRIDGE_NOTE: &str = "Tor reaches the network through a bridge on this \
+                                                computer, so direct connections are off: they \
+                                                would show this network that Tornect is in use. \
+                                                To allow them anyway, set \
+                                                network.direct_with_bridges in config.toml.";
+
+/// Always.
+pub(in super::super) const DIRECT_TOR_STILL: &str = "Both computers still need to reach Tor: Tor \
+                                                     finds the other computer and checks who it \
+                                                     is, and a direct connection starts only \
+                                                     after the other computer accepts.";
+
+/// When the switch applies.
+pub(in super::super) const NEXT_SESSION: &str = "Applies from the next session.";
+
+/// On Windows only.
+pub(in super::super) const DIRECT_WINDOWS: &str = "The first direct connection may make Windows \
+                                                   ask whether Tornect may communicate on your \
+                                                   networks. Choose \"Allow access\". If you \
+                                                   cancel, or this Windows account cannot change \
+                                                   the firewall, sessions are relayed through \
+                                                   Tor.";
+
+/// While `network.lan_only` is set (`config.toml` only): the switch shows
+/// on and cannot be changed.
+pub(in super::super) const LAN_ONLY_NOTE: &str = "config.toml limits sessions to direct \
+                                                  connections on this network \
+                                                  (network.lan_only), in both directions: no \
+                                                  STUN server or router is asked, and a session \
+                                                  that cannot connect directly ends instead of \
+                                                  going through Tor.";
 
 /// The line under the field for each line that does not parse.
 #[must_use]
@@ -150,5 +217,55 @@ pub(super) fn section(
         }
     }
     ui.add_space(20.0);
-    line(ui, NO_DIRECT, t.text_secondary);
+    widgets::section_header(ui, DIRECT_HEADER);
+    if shared {
+        super::super::hidden_card(ui, super::WRITES_HIDDEN);
+    } else {
+        direct(ui, model, actions);
+    }
+}
+
+/// The direct connections switch and what it means here (design `direct`
+/// §3.3): what each computer learns while it is on, why it is off while a
+/// bridge is in use, and `lan_only`'s rule, which only `config.toml` sets.
+fn direct(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
+    let saved = &model.settings;
+    // Under lan_only the switch shows on: sessions go direct or end.
+    let mut on = saved.direct || saved.lan_only;
+    ui.horizontal_top(|ui| {
+        let switched = ui
+            .add_enabled_ui(!saved.lan_only, |ui| {
+                widgets::toggle(ui, &mut on, DIRECT_SWITCH).clicked()
+            })
+            .inner;
+        if switched && !saved.lan_only {
+            actions.push(Action::SaveSettings(SettingsChange::Direct(on)));
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(DIRECT_SWITCH)
+                    .font(theme::font(ui.ctx(), Face::Medium, 14.0))
+                    .color(t.text_primary),
+            )
+            .wrap(),
+        );
+    });
+    ui.add_space(4.0);
+    if saved.lan_only {
+        line(ui, LAN_ONLY_NOTE, t.text_secondary);
+    } else if saved.direct {
+        line(ui, DIRECT_HOW, t.text_secondary);
+        line(ui, DIRECT_PRIVATE, t.text_secondary);
+        if saved.bridged_off {
+            line(ui, BRIDGE_NOTE, t.warn);
+        }
+    } else {
+        line(ui, DIRECT_OFF, t.text_secondary);
+    }
+    line(ui, DIRECT_TOR_STILL, t.text_muted);
+    line(ui, NEXT_SESSION, t.text_muted);
+    if cfg!(windows) {
+        line(ui, DIRECT_WINDOWS, t.text_muted);
+    }
 }

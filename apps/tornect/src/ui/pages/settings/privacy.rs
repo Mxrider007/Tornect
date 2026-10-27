@@ -5,6 +5,8 @@
 //! a path under the home names the account.
 
 use egui::{RichText, Ui};
+use tornect_session::INTERNET_DIRECT;
+use tornect_signal::consent::TransportPolicy;
 
 use super::super::super::icons::Icon;
 use super::super::super::model::Model;
@@ -15,11 +17,43 @@ use super::super::super::widgets::{self, Button, Kind};
 use super::general::NAME_NOTE;
 use super::line;
 
-/// What every computer and device this one meets learns, beside the name.
-pub(in super::super) const NETWORK_LINE: &str = "Your IP address stays hidden from the computers \
-    you connect to and those that connect here: every session is relayed through Tor. Tornect has \
-    no accounts, no telemetry and no update checks, and it checks whether a saved computer is \
-    reachable only when you click \"Check if reachable\".";
+/// What every computer and device this one meets learns, beside the name,
+/// while every session is relayed through Tor (direct connections off, or a
+/// bridge in use; design `direct` §3.4).
+pub(in super::super) const NETWORK_LINE_TOR: &str = "Your IP address stays hidden from the \
+    computers you connect to and those that connect here: every session is relayed through Tor. \
+    Tornect has no accounts, no telemetry and no update checks, and it checks whether a saved \
+    computer is reachable only when you click \"Check if reachable\".";
+
+/// The same while sessions may connect directly (design `direct` §3.4;
+/// Phase A: on the same local network only, `network.lan_only` included).
+pub(in super::super) const NETWORK_LINE_DIRECT: &str = if INTERNET_DIRECT {
+    "When direct connections are on (Settings > Connection), a computer you connect to, or that \
+     you let connect here, learns this computer's local and internet addresses, only after the \
+     session is accepted. One public STUN server per session may see that this computer started \
+     a connection, never with whom. Your internet provider can see that this computer exchanges \
+     encrypted traffic directly with another computer, and may recognise it as Tornect; while \
+     Tor uses a bridge, direct connections stay off. With direct connections off, computers you \
+     connect to never learn your IP address. Tornect has no accounts, no telemetry and no update \
+     checks, and it checks whether a saved computer is reachable only when you click \"Check if \
+     reachable\"."
+} else {
+    "Your internet address stays hidden from the computers you connect to and those that connect \
+     here. When both computers are on the same local network they connect directly, and each \
+     learns the other's local address (like 192.168.1.20), only after a session is accepted. \
+     Tornect has no accounts, no telemetry and no update checks, and it checks whether a saved \
+     computer is reachable only when you click \"Check if reachable\"."
+};
+
+/// The line for this computer's policy: Tor's while every session is
+/// relayed, the direct one otherwise.
+#[must_use]
+pub(in super::super) fn network_line(policy: TransportPolicy) -> &'static str {
+    match policy {
+        TransportPolicy::TorOnly => NETWORK_LINE_TOR,
+        TransportPolicy::Any | TransportPolicy::LanOnly => NETWORK_LINE_DIRECT,
+    }
+}
 
 /// Beside the name: what else identifies this computer to the others.
 pub(in super::super) const ID_LINE: &str =
@@ -97,7 +131,11 @@ pub(super) fn section(
     line(ui, NAME_NOTE, t.text_secondary);
     line(ui, ID_LINE, t.text_secondary);
     ui.add_space(4.0);
-    line(ui, NETWORK_LINE, t.text_secondary);
+    line(
+        ui,
+        network_line(model.settings.direct_policy()),
+        t.text_secondary,
+    );
 
     ui.add_space(20.0);
     widgets::section_header(ui, "History on this computer");

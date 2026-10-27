@@ -1794,6 +1794,11 @@ pub enum SettingsChange {
     /// The stream window's Clipboard switch at a session's start
     /// (`[viewer] clipboard_sync`; from the next session on).
     ViewerClipboard(bool),
+    /// Settings, Connection's direct connections switch (design `direct`
+    /// §3.3): `network.paranoid` is its opposite; `lan_only` and
+    /// `direct_with_bridges` are `config.toml`'s alone (from the next
+    /// session on).
+    Direct(bool),
 }
 
 /// The switches of `[services]` that Settings, Sharing changes (design
@@ -1866,6 +1871,7 @@ impl SettingsChange {
                 cfg.services.browse_files = switches.browse_files;
             }
             Self::ViewerClipboard(on) => cfg.viewer.clipboard_sync = *on,
+            Self::Direct(on) => cfg.network.paranoid = !on,
         }
     }
 }
@@ -2089,6 +2095,42 @@ mod tests {
         assert_eq!(cfg.services, before.services);
         // What the window holds after the save is what was saved.
         assert_eq!(Settings::of(&cfg).services, cfg.services);
+    }
+
+    /// Design `direct` §3.3: the direct connections switch sets
+    /// `network.paranoid` to its opposite and nothing else; `lan_only` and
+    /// `direct_with_bridges` stay what `config.toml` says, and the window
+    /// holds what was saved.
+    #[test]
+    fn the_direct_switch_sets_paranoid_alone() {
+        let mut cfg = tornect_core::Config::default();
+        cfg.network.direct_with_bridges = true;
+        cfg.network.punch_timeout_ms = 2500;
+        let before = cfg.clone();
+        SettingsChange::Direct(false).apply(&mut cfg);
+        assert!(cfg.network.paranoid);
+        assert_eq!(
+            tornect_core::config::Network {
+                paranoid: false,
+                ..cfg.network.clone()
+            },
+            before.network
+        );
+        assert_eq!(cfg.general, before.general);
+        assert_eq!(cfg.tor, before.tor);
+        let s = Settings::of(&cfg);
+        assert!(!s.direct);
+        assert_eq!(s.direct_policy(), TransportPolicy::TorOnly);
+        SettingsChange::Direct(true).apply(&mut cfg);
+        assert_eq!(cfg.network, before.network);
+        assert!(Settings::of(&cfg).direct);
+        // Under lan_only the switch changes nothing a save would keep: the
+        // file's rule holds, and both set at once do not validate.
+        let mut lan = before.clone();
+        lan.network.lan_only = true;
+        SettingsChange::Direct(true).apply(&mut lan);
+        assert!(lan.network.lan_only && !lan.network.paranoid);
+        assert_eq!(Settings::of(&lan).direct_policy(), TransportPolicy::LanOnly);
     }
 
     /// What control also gives (the services design §7.4) follows the saved
