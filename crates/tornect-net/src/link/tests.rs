@@ -461,6 +461,55 @@ async fn close_ends_the_connection_on_both_sides() {
     assert!(!host.closed_by_crypto());
 }
 
+/// Every message of `e` and of each error under it, and its `Debug`.
+fn error_texts(e: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut texts = vec![format!("{e:?}")];
+    let mut next = Some(e);
+    while let Some(e) = next {
+        texts.push(e.to_string());
+        next = e.source();
+    }
+    texts
+}
+
+/// Design §5.5 (DIRECT-6): a peer whose key is pinned can still close its
+/// connection with any reason, control sequences included. A stream's read
+/// and write errors carry quinn's kind in fixed words, with no error under
+/// them: neither their text, nor their `Debug`, nor any source names what
+/// the peer wrote.
+#[tokio::test]
+async fn a_peers_close_reason_never_reaches_a_stream_error() {
+    const REASON: &[u8] = b"\x1b[2Jpwned: run this \x07";
+    let mut pair = start_pair(
+        Arc::new(LoopbackNet::new(70)),
+        Arc::new(LoopbackNet::new(71)),
+        (1, 2),
+    )
+    .await;
+    let (viewer, host) = both_established(&mut pair).await;
+    let (mut viewer_stream, _host_stream) = media_stream(&viewer, &host).await;
+    host.close_with_reason(0x0abc, REASON);
+    within(5, viewer.closed()).await;
+    let mut byte = [0; 1];
+    let read = viewer_stream
+        .read_exact(&mut byte)
+        .await
+        .expect_err("the connection is closed");
+    let wrote = viewer_stream
+        .write_all(b"more")
+        .await
+        .expect_err("the connection is closed");
+    for e in [&read, &wrote] {
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected, "{e:?}");
+        assert_eq!(e.to_string(), "the direct connection closed");
+        assert!(std::error::Error::source(e).is_none(), "{e:?}");
+        for text in error_texts(e) {
+            assert!(!text.contains("pwned"), "{text}");
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+    }
+}
+
 /// A link that never reaches its peer: `close` still returns in time, and
 /// its driver is stopped.
 #[tokio::test]

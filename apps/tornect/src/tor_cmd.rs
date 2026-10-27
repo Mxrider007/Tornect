@@ -1930,7 +1930,7 @@ where
 /// it: a host of another version reads "binding the media stream: the other
 /// computer runs a different version of Tornect; use the same version on
 /// both" (the quality design §3.5).
-fn bind_failed(e: ViewerError) -> anyhow::Error {
+pub(crate) fn bind_failed(e: ViewerError) -> anyhow::Error {
     anyhow::Error::new(e).context("binding the media stream")
 }
 
@@ -4651,6 +4651,43 @@ mod tests {
             1,
             "the one opened beside the try"
         );
+    }
+
+    /// Design `direct` §5.5 (DIRECT-6) at the viewer's sinks: a host whose
+    /// key is pinned reads the `Bind`, then closes the direct connection
+    /// with a reason of its own (control sequences included). The `MEDIA
+    /// FAILED` line, the error `connect` returns (its chain, and its
+    /// `Debug` as the terminal prints it), and the line of a bound stream
+    /// that broke the same way say fixed words only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hosts_close_reason_is_never_printed() {
+        use crate::test_support::{HOSTILE_REASON, bind_closed_with_reason, none_holds_the_reason};
+
+        let failed = bind_closed_with_reason(HOSTILE_REASON).await;
+        assert!(
+            matches!(failed, ViewerError::Proto(ProtoError::Io(_))),
+            "{failed:?}"
+        );
+        let viewed = Err(failed);
+        let broke = media_end(&viewed, &End::You);
+        let Err(failed) = viewed else { unreachable!() };
+        assert_eq!(
+            broke,
+            "MEDIA FAILED: media stream I/O: the direct connection closed"
+        );
+        let end = End::NoPicture(bind_failed(failed));
+        let line = unbound_line(&end);
+        // `ProtoError::Io` says its I/O error and hands it on as its source
+        // too, so the chain says the fixed words twice.
+        assert_eq!(
+            line,
+            "MEDIA FAILED: binding the media stream: media stream I/O: the direct connection \
+             closed: the direct connection closed"
+        );
+        let End::NoPicture(e) = end else {
+            unreachable!()
+        };
+        none_holds_the_reason(&[broke, line, format!("{e:#}"), format!("{e:?}")]);
     }
 
     /// The early onion stream (DIRECT-2's pre-open): used while it is

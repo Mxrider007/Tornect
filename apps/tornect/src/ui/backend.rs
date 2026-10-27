@@ -4305,7 +4305,15 @@ async fn viewed(
     {
         tracing::debug!(error = %e, "sending BYE");
     }
-    Ok(match end {
+    Ok(ended_note(&host, end))
+}
+
+/// What the window says when a session it viewed with `host` ended: its
+/// note, and the `VIEWER:` line. An error's whole chain is shown; none
+/// carries what a peer wrote (the direct path's stream errors are fixed
+/// words, design `direct` §5.5).
+fn ended_note(host: &str, end: End) -> String {
+    match end {
         End::You => format!("Session with \"{host}\" ended (by you)."),
         End::Host(reason) => {
             format!("\"{host}\" ended the session ({}).", bye::name(reason))
@@ -4319,7 +4327,7 @@ async fn viewed(
             "The session with \"{host}\" ended: {}.",
             crate::tor_cmd::refused_why(code)
         ),
-    })
+    }
 }
 
 /// Where an unattended attempt that got no session belongs in the stepper:
@@ -10282,5 +10290,23 @@ mod tests {
         assert_eq!(summary.reason.as_deref(), Some("session_over"));
         let written = std::fs::read_to_string(&log_path).unwrap();
         assert!(!written.contains("hello"), "no chat text in sessions.log");
+    }
+
+    /// Design `direct` §5.5 (DIRECT-6) in the window: a host whose key is
+    /// pinned closes the direct connection after the `Bind` with a reason
+    /// of its own, control sequences included; the window's note (and the
+    /// `VIEWER:` line, the same text) says fixed words only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_note_never_shows_a_hosts_close_reason() {
+        use crate::test_support::{HOSTILE_REASON, bind_closed_with_reason, none_holds_the_reason};
+
+        let failed = bind_closed_with_reason(HOSTILE_REASON).await;
+        let note = ended_note("Desk", End::NoPicture(crate::tor_cmd::bind_failed(failed)));
+        assert_eq!(
+            note,
+            "No picture from \"Desk\": binding the media stream: media stream I/O: the direct \
+             connection closed: the direct connection closed"
+        );
+        none_holds_the_reason(&[note]);
     }
 }

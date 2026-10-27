@@ -743,6 +743,14 @@ impl Established {
     pub fn stats(&self) -> LinkStats {
         self.inner.stats()
     }
+
+    /// Closes the connection with the application `code` and `reason`, as
+    /// a peer of another build may (this build's own closes carry no
+    /// reason): for tests of where a peer's close reason could reach.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn close_with_reason(&self, code: u32, reason: &[u8]) {
+        self.conn.close(VarInt::from_u32(code), reason);
+    }
 }
 
 impl fmt::Debug for Established {
@@ -757,7 +765,9 @@ impl fmt::Debug for Established {
 /// One bidirectional QUIC stream of a direct link, as the session's media
 /// and services protocols use it: `AsyncRead + AsyncWrite`. It holds the
 /// link, so the connection lives as long as the stream (see the module
-/// documentation). Dropping it finishes its sending half.
+/// documentation). Dropping it finishes its sending half. Its I/O errors
+/// carry quinn's kind in fixed words and no source: nothing
+/// the peer wrote into its close reaches them.
 pub struct QuicStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -803,7 +813,7 @@ impl AsyncRead for QuicStream {
                 .received
                 .fetch_add(read, Ordering::Relaxed);
         }
-        polled
+        polled.map_err(sealed)
     }
 }
 
@@ -813,16 +823,33 @@ impl AsyncWrite for QuicStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
+        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf).map_err(sealed)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
+        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx).map_err(sealed)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx).map_err(sealed)
     }
+}
+
+/// A stream error as a [`QuicStream`] hands it on: quinn's kind, in fixed
+/// words, and nothing else (design `direct` §5.5, DIRECT-6). quinn's own
+/// error value is never passed on: its `ConnectionError` writes the peer's
+/// close reason (any bytes, terminal control sequences included) through
+/// its `Display`, and an `io::Error` built on it hands that error on as its
+/// `source()`, which an error chain printed with `{:#}` or `{:?}` shows.
+fn sealed(e: io::Error) -> io::Error {
+    let kind = e.kind();
+    let words = match kind {
+        io::ErrorKind::NotConnected => "the direct connection closed",
+        io::ErrorKind::ConnectionReset => "the direct stream was reset",
+        io::ErrorKind::InvalidInput => "the direct stream was read out of order",
+        _ => "the direct stream failed",
+    };
+    io::Error::new(kind, words)
 }
 
 /// A dial or an accept in progress.
