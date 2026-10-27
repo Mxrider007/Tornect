@@ -42,6 +42,34 @@ pub const PUNCH_TIMEOUT_MAX_MS: u32 = 10_000;
 /// lower port (`tornect_net::addr::MIN_REMOTE_PORT`).
 pub const MIN_DIRECT_PORT: u16 = 1024;
 
+/// The default `[network] stun_servers` (design `direct` §5.4): one server
+/// of each of four operators, so the viewer's partition (Cloudflare,
+/// Twilio) and the host's (Google, Nextcloud) never share an operator
+/// (`tornect_net::stun::partition`).
+pub const DEFAULT_STUN: [&str; 4] = [
+    "stun.cloudflare.com:3478",
+    "stun.l.google.com:19302",
+    "global.stun.twilio.com:3478",
+    "stun.nextcloud.com:443",
+];
+
+/// The default `[network] stun_servers` before the internet direct path
+/// (design §5.4 "Migration"): a saved list equal to it is read as
+/// [`DEFAULT_STUN`] ([`Network::migrate_defaults`]). It named Google twice.
+pub const OLD_DEFAULT_STUN: [&str; 3] = [
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+];
+
+/// The most `[network] stun_servers` entries (design §8.1): a session asks
+/// at most two, and the list is walked in full by the partition.
+pub const MAX_STUN_SERVERS: usize = 16;
+
+/// The longest host name of a `[network] stun_servers` entry, in bytes: a
+/// DNS name's limit (RFC 1035 §2.3.4, without the root's dot).
+pub const MAX_STUN_HOST_LEN: usize = 253;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -266,9 +294,19 @@ impl ToolbarHides {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Network {
-    /// Public STUN servers used for server-reflexive candidates. May be emptied.
+    /// Public STUN servers (`host:port`, at most [`MAX_STUN_SERVERS`]) that
+    /// tell a side its public address on the internet direct path (design
+    /// `direct` §5.3). The list is split by operator (the registrable domain)
+    /// between the two roles: the viewer asks the operators at even places
+    /// in the order they first appear, the host those at odd places, so no
+    /// operator sees both ends of a session. Each side asks one server per
+    /// session, and a second of its own part only when the first stays
+    /// silent. A list of one operator is used by both sides, and that
+    /// operator then sees both. May be emptied (no STUN).
     pub stun_servers: Vec<String>,
-    /// Whether to query the STUN list at all.
+    /// Whether to ask a STUN server at all (the Settings STUN switch). Off:
+    /// no server is asked and no name is resolved; only router mapping and
+    /// this computer's own addresses remain.
     pub enable_stun: bool,
     /// Try UPnP-IGD port mapping.
     pub upnp: bool,
@@ -459,11 +497,7 @@ impl Default for Viewer {
 impl Default for Network {
     fn default() -> Self {
         Self {
-            stun_servers: vec![
-                "stun.l.google.com:19302".to_owned(),
-                "stun1.l.google.com:19302".to_owned(),
-                "stun.cloudflare.com:3478".to_owned(),
-            ],
+            stun_servers: DEFAULT_STUN.map(str::to_owned).to_vec(),
             enable_stun: true,
             upnp: true,
             nat_pmp: true,
@@ -474,6 +508,26 @@ impl Default for Network {
             direct_port: None,
             direct_with_bridges: false,
         }
+    }
+}
+
+impl Network {
+    /// Replaces a `stun_servers` list equal to [`OLD_DEFAULT_STUN`] (the
+    /// earlier default, never edited) with [`DEFAULT_STUN`]; any other list
+    /// is the user's and stays as it is (design §5.4 "Migration"). Called by
+    /// [`Config::load`]; the next [`Config::save`] writes the new list.
+    /// Returns whether the list changed.
+    pub fn migrate_defaults(&mut self) -> bool {
+        let old = self.stun_servers.len() == OLD_DEFAULT_STUN.len()
+            && self
+                .stun_servers
+                .iter()
+                .zip(OLD_DEFAULT_STUN)
+                .all(|(s, o)| s == o);
+        if old {
+            self.stun_servers = DEFAULT_STUN.map(str::to_owned).to_vec();
+        }
+        old
     }
 }
 
@@ -538,17 +592,20 @@ pub fn default_device_name() -> String {
 }
 
 impl Config {
-    /// Load from `path`; a missing file yields the defaults.
+    /// Load from `path`; a missing file yields the defaults. An earlier
+    /// default the file still holds is read as today's
+    /// ([`Network::migrate_defaults`]).
     pub fn load(path: &Path) -> Result<Self> {
         let text = match fs_err::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e.into()),
         };
-        let cfg: Self = toml::from_str(&text).map_err(|source| CoreError::ConfigParse {
+        let mut cfg: Self = toml::from_str(&text).map_err(|source| CoreError::ConfigParse {
             path: path.to_path_buf(),
             source: Box::new(crate::error::TomlError::new(&text, &source)),
         })?;
+        cfg.network.migrate_defaults();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -622,6 +679,12 @@ impl Config {
                 "network.direct_port ({port}) must be {MIN_DIRECT_PORT} or above"
             )));
         }
+        if self.network.stun_servers.len() > MAX_STUN_SERVERS {
+            return Err(CoreError::ConfigInvalid(format!(
+                "network.stun_servers lists {} servers; at most {MAX_STUN_SERVERS}",
+                self.network.stun_servers.len()
+            )));
+        }
         for s in &self.network.stun_servers {
             let Some((host, port)) = s.rsplit_once(':') else {
                 return Err(CoreError::ConfigInvalid(format!(
@@ -631,6 +694,15 @@ impl Config {
             if host.is_empty() || port.parse::<u16>().is_err() {
                 return Err(CoreError::ConfigInvalid(format!(
                     "network.stun_servers entry {s:?} must be host:port"
+                )));
+            }
+            if host.len() > MAX_STUN_HOST_LEN
+                || !host.is_ascii()
+                || host.chars().any(char::is_whitespace)
+            {
+                return Err(CoreError::ConfigInvalid(format!(
+                    "network.stun_servers entry {s:?} must name its host in at most \
+                     {MAX_STUN_HOST_LEN} ASCII characters without spaces"
                 )));
             }
         }
@@ -1000,6 +1072,140 @@ panic_key = "Ctrl+Alt+End"
         let text = "[network]\npunch_timeout_ms = 500\n";
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err(), "a file below the floor is refused");
+    }
+
+    /// Design §5.4: the default list is four servers of four operators
+    /// (their registrable domains, the last two labels here), each on a
+    /// port the STUN filter admits (any but 0), and it no longer names
+    /// Google twice. `tornect_net::stun` tests that its partition gives the
+    /// viewer Cloudflare and Twilio and the host Google and Nextcloud.
+    #[test]
+    fn the_default_stun_list_has_four_operators() {
+        let list = Config::default().network.stun_servers;
+        assert_eq!(list, DEFAULT_STUN.map(str::to_owned).to_vec());
+        let mut operators = Vec::new();
+        for entry in &list {
+            let (host, port) = entry.rsplit_once(':').expect("host:port");
+            assert_ne!(port.parse::<u16>().expect("a port"), 0, "{entry}");
+            let labels: Vec<&str> = host.split('.').collect();
+            operators.push(labels[labels.len() - 2..].join("."));
+        }
+        assert_eq!(
+            operators,
+            [
+                "cloudflare.com",
+                "google.com",
+                "twilio.com",
+                "nextcloud.com"
+            ]
+        );
+        assert!(!list.iter().any(|s| s.starts_with("stun1.")), "{list:?}");
+        assert!(Config::default().network.enable_stun);
+    }
+
+    /// Design §5.4 "Migration": a file that still holds the earlier
+    /// default, untouched, loads with today's list, and the next save
+    /// writes it; the function reports the change once.
+    #[test]
+    fn an_untouched_old_stun_default_is_migrated_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut old = Config::default();
+        old.network.stun_servers = OLD_DEFAULT_STUN.map(str::to_owned).to_vec();
+        let text = toml::to_string_pretty(&old).unwrap();
+        std::fs::write(&path, &text).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.network.stun_servers,
+            DEFAULT_STUN.map(str::to_owned).to_vec()
+        );
+        assert_eq!(loaded, Config::default());
+        loaded.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("global.stun.twilio.com:3478"), "{saved}");
+        assert!(!saved.contains("stun1.l.google.com"), "{saved}");
+
+        let mut network = old.network.clone();
+        assert!(network.migrate_defaults());
+        assert!(!network.migrate_defaults(), "today's default stays");
+        assert_eq!(network, Network::default());
+    }
+
+    /// Design §5.4: any list but the exact earlier default is the user's
+    /// and is kept, however close it is: reordered, cut, extended, with
+    /// another case or port, emptied.
+    #[test]
+    fn an_edited_stun_list_is_kept() {
+        let old: Vec<String> = OLD_DEFAULT_STUN.map(str::to_owned).to_vec();
+        let mut reordered = old.clone();
+        reordered.reverse();
+        let mut extended = old.clone();
+        extended.push("stun.example.org:3478".to_owned());
+        let mut cased = old.clone();
+        cased[0] = cased[0].to_uppercase();
+        let mut ported = old.clone();
+        ported[2] = "stun.cloudflare.com:53".to_owned();
+        for list in [
+            reordered,
+            old[..2].to_vec(),
+            extended,
+            cased,
+            ported,
+            vec![old[0].clone(), old[0].clone(), old[2].clone()],
+            Vec::new(),
+        ] {
+            let mut network = Network {
+                stun_servers: list.clone(),
+                ..Network::default()
+            };
+            assert!(!network.migrate_defaults(), "{list:?}");
+            assert_eq!(network.stun_servers, list);
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut cfg = Config::default();
+            cfg.network.stun_servers = list.clone();
+            cfg.save(&path).unwrap();
+            assert_eq!(Config::load(&path).unwrap().network.stun_servers, list);
+        }
+    }
+
+    /// Design §8.1: at most 16 entries, and each host at most 253 bytes of
+    /// ASCII with no whitespace; an IPv6 literal in brackets passes.
+    #[test]
+    fn the_stun_list_is_bounded() {
+        let entries = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("stun{i}.example.org:3478"))
+                .collect()
+        };
+        for (n, ok) in [(0, true), (1, true), (MAX_STUN_SERVERS, true), (17, false)] {
+            let mut cfg = Config::default();
+            cfg.network.stun_servers = entries(n);
+            let got = cfg.validate();
+            assert_eq!(got.is_ok(), ok, "{n}: {got:?}");
+            if let Err(e) = got {
+                assert!(e.to_string().contains("at most 16"), "{e}");
+            }
+        }
+        let long = |len: usize| format!("{}.org:3478", "a".repeat(len - 4));
+        for (entry, ok) in [
+            (long(MAX_STUN_HOST_LEN), true),
+            (long(MAX_STUN_HOST_LEN + 1), false),
+            ("stün.example.org:3478".to_owned(), false),
+            ("stun example.org:3478".to_owned(), false),
+            ("stun.example.org\t:3478".to_owned(), false),
+            (" stun.example.org:3478".to_owned(), false),
+            ("[2001:db8::1]:3478".to_owned(), true),
+            ("192.0.2.1:3478".to_owned(), true),
+            (":3478".to_owned(), false),
+            ("stun.example.org:65536".to_owned(), false),
+        ] {
+            let mut cfg = Config::default();
+            cfg.network.stun_servers = vec![entry.clone()];
+            let got = cfg.validate();
+            assert_eq!(got.is_ok(), ok, "{entry:?}: {got:?}");
+        }
     }
 
     /// The quality design §6.1: `[viewer] quality` is written and read in
