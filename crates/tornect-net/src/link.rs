@@ -195,6 +195,9 @@ pub struct LinkStats {
     pub dialled: bool,
     /// The dial failed; `crypto` when it ended with a TLS alert.
     pub dial_failed: Option<DialFailure>,
+    /// The accepting side's handshakes that ended with a TLS alert: a pin
+    /// refused the dialler's key, or the dialler refused this side's.
+    pub handshakes_refused: u64,
     /// A connection passed [`quic::check_peer`].
     pub established: bool,
     /// Candidate batches dropped because their scope is above this side's
@@ -297,6 +300,19 @@ pub struct DirectLink {
     events: mpsc::Receiver<LinkEvent>,
     local: mpsc::Receiver<LocalBatch>,
     local_over: bool,
+    /// A final connection result was given ([`DirectLink::next_news`]).
+    connection_over: bool,
+}
+
+/// What a direct link has next for its owner ([`DirectLink::next_news`]).
+#[derive(Debug)]
+pub enum LinkNews {
+    /// A batch of this side's candidates, or the end of gathering, as
+    /// [`DirectLink::next_local`] gives them.
+    Local(LocalBatch),
+    /// The connection, or why there is none yet, as
+    /// [`DirectLink::established`] gives it.
+    Connection(Result<Established, DirectFail>),
 }
 
 impl DirectLink {
@@ -446,6 +462,7 @@ impl DirectLink {
                 events,
                 local,
                 local_over: false,
+                connection_over: false,
             },
             offered,
         ))
@@ -455,15 +472,28 @@ impl DirectLink {
     /// [`LocalBatch::Done`] once; after that it never returns. Cancel safe
     /// (a channel receive).
     pub async fn next_local(&mut self) -> LocalBatch {
-        if self.local_over {
-            return std::future::pending().await;
+        recv_local(&mut self.local, &mut self.local_over).await
+    }
+
+    /// [`Self::next_local`] and [`Self::established`] in one wait, for an
+    /// owner that must hear both while it also waits on other things (a
+    /// `select!` cannot hold both borrows). A ready batch comes first.
+    /// After a final connection result (`Ok`, [`DirectFail::Quic`],
+    /// [`DirectFail::Closed`]) only batches come, and once gathering is
+    /// over too it never returns. Cancel safe (channel receives).
+    pub async fn next_news(&mut self) -> LinkNews {
+        enum Got {
+            Local(LocalBatch),
+            Event(Option<LinkEvent>),
         }
-        match self.local.recv().await {
-            Some(LocalBatch::More(batch)) => LocalBatch::More(batch),
-            Some(LocalBatch::Done) | None => {
-                self.local_over = true;
-                LocalBatch::Done
-            }
+        let got = tokio::select! {
+            biased;
+            batch = recv_local(&mut self.local, &mut self.local_over) => Got::Local(batch),
+            event = self.events.recv(), if !self.connection_over => Got::Event(event),
+        };
+        match got {
+            Got::Local(batch) => LinkNews::Local(batch),
+            Got::Event(event) => LinkNews::Connection(self.connection(event)),
         }
     }
 
@@ -507,7 +537,13 @@ impl DirectLink {
     ///
     /// As above.
     pub async fn established(&mut self) -> Result<Established, DirectFail> {
-        match self.events.recv().await {
+        let event = self.events.recv().await;
+        self.connection(event)
+    }
+
+    /// A driver event as the owner hears it; a final one is remembered.
+    fn connection(&mut self, event: Option<LinkEvent>) -> Result<Established, DirectFail> {
+        let result = match event {
             Some(LinkEvent::Established {
                 conn,
                 route,
@@ -522,7 +558,11 @@ impl DirectLink {
             Some(LinkEvent::Failed { heard }) => Err(DirectFail::NoPath { heard }),
             Some(LinkEvent::Dead(fail)) => Err(fail),
             None => Err(DirectFail::Closed),
+        };
+        if !matches!(result, Err(DirectFail::NoPath { .. })) {
+            self.connection_over = true;
         }
+        result
     }
 
     /// The link's counters.
@@ -549,6 +589,21 @@ impl fmt::Debug for DirectLink {
             .field("scope", &self.scope)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
+    }
+}
+
+/// The next of a link's own batches, then [`LocalBatch::Done`] once; after
+/// that it never returns. Cancel safe (a channel receive).
+async fn recv_local(local: &mut mpsc::Receiver<LocalBatch>, over: &mut bool) -> LocalBatch {
+    if *over {
+        return std::future::pending().await;
+    }
+    match local.recv().await {
+        Some(LocalBatch::More(batch)) => LocalBatch::More(batch),
+        Some(LocalBatch::Done) | None => {
+            *over = true;
+            LocalBatch::Done
+        }
     }
 }
 
@@ -836,8 +891,20 @@ impl Driver {
             let gate = self.gate.clone();
             let peer_pk = self.peer_pk;
             let filter = self.filter.clone();
+            let shared = Arc::clone(&self.shared);
             Box::pin(async move {
-                quic::accept(&endpoint, |from| gate.admits(from), &peer_pk, &filter).await
+                let refused = || {
+                    shared
+                        .update(|s| s.handshakes_refused = s.handshakes_refused.saturating_add(1));
+                };
+                quic::accept_noting(
+                    &endpoint,
+                    |from| gate.admits(from),
+                    &peer_pk,
+                    &filter,
+                    refused,
+                )
+                .await
             }) as Handshake
         });
         let mut dial: Option<Handshake> = None;

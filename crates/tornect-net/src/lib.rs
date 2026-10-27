@@ -36,8 +36,8 @@ pub use addr::{
 pub use checklist::{Action, Checklist, PunchRole, PunchStats, Rank};
 pub use env::{NetEnv, RealNet};
 pub use link::{
-    DialFailure, DirectFail, DirectLink, DirectParams, Established, LinkStats, LocalBatch,
-    QuicStream, Route,
+    DialFailure, DirectFail, DirectLink, DirectParams, Established, LinkNews, LinkStats,
+    LocalBatch, QuicStream, Route,
 };
 pub use local::{IfaceAddr, IfaceKind, RouteSources};
 pub use probe::{Probe, ProbeDrop, ProbeKey, Txid};

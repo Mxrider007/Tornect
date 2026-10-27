@@ -692,6 +692,25 @@ pub async fn accept(
     peer_pk: &[u8; 32],
     filter: &RemoteFilter,
 ) -> Result<quinn::Connection, QuicError> {
+    accept_noting(endpoint, validated, peer_pk, filter, || {}).await
+}
+
+/// [`accept`], calling `refused` for each handshake that ended with a TLS
+/// alert ([`is_crypto_close`]): this side's pin refused the dialler's key,
+/// or the dialler refused this side's. A direct link counts them, so the
+/// host can say a pin refused the viewer (design §6.5 "Pin refused by the
+/// host's TLS"); nothing about the dialler is passed on.
+///
+/// # Errors
+///
+/// [`QuicError::Closed`] once the endpoint closes.
+pub async fn accept_noting(
+    endpoint: &quinn::Endpoint,
+    validated: impl Fn(SocketAddr) -> bool,
+    peer_pk: &[u8; 32],
+    filter: &RemoteFilter,
+    refused: impl Fn(),
+) -> Result<quinn::Connection, QuicError> {
     let mut pending: Vec<Pin<Box<quinn::Connecting>>> = Vec::new();
     loop {
         tokio::select! {
@@ -721,7 +740,15 @@ pub async fn accept(
                 }
             }
             done = first_handshake(&mut pending), if !pending.is_empty() => {
-                let Ok(conn) = done else { continue };
+                let conn = match done {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        if is_crypto_close(&error) {
+                            refused();
+                        }
+                        continue;
+                    }
+                };
                 if check_peer(&conn, peer_pk, filter).is_ok() {
                     endpoint.set_server_config(None);
                     return Ok(conn);

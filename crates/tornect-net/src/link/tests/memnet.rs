@@ -401,3 +401,84 @@ async fn close_ends_the_connection_on_paused_time() {
     assert!(v.open_stream(1).await.is_err());
     assert!(!h.closed_by_crypto());
 }
+
+/// Design §6.5 "Pin refused by the host's TLS": the accepting host is
+/// pinned to another device. The dialling viewer's handshake completes
+/// (TLS 1.3 lets the client finish first) and then ends with the host's
+/// alert; the host's link counts the refused handshake, establishes
+/// nothing and records no dial failure of its own. A link whose pins
+/// agree counts none.
+#[tokio::test(start_paused = true)]
+async fn a_handshake_the_accepting_pin_refuses_is_counted() {
+    let mut seeds = [1u8, 2, 3];
+    seeds.sort_by_key(|seed| pk(*seed));
+    let [viewer_seed, other_seed, host_seed] = seeds;
+    let (_net, viewer, host) = one_segment(1, LinkSpec::LAN, "192.168.1.10/24", "192.168.1.20/24");
+    let (mut viewer_link, viewer_offered) = DirectLink::start(
+        params(TornectRole::Viewer, viewer_seed, host_seed),
+        env(&viewer),
+    )
+    .await
+    .expect("the viewer's link");
+    let (host_link, host_offered) =
+        DirectLink::start(params(TornectRole::Host, host_seed, other_seed), env(&host))
+            .await
+            .expect("the host's link");
+    host_link.add_remote(viewer_offered, Scope::SameSite);
+    host_link.remote_done();
+    viewer_link.add_remote(host_offered, Scope::SameSite);
+    viewer_link.remote_done();
+    let v = within(5, viewer_link.established())
+        .await
+        .expect("the viewer's handshake completes first");
+    within(5, v.closed()).await;
+    assert!(v.closed_by_crypto());
+    let stats = host_link.stats();
+    assert!(stats.handshakes_refused >= 1, "{stats:?}");
+    assert!(!stats.established);
+    assert_eq!(stats.dial_failed, None);
+    assert_eq!(viewer_link.stats().handshakes_refused, 0);
+
+    let mut pair = start_pair(env(&viewer), env(&host), (viewer_seed, host_seed)).await;
+    let _ = both_established(&mut pair).await;
+    assert_eq!(pair.host.stats().handshakes_refused, 0);
+    assert_eq!(pair.viewer.stats().handshakes_refused, 0);
+}
+
+/// `next_news` gives the end of gathering first, then the connection, then
+/// nothing more: after a final connection result it waits for good (both
+/// ends of a pair on one segment, the connection's own wait included).
+#[tokio::test(start_paused = true)]
+async fn news_brings_the_batches_then_the_connection_once() {
+    let (_net, viewer, host) = one_segment(1, LinkSpec::LAN, "192.168.1.10/24", "192.168.1.20/24");
+    let (mut viewer_link, viewer_offered) =
+        DirectLink::start(params(TornectRole::Viewer, 1, 2), env(&viewer))
+            .await
+            .expect("the viewer's link");
+    let (mut host_link, host_offered) =
+        DirectLink::start(params(TornectRole::Host, 2, 1), env(&host))
+            .await
+            .expect("the host's link");
+    for link in [&mut viewer_link, &mut host_link] {
+        assert!(matches!(
+            within(1, link.next_news()).await,
+            LinkNews::Local(LocalBatch::Done)
+        ));
+    }
+    host_link.add_remote(viewer_offered, Scope::SameSite);
+    host_link.remote_done();
+    viewer_link.add_remote(host_offered, Scope::SameSite);
+    viewer_link.remote_done();
+    for link in [&mut viewer_link, &mut host_link] {
+        let news = within(5, link.next_news()).await;
+        assert!(matches!(&news, LinkNews::Connection(Ok(_))), "{news:?}");
+    }
+    for link in [&mut viewer_link, &mut host_link] {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), link.next_news())
+                .await
+                .is_err(),
+            "nothing after the connection"
+        );
+    }
+}
