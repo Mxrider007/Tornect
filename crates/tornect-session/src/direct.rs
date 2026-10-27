@@ -1,11 +1,13 @@
 //! The session layer's side of the direct path (the direct design §4,
 //! §6.5–§6.7, §8.5): what a stream of a session's direct QUIC connection
 //! must offer [`MediaHost::serve_direct`](crate::MediaHost::serve_direct),
-//! the host's half of the path phase ([`DirectHost`]), the settings both
-//! halves read ([`DirectSettings`]), the candidates' wire form
-//! ([`to_wire`], [`from_wire`]), the hook a second stream of the
-//! connection is served through ([`SecondStream`]), and the viewer's one
-//! fallback after its direct `Bind` ([`after_bind_close`]).
+//! the host's half of the path phase ([`DirectHost`]), the viewer's
+//! ([`ViewerDirect::choose_path`], from its [`decide`]), the reasons a
+//! session's media is relayed through Tor ([`TorWhy`], [`FallbackWhy`],
+//! [`PathEnd`]), the settings both halves read ([`DirectSettings`]), the
+//! candidates' wire form ([`to_wire`], [`from_wire`]), the hook a second
+//! stream of the connection is served through ([`SecondStream`]), and the
+//! viewer's one fallback after its direct `Bind` ([`after_bind_close`]).
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -18,9 +20,13 @@ use tornect_net::{BoxFuture, Candidate, CandidateKind, Established, QuicStream, 
 use tornect_signal::messages::{self, MAX_CANDIDATES_PER_FRAME, candidate_kind};
 use zeroize::Zeroizing;
 
+mod decide;
 mod host;
+mod viewer;
 
+pub use decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide};
 pub use host::{DirectHost, DirectHostStats, OnMedia};
+pub use viewer::{DirectBindFailed, DirectMedia, PathChoice, ViewerDirect, ViewerDirectStats};
 
 /// Whether a session may reach beyond the same site (the direct design
 /// §4): public addresses, server-reflexive and mapped candidates. Off in
@@ -258,8 +264,9 @@ pub enum AfterBind {
 /// byte arrived. Anything else — a refusal, a wrong proof, a timeout, a
 /// close after the host wrote — is [`AfterBind::End`].
 ///
-/// The direct design passes the viewer's `DirectMedia` (step A17); its
-/// link is the part this reads.
+/// The direct design passes the viewer's [`DirectMedia`], whose stream the
+/// bind consumed; its link is the part this reads
+/// ([`DirectMedia::bind`] asks it).
 #[must_use]
 pub fn after_bind_close(link: &Established) -> AfterBind {
     after_close(link.closed_by_crypto(), link.stream_bytes_received())

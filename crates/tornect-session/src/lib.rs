@@ -23,6 +23,7 @@
 //! | a single-use `Bind`: one media stream per session | [`MediaHost`]'s registry |
 //! | on a direct connection, a `Bind` binds only the link's own session, from its pinned peer, under a MAC over the connection's exporter; the host proves itself with `BindProof` before capture opens; one claim per session across both paths, published; the signed transport policy decides which paths may claim (the direct design §6.6) | [`MediaHost::serve_direct`], [`MediaHost::claimed`] |
 //! | the host binds nothing before the viewer's first `CANDIDATES`, nothing for a `tor_only` session or for its own device, at most one link per session; the link closes on the viewer's fallback, the onion path's claim, a kill, a refused `Bind`, the linger and the session's end; a `lan_only` session with no direct path ends `BYE{NO_LAN_PATH}` (the direct design §4, §8.5) | [`DirectHost`] |
+//! | the viewer decides a session's path from its signed accept alone: no media, an old host, its own device and every `tor_only` cell send `TOR_FALLBACK` with no call to the network; a try is capped at `punch_timeout` from the accept, closes its link before its `TOR_FALLBACK`, takes at most 6 `CANDIDATES` and one `DONE` from the host and none above its scope; a `lan_only` session with no same-site path ends `BYE{NO_LAN_PATH}`; the caller's stop ends it within one poll, a host `PING` included (the direct design §4, §8.5) | [`decide`], [`ViewerDirect::choose_path`] |
 //! | on a direct connection, the viewer reads nothing from the host, decodes no picture and sends no input before the host's `BindProof` checks in constant time; after its `Bind` it falls back to the onion path only when a TLS alert closed the connection before any host byte (the direct design §6.6, DIRECT-2) | [`Binding::direct`], [`MediaViewer::bind`], [`direct::after_bind_close`] |
 //! | view-only input is never decoded or injected | a view-only session has no injector |
 //! | an input rate cap | [`flow::TokenBucket`] |
@@ -63,9 +64,10 @@ pub mod viewer;
 
 pub use backend::{DesktopBackend, Source, SystemBackend, TEST_SCREENS};
 pub use direct::{
-    AfterBind, DIRECT_DRAIN, DirectHost, DirectHostStats, DirectOptions, DirectSettings,
-    DirectStream, HOST_DIRECT_LINGER, INTERNET_DIRECT, OnMedia, SecondStream, after_bind_close,
-    from_wire, to_wire,
+    AfterBind, DIRECT_DRAIN, Decision, DirectBindFailed, DirectHost, DirectHostStats, DirectMedia,
+    DirectOptions, DirectSettings, DirectStream, FallbackWhy, HOST_DIRECT_LINGER, INTERNET_DIRECT,
+    Mine, OnMedia, PathChoice, PathEnd, SecondStream, TorWhy, ViewerDirect, ViewerDirectStats,
+    after_bind_close, decide, from_wire, to_wire,
 };
 pub use host::{
     CaptureChanged, CaptureStarted, CaptureState, MediaBackend, MediaEnd, MediaHost, MediaLimits,
