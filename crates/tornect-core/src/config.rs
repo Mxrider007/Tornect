@@ -29,6 +29,19 @@ pub const MAX_FILE_MIB: u64 = 1 << 20;
 /// MiB whose byte count a `u64` still holds exactly.
 pub const MAX_LIMIT_MIB: u64 = u64::MAX / MIB;
 
+/// The least `[network] punch_timeout_ms` (decision M1-79): the viewer's
+/// direct attempt gets at least one second.
+pub const PUNCH_TIMEOUT_MIN_MS: u32 = 1000;
+
+/// The most `[network] punch_timeout_ms` (decision M1-79): 10 s below the
+/// 20 s a host keeps a session's direct link open without a `Bind`, so the
+/// host still listens while the viewer tries.
+pub const PUNCH_TIMEOUT_MAX_MS: u32 = 10_000;
+
+/// The least `[network] direct_port`: peers refuse a direct candidate on a
+/// lower port (`tornect_net::addr::MIN_REMOTE_PORT`).
+pub const MIN_DIRECT_PORT: u16 = 1024;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -267,9 +280,13 @@ pub struct Network {
     pub lan_only: bool,
     /// Paranoid mode: media always relayed through Tor; peers never learn IPs.
     pub paranoid: bool,
-    /// How long to hole-punch before falling back to Tor (`docs/PLAN.md` §B.2: 4 s).
+    /// How long the viewer tries the direct path, from the host's accept,
+    /// before relaying the session's media through Tor (`docs/PLAN.md` §B.2:
+    /// 4 s; decision M1-79): [`PUNCH_TIMEOUT_MIN_MS`] to
+    /// [`PUNCH_TIMEOUT_MAX_MS`], under the 20 s the host keeps listening.
     pub punch_timeout_ms: u32,
-    /// Fixed UDP port for direct connections (`None` = ephemeral).
+    /// Fixed UDP port for direct connections (`None` = ephemeral), at least
+    /// [`MIN_DIRECT_PORT`].
     pub direct_port: Option<u16>,
     /// Allow direct connections while Tor reaches the network through a
     /// bridge (decision M1-86). Off by default: a direct path would show the
@@ -591,10 +608,19 @@ impl Config {
                 "media.codec_preference must list at least one codec".to_owned(),
             ));
         }
-        if self.network.punch_timeout_ms == 0 || self.network.punch_timeout_ms > 60_000 {
-            return Err(CoreError::ConfigInvalid(
-                "network.punch_timeout_ms must be between 1 and 60000".to_owned(),
-            ));
+        if !(PUNCH_TIMEOUT_MIN_MS..=PUNCH_TIMEOUT_MAX_MS).contains(&self.network.punch_timeout_ms) {
+            return Err(CoreError::ConfigInvalid(format!(
+                "network.punch_timeout_ms ({}) must be between {PUNCH_TIMEOUT_MIN_MS} and \
+                 {PUNCH_TIMEOUT_MAX_MS}",
+                self.network.punch_timeout_ms
+            )));
+        }
+        if let Some(port) = self.network.direct_port
+            && port < MIN_DIRECT_PORT
+        {
+            return Err(CoreError::ConfigInvalid(format!(
+                "network.direct_port ({port}) must be {MIN_DIRECT_PORT} or above"
+            )));
         }
         for s in &self.network.stun_servers {
             let Some((host, port)) = s.rsplit_once(':') else {
@@ -931,6 +957,49 @@ panic_key = "Ctrl+Alt+End"
         let mut cfg = Config::default();
         cfg.media.min_bitrate_kbps = cfg.media.max_bitrate_kbps + 1;
         assert!(cfg.validate().is_err());
+    }
+
+    /// Decision M1-79: `punch_timeout_ms` is 1–10 s (10 s under the host's
+    /// 20 s linger), and a fixed `direct_port` is one a peer admits (1024
+    /// or above); the defaults pass, and so does no fixed port.
+    #[test]
+    fn the_direct_knobs_are_validated() {
+        for (ms, ok) in [
+            (0, false),
+            (1, false),
+            (999, false),
+            (PUNCH_TIMEOUT_MIN_MS, true),
+            (4000, true),
+            (PUNCH_TIMEOUT_MAX_MS, true),
+            (10_001, false),
+            (60_000, false),
+        ] {
+            let mut cfg = Config::default();
+            cfg.network.punch_timeout_ms = ms;
+            let got = cfg.validate();
+            assert_eq!(got.is_ok(), ok, "{ms}: {got:?}");
+            if let Err(e) = got {
+                assert!(e.to_string().contains("between 1000 and 10000"), "{e}");
+            }
+        }
+        for (port, ok) in [
+            (None, true),
+            (Some(1), false),
+            (Some(1023), false),
+            (Some(MIN_DIRECT_PORT), true),
+            (Some(50_000), true),
+            (Some(u16::MAX), true),
+        ] {
+            let mut cfg = Config::default();
+            cfg.network.direct_port = port;
+            let got = cfg.validate();
+            assert_eq!(got.is_ok(), ok, "{port:?}: {got:?}");
+        }
+        assert_eq!(Config::default().network.punch_timeout_ms, 4000);
+        assert!(Config::default().network.direct_port.is_none());
+        let text = "[network]\npunch_timeout_ms = 500\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.validate().is_err(), "a file below the floor is refused");
     }
 
     /// The quality design §6.1: `[viewer] quality` is written and read in
