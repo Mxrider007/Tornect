@@ -1270,10 +1270,15 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         },
         tor.bridge_lines.len()
     );
-    // The direct path (design `direct` §3.5, Phase A): its state for this
-    // configuration and the kinds of address this computer has; nothing is
-    // sent, and no address is printed.
-    for line in direct::doctor_lines(&loaded, tornect_signal::tor::last_good(paths)) {
+    // The direct path (design `direct` §3.5): its state for this
+    // configuration, the STUN servers and the router, the router ports an
+    // earlier run left, and the kinds of address this computer has; nothing
+    // is sent, and no address is printed.
+    for line in direct::doctor_lines(
+        &loaded,
+        tornect_signal::tor::last_good(paths),
+        &paths.router_ports_dir(),
+    ) {
         println!("{line}");
     }
     let store = FileSecretStore::open(paths.keys_dir())?;

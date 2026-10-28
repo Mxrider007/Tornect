@@ -605,6 +605,29 @@ fn follow_knobs(m: &mut super::model::Model, knobs: &crate::direct::DirectKnobs)
     m.settings.bridged_off = knobs.transport.off_by_bridge();
 }
 
+/// What the window says once, from its start: what history keeps, on the
+/// first run of a home, and that direct connections are on while that
+/// notice is due (design `direct` §3.6).
+fn start_notices(m: &mut super::model::Model, first: bool) {
+    m.history_notice = first;
+    m.direct_notice = m.settings.direct_notice_due();
+}
+
+/// The STUN names' background refresh follows the knobs (design `direct`
+/// §5.3, [`crate::direct::RouterPorts::follow_stun`]): at the start, after
+/// each Tor bootstrap and after each save. This window connects, and hosts
+/// unless started without its host role.
+fn follow_stun(b: &Backend) {
+    if let Some(router) = &b.router {
+        let roles = if b.host {
+            crate::direct::BOTH
+        } else {
+            crate::direct::VIEWER
+        };
+        router.follow_stun(&b.knobs, roles);
+    }
+}
+
 /// The settings page's line when a change was not saved because this screen
 /// may be in a picture that leaves it (the change may not be this
 /// computer's user's own).
@@ -636,6 +659,11 @@ fn save_settings(
         change.apply(&mut cfg);
         cfg.save(&path).map(|()| cfg)
     });
+    // The one-time notice's OK closes it, saved or not: unsaved, it asks
+    // again at the next start (design `direct` §3.6).
+    if *change == SettingsChange::DirectNoticeSeen {
+        shared.update(|m| m.direct_notice = false);
+    }
     match saved {
         Ok(cfg) => {
             knobs.set_from(&cfg.network);
@@ -2772,7 +2800,9 @@ async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Co
                 break;
             }
             Some(Command::SaveSettings(change)) => {
-                let _ = save_settings(&b.paths, &b.shared, &b.knobs, &change);
+                if save_settings(&b.paths, &b.shared, &b.knobs, &change).is_some() {
+                    follow_stun(b);
+                }
             }
             Some(Command::SetHistory(on)) => change_book(b, &Change::History(on)),
             Some(Command::ClearHistory) => change_book(b, &Change::Clear),
@@ -2870,12 +2900,13 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     // What the window says of direct connections follows the knobs the
     // sessions read: they took the command line's bridge choice too.
     b.shared.update(|m| follow_knobs(m, &b.knobs));
+    follow_stun(&b);
     let Some((first, early)) = before_the_start(&mut b, &mut commands).await else {
         b.shared.update(|m| m.closed = true);
         return;
     };
     let b = Arc::new(b);
-    b.shared.update(|m| m.history_notice = first);
+    b.shared.update(|m| start_notices(m, first));
     refresh_diagnostics(&b);
     {
         let (paths, shared) = (b.paths.clone(), Arc::clone(&b.shared));
@@ -2969,6 +3000,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     // M1-86): before the onion service is published again.
                     b.knobs.bootstrapped(started.rung(), &b.cfg.tor);
                     b.shared.update(|m| follow_knobs(m, &b.knobs));
+                    follow_stun(&b);
                     refresh_diagnostics(&b);
                     let started = Arc::new(started);
                     b.shared.update(|m| m.tor_retry = None);
@@ -3220,6 +3252,9 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => {
                         let saved = save_settings(&b.paths, &b.shared, &b.knobs, &change);
+                        if saved.is_some() {
+                            follow_stun(&b);
+                        }
                         if let (Some(saved), Some(hosted)) = (saved, &hosted) {
                             let lacks = b.shared.read(|m| m.portal_lacks_clipboard());
                             republish(&hosted.policy, &saved, lacks);
@@ -7225,6 +7260,105 @@ mod tests {
         assert!(!Config::load(&path).unwrap().network.paranoid);
         assert_eq!(held.transport.get(), TransportPolicy::LanOnly);
         shared.read(|m| assert_eq!(m.settings.problem, Some(NOT_SAVED_FILE)));
+    }
+
+    /// Design `direct` §3.3: the STUN and router switches reach
+    /// `config.toml` and, at once, the direct settings both roles' next
+    /// sessions read (a clone, as the host role holds them); the STUN list
+    /// stays the file's.
+    #[test]
+    fn the_stun_and_router_switches_reach_the_direct_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let path = paths.config_file();
+        let mut on_disk = Config::default();
+        on_disk.network.stun_servers = vec!["stun.example.org:3478".to_owned()];
+        on_disk.save(&path).unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        let held = knobs.clone();
+        assert!(held.direct.get().enable_stun);
+
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Stun(false));
+        assert!(!Config::load(&path).unwrap().network.enable_stun);
+        let options = held.direct.get();
+        assert!(!options.enable_stun);
+        assert_eq!(&*options.stun_partition_viewer, ["stun.example.org:3478"]);
+        shared.read(|m| assert!(!m.settings.stun));
+
+        save_settings(
+            &paths,
+            &shared,
+            &knobs,
+            &SettingsChange::RouterMapping(false),
+        );
+        let saved = Config::load(&path).unwrap().network;
+        assert!(!saved.upnp && !saved.nat_pmp && !saved.pcp);
+        assert!(!held.direct.get().map.any());
+        shared.read(|m| assert!(!m.settings.router && !m.settings.stun));
+
+        save_settings(
+            &paths,
+            &shared,
+            &knobs,
+            &SettingsChange::RouterMapping(true),
+        );
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Stun(true));
+        let options = held.direct.get();
+        assert!(options.enable_stun);
+        assert!(options.map.upnp && options.map.nat_pmp && options.map.pcp);
+        assert_eq!(Config::load(&path).unwrap(), on_disk);
+        shared.read(|m| {
+            assert!(m.settings.router && m.settings.stun);
+            assert_eq!(m.settings.problem, None);
+        });
+    }
+
+    /// Design `direct` §3.6: the notice that direct connections are on is
+    /// up from a start while it is due, and its OK closes it and saves that
+    /// it was seen, so the next start says nothing; an OK whose save fails
+    /// closes it too, and the next start asks again.
+    #[test]
+    fn the_direct_notice_shows_from_a_start_until_its_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let path = paths.config_file();
+        Config::default().save(&path).unwrap();
+        let start = |paths: &Paths| {
+            let mut model = Model {
+                settings: Settings::of(&Config::load(&paths.config_file()).unwrap()),
+                ..Model::default()
+            };
+            // An internet build's window.
+            model.settings.internet = true;
+            start_notices(&mut model, false);
+            model
+        };
+        let model = start(&paths);
+        assert!(model.direct_notice && !model.history_notice);
+        let shared = Shared::new(model, Arc::new(|_| {}));
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        save_settings(&paths, &shared, &knobs, &SettingsChange::DirectNoticeSeen);
+        assert!(Config::load(&path).unwrap().general.direct_notice_seen);
+        shared.read(|m| assert!(!m.direct_notice));
+        assert!(!start(&paths).direct_notice, "seen: never again");
+
+        // Not saved (the file cannot be read): closed, and asked again.
+        let other = Paths::from_home(tmp.path().join("other"));
+        Config::default().save(&other.config_file()).unwrap();
+        let shared = Shared::new(start(&other), Arc::new(|_| {}));
+        std::fs::write(other.config_file(), "not toml [").unwrap();
+        save_settings(&other, &shared, &knobs, &SettingsChange::DirectNoticeSeen);
+        shared.read(|m| {
+            assert!(!m.direct_notice);
+            assert_eq!(m.settings.problem, Some(NOT_SAVED_FILE));
+        });
+        Config::default().save(&other.config_file()).unwrap();
+        assert!(start(&other).direct_notice);
+        // The first run's history notice comes along.
+        let mut first = start(&paths);
+        start_notices(&mut first, true);
+        assert!(first.history_notice);
     }
 
     /// A window's backend for the first run's tests, in a fresh home under

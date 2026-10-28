@@ -484,12 +484,22 @@ fn closed_line(who: &str) -> String {
 }
 
 /// The note under a session question while an accept may let the session
-/// connect directly (design `direct` §3.6, \[SEC\]; Phase A: the local
-/// address): what `label` then learns, and, while it is the switch's doing,
-/// how to relay every session instead. `lan_only` has no Tor to relay
-/// through, so its note names no switch; Tor only has no note.
+/// connect directly (design `direct` §3.6, \[SEC\]), in this build's words
+/// ([`direct_note_in`] with [`INTERNET_DIRECT`]).
 fn direct_note(label: &str, policy: TransportPolicy) -> Option<String> {
-    let what = if INTERNET_DIRECT {
+    direct_note_in(label, policy, INTERNET_DIRECT)
+}
+
+/// The note under a session question while an accept may let the session
+/// connect directly: what `label` then learns (this computer's internet
+/// address where direct connections reach the internet, `internet`, and
+/// the policy is `Any`; its local address under `lan_only` or in a build
+/// whose direct connections stay on the local network), and, while it is
+/// the switch's doing, how to relay every session instead. `lan_only` has
+/// no Tor to relay through, so its note names no switch; Tor only has no
+/// note.
+fn direct_note_in(label: &str, policy: TransportPolicy, internet: bool) -> Option<String> {
+    let what = if internet && policy == TransportPolicy::Any {
         "internet address"
     } else {
         "local address"
@@ -1088,8 +1098,10 @@ mod tests {
 
     /// Design `direct` §3.6 [SEC]: while an accept may let the session
     /// connect directly, the terminal's session question says what the
-    /// asking device then learns (Phase A: the local address) and how to
-    /// relay every session through Tor; under `lan_only` it names no switch;
+    /// asking device then learns (the internet address where direct
+    /// connections reach the internet, the local address under `lan_only`
+    /// or where they stay on the local network) and how to relay every
+    /// session through Tor; under `lan_only` it names no switch;
     /// with every session relayed it says nothing of it. The question reads
     /// the knob when it is asked, so a changed policy reaches the next
     /// question.
@@ -1099,10 +1111,34 @@ mod tests {
             device: tornect_core::DeviceIdentity::from_seed(&[7; 32]).id(),
             label: "Laptop".to_owned(),
         };
-        const ANY: &str = "  note: accepting also lets \"Laptop\" learn this computer's local \
-                           address (network.paranoid = true relays through Tor)";
+        // A build whose direct connections stay on the local network
+        // (Phase A), and one whose reach the internet (Phase B).
+        const ANY_LAN: &str = "  note: accepting also lets \"Laptop\" learn this computer's \
+                               local address (network.paranoid = true relays through Tor)";
+        const ANY_INTERNET: &str = "  note: accepting also lets \"Laptop\" learn this \
+                                    computer's internet address (network.paranoid = true \
+                                    relays through Tor)";
         const LAN: &str = "  note: accepting also lets \"Laptop\" learn this computer's local \
                            address";
+        for internet in [false, true] {
+            let any = if internet { ANY_INTERNET } else { ANY_LAN };
+            for (policy, note) in [
+                (TransportPolicy::Any, Some(any)),
+                (TransportPolicy::LanOnly, Some(LAN)),
+                (TransportPolicy::TorOnly, None),
+            ] {
+                assert_eq!(
+                    direct_note_in("Laptop", policy, internet).as_deref(),
+                    note,
+                    "{policy:?} {internet}"
+                );
+            }
+        }
+        const ANY: &str = if INTERNET_DIRECT {
+            ANY_INTERNET
+        } else {
+            ANY_LAN
+        };
         let linux = Availability::LINUX;
         for (policy, note) in [
             (TransportPolicy::Any, Some(ANY)),

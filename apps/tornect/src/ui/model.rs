@@ -166,6 +166,10 @@ pub struct Model {
     /// This is the window's first run in this home: Home says once that no
     /// list of past connections is kept unless history is switched on.
     pub history_notice: bool,
+    /// The one-time notice that direct connections are on (design `direct`
+    /// §3.6) is up: set at the window's start when it is due
+    /// ([`Settings::direct_notice_due`]), cleared by its OK.
+    pub direct_notice: bool,
     /// This computer's two sets of device words, once derived (§B.6.1 item 5).
     pub mine: Option<MyWords>,
     /// The connect field's look-alike warning (§B.6.1 item 4): the ID typed
@@ -1699,6 +1703,16 @@ pub enum Check {
     Unreachable(String),
 }
 
+/// What an accepted session may let the other computer learn of this
+/// computer's addresses ([`Settings::reveals`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reveals {
+    /// Its local address (the same site only).
+    Local,
+    /// Its local and internet addresses.
+    Internet,
+}
+
 /// What `config.toml` holds of what the settings pages change, as saved:
 /// read at the window's start and again after each save from the window. The
 /// name others see may differ from the one in use until the next start.
@@ -1728,6 +1742,22 @@ pub struct Settings {
     /// through a bridge (decision M1-86): from the configuration until Tor
     /// starts, then from the way it went in (the knobs the sessions read).
     pub bridged_off: bool,
+    /// This build's direct connections reach beyond the local network
+    /// ([`tornect_session::INTERNET_DIRECT`]): the window's words about
+    /// direct connections are those of the scope the sessions have (design
+    /// `direct` §2, "the Settings and Privacy copy follows the constant").
+    /// Always the constant outside tests, which set it to show the other
+    /// scope's words.
+    pub internet: bool,
+    /// `network.enable_stun`: the "Use public STUN servers" switch (design
+    /// `direct` §3.3).
+    pub stun: bool,
+    /// `network.upnp`, `nat_pmp` and `pcp` all on: the "Ask this network's
+    /// router to open a port" switch, which sets all three.
+    pub router: bool,
+    /// `general.direct_notice_seen`: the one-time notice that direct
+    /// connections are on was answered (design `direct` §3.6).
+    pub direct_notice_seen: bool,
     /// Why the last save from the window was not made, in plain words;
     /// `None` once one was.
     pub problem: Option<&'static str>,
@@ -1758,8 +1788,37 @@ impl Settings {
             bridged_off: crate::direct::DirectKnobs::new(cfg)
                 .transport
                 .off_by_bridge(),
+            internet: tornect_session::INTERNET_DIRECT,
+            stun: cfg.network.enable_stun,
+            router: cfg.network.upnp && cfg.network.nat_pmp && cfg.network.pcp,
+            direct_notice_seen: cfg.general.direct_notice_seen,
             problem: None,
         }
+    }
+
+    /// What an accepted session may let the other computer learn of this
+    /// computer's addresses with these settings (design `direct` §3.6):
+    /// nothing while every session is relayed through Tor; its local
+    /// address under `lan_only` or in a build whose direct connections stay
+    /// on the local network; its internet address too otherwise.
+    #[must_use]
+    pub fn reveals(&self) -> Option<Reveals> {
+        match self.direct_policy() {
+            TransportPolicy::TorOnly => None,
+            TransportPolicy::Any if self.internet => Some(Reveals::Internet),
+            TransportPolicy::Any | TransportPolicy::LanOnly => Some(Reveals::Local),
+        }
+    }
+
+    /// Whether the window shows its one-time notice that direct
+    /// connections are on (design `direct` §3.6), asked at the window's
+    /// start: in a build whose direct connections reach the internet, while
+    /// this computer's policy lets every session try them (not Tor only, a
+    /// bridge in use included, and not `lan_only`, which reveals no
+    /// internet address), until its OK was pressed once.
+    #[must_use]
+    pub fn direct_notice_due(&self) -> bool {
+        self.internet && self.direct_policy() == TransportPolicy::Any && !self.direct_notice_seen
     }
 
     /// This computer's policy for the direct path as the sessions read it
@@ -1799,6 +1858,16 @@ pub enum SettingsChange {
     /// `direct_with_bridges` are `config.toml`'s alone (from the next
     /// session on).
     Direct(bool),
+    /// The "Use public STUN servers" switch: `network.enable_stun`; the
+    /// list stays `config.toml`'s (from the next session on).
+    Stun(bool),
+    /// The "Ask this network's router to open a port" switch:
+    /// `network.upnp`, `nat_pmp` and `pcp` together (from the next session
+    /// on).
+    RouterMapping(bool),
+    /// The one-time notice that direct connections are on was answered
+    /// with OK (`general.direct_notice_seen`).
+    DirectNoticeSeen,
 }
 
 /// The switches of `[services]` that Settings, Sharing changes (design
@@ -1872,6 +1941,13 @@ impl SettingsChange {
             }
             Self::ViewerClipboard(on) => cfg.viewer.clipboard_sync = *on,
             Self::Direct(on) => cfg.network.paranoid = !on,
+            Self::Stun(on) => cfg.network.enable_stun = *on,
+            Self::RouterMapping(on) => {
+                cfg.network.upnp = *on;
+                cfg.network.nat_pmp = *on;
+                cfg.network.pcp = *on;
+            }
+            Self::DirectNoticeSeen => cfg.general.direct_notice_seen = true,
         }
     }
 }
@@ -2134,6 +2210,109 @@ mod tests {
         SettingsChange::Direct(true).apply(&mut lan);
         assert!(lan.network.lan_only && !lan.network.paranoid);
         assert_eq!(Settings::of(&lan).direct_policy(), TransportPolicy::LanOnly);
+    }
+
+    /// Design `direct` §3.3: the STUN switch writes `enable_stun` alone, the
+    /// router switch the three protocols together, and the notice's OK
+    /// `general.direct_notice_seen` alone; the STUN list, `lan_only`,
+    /// `direct_with_bridges` and every other key are left as the file has
+    /// them. The router switch reads on only while all three are on.
+    #[test]
+    fn the_stun_and_router_switches_and_the_notice_write_their_keys_alone() {
+        let mut cfg = tornect_core::Config::default();
+        cfg.network.stun_servers = vec!["stun.example.org:3478".to_owned()];
+        cfg.network.direct_with_bridges = true;
+        let before = cfg.clone();
+        let s = Settings::of(&cfg);
+        assert!(s.stun && s.router && !s.direct_notice_seen);
+        assert_eq!(s.internet, tornect_session::INTERNET_DIRECT);
+
+        SettingsChange::Stun(false).apply(&mut cfg);
+        assert_eq!(
+            tornect_core::config::Network {
+                enable_stun: true,
+                ..cfg.network.clone()
+            },
+            before.network
+        );
+        assert!(!Settings::of(&cfg).stun);
+        SettingsChange::Stun(true).apply(&mut cfg);
+        assert_eq!(cfg, before);
+
+        SettingsChange::RouterMapping(false).apply(&mut cfg);
+        let n = &cfg.network;
+        assert!(!n.upnp && !n.nat_pmp && !n.pcp);
+        assert_eq!(
+            tornect_core::config::Network {
+                upnp: true,
+                nat_pmp: true,
+                pcp: true,
+                ..cfg.network.clone()
+            },
+            before.network
+        );
+        assert!(!Settings::of(&cfg).router);
+        SettingsChange::RouterMapping(true).apply(&mut cfg);
+        assert_eq!(cfg, before);
+        // One protocol off in the file: the switch reads off, and turning
+        // it on sets all three.
+        cfg.network.nat_pmp = false;
+        assert!(!Settings::of(&cfg).router);
+        SettingsChange::RouterMapping(true).apply(&mut cfg);
+        assert_eq!(cfg, before);
+
+        SettingsChange::DirectNoticeSeen.apply(&mut cfg);
+        assert!(cfg.general.direct_notice_seen);
+        assert!(Settings::of(&cfg).direct_notice_seen);
+        assert_eq!(
+            tornect_core::config::General {
+                direct_notice_seen: false,
+                ..cfg.general.clone()
+            },
+            before.general
+        );
+        assert_eq!(cfg.network, before.network);
+    }
+
+    /// Design `direct` §3.6: the notice is due at a start only in a build
+    /// whose direct connections reach the internet, while the policy is
+    /// `Any` (not paranoid, no bridge in use, not `lan_only`), until its OK
+    /// was saved.
+    #[test]
+    fn the_direct_notice_is_due_once_in_an_internet_build_while_direct_is_on() {
+        let cfg = tornect_core::Config::default();
+        let mut s = Settings::of(&cfg);
+        assert_eq!(s.direct_notice_due(), tornect_session::INTERNET_DIRECT);
+        s.internet = false;
+        assert!(!s.direct_notice_due(), "a local-network build says nothing");
+        s.internet = true;
+        assert!(s.direct_notice_due(), "an upgrade with the defaults");
+        type Case = (&'static str, fn(&mut tornect_core::Config));
+        let quiet: [Case; 4] = [
+            ("seen", |c| c.general.direct_notice_seen = true),
+            ("paranoid", |c| c.network.paranoid = true),
+            ("lan_only", |c| c.network.lan_only = true),
+            ("a bridge", |c| c.tor.bridges = BridgeMode::Obfs4),
+        ];
+        for (case, set) in quiet {
+            let mut cfg = tornect_core::Config::default();
+            set(&mut cfg);
+            let mut s = Settings::of(&cfg);
+            s.internet = true;
+            assert!(!s.direct_notice_due(), "{case}");
+        }
+        // A bridge allowed by direct_with_bridges asks.
+        let mut cfg = tornect_core::Config::default();
+        cfg.tor.bridges = BridgeMode::Obfs4;
+        cfg.network.direct_with_bridges = true;
+        let mut s = Settings::of(&cfg);
+        s.internet = true;
+        assert!(s.direct_notice_due());
+        // A bridge Tor went in by, after the start (the knobs said it).
+        let mut s = Settings::of(&tornect_core::Config::default());
+        s.internet = true;
+        s.bridged_off = true;
+        assert!(!s.direct_notice_due());
     }
 
     /// What control also gives (the services design §7.4) follows the saved

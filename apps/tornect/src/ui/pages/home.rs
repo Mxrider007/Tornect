@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
 use tornect_core::invite;
-use tornect_session::INTERNET_DIRECT;
 use tornect_signal::consent::TransportPolicy;
 
 use super::super::icons::{self, Icon};
@@ -949,13 +948,21 @@ fn setup_card(ui: &mut Ui, t: &Tokens, setup: &Setup, sharing: bool, actions: &m
         });
 }
 
-/// The fourth step's note when the picture opens directly where it can
-/// (design `direct` §3.2, Phase A; the Phase B line is keyed on
-/// `INTERNET_DIRECT`).
-pub(super) const OPENING_DIRECT: &str = if INTERNET_DIRECT {
-    "Directly if the two computers can reach each other, otherwise relayed through Tor"
+/// The fourth step's note when the picture opens directly where it can, in
+/// a build whose direct connections stay on the local network (design
+/// `direct` §3.2, Phase A).
+pub(super) const OPENING_DIRECT_LAN: &str =
+    "Directly if both computers are on the same network, otherwise relayed through Tor";
+/// The same in a build whose direct connections reach the internet (Phase
+/// B).
+pub(super) const OPENING_DIRECT_INTERNET: &str =
+    "Directly if the two computers can reach each other, otherwise relayed through Tor";
+/// The note of this build when the picture opens directly where it can.
+#[cfg(test)]
+pub(super) const OPENING_DIRECT: &str = if tornect_session::INTERNET_DIRECT {
+    OPENING_DIRECT_INTERNET
 } else {
-    "Directly if both computers are on the same network, otherwise relayed through Tor"
+    OPENING_DIRECT_LAN
 };
 /// The fourth step's note when direct connections are off here (the Settings
 /// switch, or a bridge in use).
@@ -964,10 +971,13 @@ pub(super) const OPENING_TOR: &str = "Relayed through Tor: private, and slower t
 /// connect directly ends instead of going through Tor.
 pub(super) const OPENING_LAN_ONLY: &str = "Directly if both computers are on the same network, otherwise the session ends (network.lan_only)";
 
-/// "Opening the picture" for this computer's direct-connection settings.
-pub(super) fn opening_note(policy: TransportPolicy) -> &'static str {
+/// "Opening the picture" for this computer's direct-connection settings,
+/// in a build whose direct connections reach the internet or not
+/// (`internet`: `Settings::internet`).
+pub(super) fn opening_note(policy: TransportPolicy, internet: bool) -> &'static str {
     match policy {
-        TransportPolicy::Any => OPENING_DIRECT,
+        TransportPolicy::Any if internet => OPENING_DIRECT_INTERNET,
+        TransportPolicy::Any => OPENING_DIRECT_LAN,
         TransportPolicy::TorOnly => OPENING_TOR,
         TransportPolicy::LanOnly => OPENING_LAN_ONLY,
     }
@@ -1042,7 +1052,7 @@ fn connect_stepper(
                 .color(t.text_muted),
         );
     }
-    let opening = opening_note(model.settings.direct_policy());
+    let opening = opening_note(model.settings.direct_policy(), model.settings.internet);
     // An unattended connect's own steps (§B.8.10): the password, then the
     // computer's checks, where someone there can still block (or must allow)
     // — generic, with no countdown, since the grant's policy is disclosed

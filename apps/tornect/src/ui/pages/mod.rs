@@ -19,6 +19,7 @@ use tornect_core::address_book::Day;
 pub use self::address_book::{BookForm, Tab};
 pub(super) use self::sessions::rows as session_rows;
 pub use self::settings::SettingsForm;
+pub(super) use self::settings::connection::direct_switch;
 use super::model::Model;
 use super::nav::Page;
 use super::theme::{self, Face};
@@ -2515,7 +2516,9 @@ mod tests {
 
     /// Design `direct` §3.2: "Opening the picture" says how the picture
     /// opens with this computer's settings, in both steppers: directly where
-    /// it can (Phase A: on the same network), through Tor when direct
+    /// it can (on the same network in a build whose direct connections stay
+    /// there, Phase A; where the two computers can reach each other in one
+    /// whose reach the internet, Phase B), through Tor when direct
     /// connections are off or a bridge turns them off, and the end of the
     /// session under `network.lan_only`. The line this version used to show
     /// is gone.
@@ -2523,75 +2526,90 @@ mod tests {
     fn the_picture_step_says_how_it_opens_with_these_settings() {
         use super::super::model::{ClientStage, Dial};
         use tornect_signal::consent::TransportPolicy;
-        assert!(home::OPENING_DIRECT.contains("same network"));
-        const { assert!(!tornect_session::INTERNET_DIRECT) };
+        assert_eq!(
+            home::OPENING_DIRECT_LAN,
+            "Directly if both computers are on the same network, otherwise relayed through Tor"
+        );
+        assert_eq!(
+            home::OPENING_DIRECT_INTERNET,
+            "Directly if the two computers can reach each other, otherwise relayed through Tor"
+        );
+        assert_eq!(
+            home::OPENING_DIRECT,
+            home::opening_note(TransportPolicy::Any, tornect_session::INTERNET_DIRECT)
+        );
         // A name, the settings, the note, the policy the sessions read.
         type Case = (&'static str, fn(&mut Model), &'static str, TransportPolicy);
         let id = TornectId::from_bytes([0x42; 32]);
-        let cases: [Case; 4] = [
-            (
-                "direct on",
-                |_| {},
-                home::OPENING_DIRECT,
-                TransportPolicy::Any,
-            ),
-            (
-                "direct off",
-                |m| m.settings.direct = false,
-                home::OPENING_TOR,
-                TransportPolicy::TorOnly,
-            ),
-            (
-                "a bridge in use",
-                |m| m.settings.bridged_off = true,
-                home::OPENING_TOR,
-                TransportPolicy::TorOnly,
-            ),
-            (
-                "lan_only",
-                |m| m.settings.lan_only = true,
-                home::OPENING_LAN_ONLY,
-                TransportPolicy::LanOnly,
-            ),
-        ];
-        for (case, set, note, policy) in cases {
-            for unattended in [false, true] {
-                let mut model = at_rest();
-                set(&mut model);
-                assert_eq!(model.settings.direct_policy(), policy, "{case}");
-                assert_eq!(home::opening_note(policy), note, "{case}");
-                model.dial = Dial {
-                    id: Some(id),
-                    since: Some(Instant::now()),
-                    paired_now: false,
-                    failed: None,
-                    unattended,
-                    went_live: false,
-                };
-                model.client = if unattended {
-                    ClientStage::Checking
-                } else {
-                    ClientStage::Asking
-                };
-                let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
-                assert!(has_text(&window, "Opening the picture"), "{case}");
-                assert!(has_text(&window, note), "{case} {unattended}");
-                for other in [
-                    home::OPENING_DIRECT,
+        for internet in [false, true] {
+            let direct = if internet {
+                home::OPENING_DIRECT_INTERNET
+            } else {
+                home::OPENING_DIRECT_LAN
+            };
+            let cases: [Case; 4] = [
+                ("direct on", |_| {}, direct, TransportPolicy::Any),
+                (
+                    "direct off",
+                    |m| m.settings.direct = false,
                     home::OPENING_TOR,
+                    TransportPolicy::TorOnly,
+                ),
+                (
+                    "a bridge in use",
+                    |m| m.settings.bridged_off = true,
+                    home::OPENING_TOR,
+                    TransportPolicy::TorOnly,
+                ),
+                (
+                    "lan_only",
+                    |m| m.settings.lan_only = true,
                     home::OPENING_LAN_ONLY,
-                ] {
-                    if other != note {
-                        assert!(!has_text(&window, other), "{case}: {other}");
+                    TransportPolicy::LanOnly,
+                ),
+            ];
+            for (case, set, note, policy) in cases {
+                for unattended in [false, true] {
+                    let mut model = at_rest();
+                    model.settings.internet = internet;
+                    set(&mut model);
+                    assert_eq!(model.settings.direct_policy(), policy, "{case}");
+                    assert_eq!(home::opening_note(policy, internet), note, "{case}");
+                    model.dial = Dial {
+                        id: Some(id),
+                        since: Some(Instant::now()),
+                        paired_now: false,
+                        failed: None,
+                        unattended,
+                        went_live: false,
+                    };
+                    model.client = if unattended {
+                        ClientStage::Checking
+                    } else {
+                        ClientStage::Asking
+                    };
+                    let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+                    let case = format!("{case} {unattended} {internet}");
+                    assert!(has_text(&window, "Opening the picture"), "{case}");
+                    assert!(has_text(&window, note), "{case}");
+                    for other in [
+                        home::OPENING_DIRECT_LAN,
+                        home::OPENING_DIRECT_INTERNET,
+                        home::OPENING_TOR,
+                        home::OPENING_LAN_ONLY,
+                    ] {
+                        if other != note {
+                            assert!(!has_text(&window, other), "{case}: {other}");
+                        }
                     }
+                    assert!(
+                        !has_text(
+                            &window,
+                            "No direct path in this version: relayed through Tor"
+                        ),
+                        "{case}"
+                    );
                 }
-                assert!(
-                    !has_text(
-                        &window,
-                        "No direct path in this version: relayed through Tor"
-                    ),
-                    "{case}"
-                );
             }
         }
     }
@@ -4282,13 +4300,36 @@ mod tests {
              click \"Check if reachable\"."
         );
         assert_eq!(
-            privacy::NETWORK_LINE_DIRECT,
+            privacy::NETWORK_LINE_LAN,
             "Your internet address stays hidden from the computers you connect to and those that \
              connect here. When both computers are on the same local network they connect \
              directly, and each learns the other's local address (like 192.168.1.20), only after \
              a session is accepted. Tornect has no accounts, no telemetry and no update checks, \
              and it checks whether a saved computer is reachable only when you click \"Check if \
              reachable\"."
+        );
+        // Design `direct` §3.4's Phase B words, with the condition the STUN
+        // operator split holds under (decision M1-81).
+        assert_eq!(
+            privacy::NETWORK_LINE_INTERNET,
+            "When direct connections are on (Settings > Connection), a computer you connect to, \
+             or that you let connect here, learns this computer's local and internet addresses, \
+             only after the session is accepted. One public STUN server per session may see that \
+             this computer started a connection, never with whom (when both computers use the \
+             same list, as with the default). Your internet provider can see that this computer \
+             exchanges encrypted traffic directly with another computer, and may recognise it as \
+             Tornect; while Tor uses a bridge, direct connections stay off. With direct \
+             connections off, computers you connect to never learn your IP address. Tornect has \
+             no accounts, no telemetry and no update checks, and it checks whether a saved \
+             computer is reachable only when you click \"Check if reachable\"."
+        );
+        assert_eq!(
+            privacy::NETWORK_LINE_DIRECT,
+            if tornect_session::INTERNET_DIRECT {
+                privacy::NETWORK_LINE_INTERNET
+            } else {
+                privacy::NETWORK_LINE_LAN
+            }
         );
         for size in [WIDE, NARROW] {
             let window = privacy(with_book(false), size);
@@ -4917,53 +4958,69 @@ mod tests {
     }
 
     /// Design `direct` §3.4: the Privacy page says what the other computer
-    /// learns as this computer's policy has it: the direct line while
-    /// sessions may connect directly (`lan_only` too), Tor's line, word for
-    /// word as before, while every session is relayed (the switch off, or a
-    /// bridge in use).
+    /// learns as this computer's policy has it: while sessions may connect
+    /// directly, the local network's line (a build whose direct connections
+    /// stay there, and `lan_only` in any build) or the internet's; Tor's
+    /// line, word for word as before, while every session is relayed (the
+    /// switch off, or a bridge in use).
     #[test]
     fn the_privacy_line_follows_the_direct_switch() {
+        use super::super::model::Reveals;
         use settings::privacy;
-        // A name, the settings, the line.
-        type Case = (&'static str, fn(&mut Model), &'static str);
-        let cases: [Case; 4] = [
-            ("direct on", |_| {}, privacy::NETWORK_LINE_DIRECT),
-            (
-                "direct off",
-                |m| m.settings.direct = false,
-                privacy::NETWORK_LINE_TOR,
-            ),
-            (
-                "a bridge in use",
-                |m| m.settings.bridged_off = true,
-                privacy::NETWORK_LINE_TOR,
-            ),
-            (
-                "lan_only",
-                |m| m.settings.lan_only = true,
-                privacy::NETWORK_LINE_DIRECT,
-            ),
-        ];
-        for (case, set, line) in cases {
-            let mut model = with_book(false);
-            set(&mut model);
-            assert_eq!(
-                privacy::network_line(model.settings.direct_policy()),
-                line,
-                "{case}"
-            );
-            let window = privacy(model, WIDE);
-            assert!(has_text(&window, line), "{case}");
-            for other in [privacy::NETWORK_LINE_TOR, privacy::NETWORK_LINE_DIRECT] {
-                if other != line {
-                    assert!(!has_text(&window, other), "{case}");
+        // A name, the settings, what an accept reveals, the line.
+        type Case = (&'static str, fn(&mut Model), Option<Reveals>, &'static str);
+        for internet in [false, true] {
+            let (on, on_line) = if internet {
+                (Reveals::Internet, privacy::NETWORK_LINE_INTERNET)
+            } else {
+                (Reveals::Local, privacy::NETWORK_LINE_LAN)
+            };
+            let cases: [Case; 4] = [
+                ("direct on", |_| {}, Some(on), on_line),
+                (
+                    "direct off",
+                    |m| m.settings.direct = false,
+                    None,
+                    privacy::NETWORK_LINE_TOR,
+                ),
+                (
+                    "a bridge in use",
+                    |m| m.settings.bridged_off = true,
+                    None,
+                    privacy::NETWORK_LINE_TOR,
+                ),
+                (
+                    "lan_only",
+                    |m| m.settings.lan_only = true,
+                    Some(Reveals::Local),
+                    privacy::NETWORK_LINE_LAN,
+                ),
+            ];
+            for (case, set, reveals, line) in cases {
+                let mut model = with_book(false);
+                model.settings.internet = internet;
+                set(&mut model);
+                let case = format!("{case} {internet}");
+                assert_eq!(model.settings.reveals(), reveals, "{case}");
+                assert_eq!(privacy::network_line(reveals), line, "{case}");
+                let window = privacy(model, WIDE);
+                assert!(has_text(&window, line), "{case}");
+                for other in [
+                    privacy::NETWORK_LINE_TOR,
+                    privacy::NETWORK_LINE_LAN,
+                    privacy::NETWORK_LINE_INTERNET,
+                ] {
+                    if other != line {
+                        assert!(!has_text(&window, other), "{case}");
+                    }
                 }
             }
         }
     }
 
-    /// Design `direct` §3.3, Phase A: Settings, Connection's direct
-    /// connections section in the design's words. On: the switch saves
+    /// Design `direct` §3.3, Phase A (a build whose direct connections stay
+    /// on the local network): Settings, Connection's direct connections
+    /// section in the design's words, with none of Phase B's. On: the switch saves
     /// `Direct(false)`, and the page says how a direct connection comes
     /// about and what stays private; off: every session through Tor, and
     /// the switch saves `Direct(true)`; a bridge in use keeps the switch as
@@ -4979,12 +5036,12 @@ mod tests {
         use settings::connection;
         const VERY_TALL: (f32, f32) = (1200.0, 1900.0);
         assert_eq!(
-            connection::DIRECT_SWITCH,
+            connection::DIRECT_SWITCH_LAN,
             "Connect directly when both computers are on the same local network (faster; the \
              other computer learns this computer's local address)"
         );
         assert_eq!(
-            connection::DIRECT_HOW,
+            connection::DIRECT_HOW_LAN,
             "After the other computer accepts, the two computers exchange their local network \
              addresses over Tor and try to reach each other directly for a moment. If they are \
              not on the same network, the session is relayed through Tor."
@@ -5023,7 +5080,9 @@ mod tests {
              (network.lan_only), in both directions: no STUN server or router is asked, and a \
              session that cannot connect directly ends instead of going through Tor."
         );
-        let open = |model: Model| {
+        let open = |mut model: Model| {
+            // A build whose direct connections stay on the local network.
+            model.settings.internet = false;
             let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, VERY_TALL);
             window.form.settings.section = settings::Section::Connection;
             window.pass(Vec::new());
@@ -5035,7 +5094,7 @@ mod tests {
                 .nodes
                 .iter()
                 .find(|n| {
-                    n.role() == Role::CheckBox && n.label() == Some(connection::DIRECT_SWITCH)
+                    n.role() == Role::CheckBox && n.label() == Some(connection::DIRECT_SWITCH_LAN)
                 })
                 .cloned()
         };
@@ -5045,11 +5104,20 @@ mod tests {
             window.click(at)
         };
         let all = [
-            connection::DIRECT_HOW,
+            connection::DIRECT_HOW_LAN,
             connection::DIRECT_PRIVATE,
             connection::DIRECT_OFF,
             connection::BRIDGE_NOTE,
             connection::LAN_ONLY_NOTE,
+            // None of the internet build's words.
+            connection::DIRECT_SWITCH_INTERNET,
+            connection::DIRECT_HOW_INTERNET,
+            connection::DIRECT_EXPOSES,
+            connection::STUN_SWITCH,
+            connection::STUN_LINE,
+            connection::ROUTER_SWITCH,
+            connection::ROUTER_LINE,
+            connection::PUBLIC_ANYWAY,
         ];
         let says_only = |window: &Window, case: &str, said: &[&str]| {
             for text in all {
@@ -5076,7 +5144,7 @@ mod tests {
         says_only(
             &window,
             "on",
-            &[connection::DIRECT_HOW, connection::DIRECT_PRIVATE],
+            &[connection::DIRECT_HOW_LAN, connection::DIRECT_PRIVATE],
         );
         assert_eq!(
             click(&mut window),
@@ -5101,7 +5169,7 @@ mod tests {
             &window,
             "bridged",
             &[
-                connection::DIRECT_HOW,
+                connection::DIRECT_HOW_LAN,
                 connection::DIRECT_PRIVATE,
                 connection::BRIDGE_NOTE,
             ],
@@ -5120,7 +5188,256 @@ mod tests {
         model.hosted_elsewhere = true;
         let window = open(model);
         assert!(switch(&window).is_none());
-        assert!(!has_text(&window, connection::DIRECT_SWITCH));
+        assert!(!has_text(&window, connection::DIRECT_SWITCH_LAN));
+        assert!(has_text(&window, HIDDEN_WHILE_SHARED));
+    }
+
+    /// Design `direct` §3.3, Phase B (a build whose direct connections
+    /// reach the internet): the switch in Phase B's words; while it is on,
+    /// how a direct connection comes about, what the other computer learns,
+    /// and the STUN and router switches, each with its line, saving
+    /// `Stun(..)` and `RouterMapping(..)`; while either is off, that neither
+    /// hides this computer's internet address. Off: every session through
+    /// Tor, and no sub-switch. A bridge in use keeps the switches as saved
+    /// and says why direct connections are off anyway; `lan_only` shows the
+    /// switch on and disabled, with its note and no sub-switch. None of
+    /// Phase A's words; while this screen is shared, no switch at all.
+    #[test]
+    fn the_internet_switches_say_what_the_stun_server_and_the_router_see() {
+        use super::super::model::SettingsChange;
+        use egui::accesskit::Toggled;
+        use settings::connection;
+        const VERY_TALL: (f32, f32) = (1200.0, 2400.0);
+        assert_eq!(
+            connection::DIRECT_SWITCH_INTERNET,
+            "Allow direct connections (faster; the other computer learns your IP address)"
+        );
+        assert_eq!(
+            connection::DIRECT_HOW_INTERNET,
+            "After the other computer accepts, the two computers exchange their addresses over \
+             Tor and try to reach each other directly for up to 4 seconds. If they cannot, the \
+             session is relayed through Tor."
+        );
+        assert_eq!(
+            connection::DIRECT_EXPOSES,
+            "A computer you connect to, or that you let connect here, learns this computer's \
+             local and internet addresses (IPv4 and IPv6), only after the session is accepted. \
+             Computers that are refused, or never paired, learn nothing."
+        );
+        assert_eq!(connection::STUN_SWITCH, "Use public STUN servers");
+        // The design's words, with the condition the operator split holds
+        // under (decision M1-81; the review of steps B2 and B3).
+        assert_eq!(
+            connection::STUN_LINE,
+            "To find this computer's internet address, Tornect asks one public server per \
+             session (by default from Cloudflare, Google, Twilio or Nextcloud; the list is in \
+             config.toml). That server sees this computer's internet address and when a session \
+             starts, never which computer it connects to (when both computers use the same list, \
+             as with the default) and never the picture. Tornect looks up these servers' names \
+             when it starts and every 10 minutes. Off: direct connections across routers succeed \
+             less often."
+        );
+        assert_eq!(
+            connection::ROUTER_SWITCH,
+            "Ask this network's router to open a port (UPnP, NAT-PMP, PCP)"
+        );
+        assert_eq!(
+            connection::ROUTER_LINE,
+            "The opening is for one session and shows as \"Tornect\" in the router's settings. \
+             Tornect closes it when the session ends; if Tornect stops first, most routers drop it \
+             within 10 minutes, and Tornect removes it at its next start."
+        );
+        assert_eq!(
+            connection::PUBLIC_ANYWAY,
+            "With these off, the other computer still learns this computer's internet address \
+             from the direct connection itself. To keep it hidden, turn direct connections off."
+        );
+        assert_eq!(direct_switch(true), connection::DIRECT_SWITCH_INTERNET);
+        assert_eq!(direct_switch(false), connection::DIRECT_SWITCH_LAN);
+        let open = |mut model: Model| {
+            model.settings.internet = true;
+            let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, VERY_TALL);
+            window.form.settings.section = settings::Section::Connection;
+            window.pass(Vec::new());
+            assert!(has_text(&window, connection::DIRECT_HEADER));
+            window
+        };
+        let switch = |window: &Window, label: &str| -> Option<Node> {
+            window
+                .nodes
+                .iter()
+                .find(|n| n.role() == Role::CheckBox && n.label() == Some(label))
+                .cloned()
+        };
+        let click = |window: &mut Window, label: &str| {
+            let b = switch(window, label)
+                .and_then(|n| n.bounds())
+                .unwrap_or_else(|| panic!("the switch {label}"));
+            let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+            window.click(at)
+        };
+        let all = [
+            connection::DIRECT_HOW_INTERNET,
+            connection::DIRECT_EXPOSES,
+            connection::STUN_LINE,
+            connection::ROUTER_LINE,
+            connection::PUBLIC_ANYWAY,
+            connection::DIRECT_OFF,
+            connection::BRIDGE_NOTE,
+            connection::LAN_ONLY_NOTE,
+            // None of Phase A's words.
+            connection::DIRECT_SWITCH_LAN,
+            connection::DIRECT_HOW_LAN,
+            connection::DIRECT_PRIVATE,
+        ];
+        let says_only = |window: &Window, case: &str, said: &[&str]| {
+            for text in all {
+                assert_eq!(
+                    has_text(window, text),
+                    said.contains(&text),
+                    "{case}: {text}"
+                );
+            }
+            for text in [connection::DIRECT_TOR_STILL, connection::NEXT_SESSION] {
+                assert!(has_text(window, text), "{case}: {text}");
+            }
+            assert_eq!(
+                has_text(window, connection::DIRECT_WINDOWS),
+                cfg!(windows),
+                "{case}"
+            );
+        };
+        let sub_switches = |window: &Window, case: &str, shown: Option<(bool, bool)>| {
+            let toggled = |on| if on { Toggled::True } else { Toggled::False };
+            match shown {
+                Some((stun, router)) => {
+                    let s = switch(window, connection::STUN_SWITCH).expect(case);
+                    assert_eq!(s.toggled(), Some(toggled(stun)), "{case}");
+                    let r = switch(window, connection::ROUTER_SWITCH).expect(case);
+                    assert_eq!(r.toggled(), Some(toggled(router)), "{case}");
+                }
+                None => {
+                    for label in [connection::STUN_SWITCH, connection::ROUTER_SWITCH] {
+                        assert!(switch(window, label).is_none(), "{case}: {label}");
+                        assert!(!has_text(window, label), "{case}: {label}");
+                    }
+                }
+            }
+        };
+        let on_lines = [
+            connection::DIRECT_HOW_INTERNET,
+            connection::DIRECT_EXPOSES,
+            connection::STUN_LINE,
+            connection::ROUTER_LINE,
+        ];
+
+        // On, as config.toml's defaults have it.
+        let mut window = open(at_rest());
+        let direct = switch(&window, connection::DIRECT_SWITCH_INTERNET).expect("the switch");
+        assert_eq!(direct.toggled(), Some(Toggled::True));
+        assert!(!direct.is_disabled());
+        says_only(&window, "on", &on_lines);
+        sub_switches(&window, "on", Some((true, true)));
+        assert_eq!(
+            click(&mut window, connection::DIRECT_SWITCH_INTERNET),
+            vec![Action::SaveSettings(SettingsChange::Direct(false))]
+        );
+        let mut window = open(at_rest());
+        assert_eq!(
+            click(&mut window, connection::STUN_SWITCH),
+            vec![Action::SaveSettings(SettingsChange::Stun(false))]
+        );
+        let mut window = open(at_rest());
+        assert_eq!(
+            click(&mut window, connection::ROUTER_SWITCH),
+            vec![Action::SaveSettings(SettingsChange::RouterMapping(false))]
+        );
+
+        // Either sub-switch off: the address is learnt anyway.
+        let with_public = [
+            connection::DIRECT_HOW_INTERNET,
+            connection::DIRECT_EXPOSES,
+            connection::STUN_LINE,
+            connection::ROUTER_LINE,
+            connection::PUBLIC_ANYWAY,
+        ];
+        let mut model = at_rest();
+        model.settings.stun = false;
+        let mut window = open(model);
+        says_only(&window, "stun off", &with_public);
+        sub_switches(&window, "stun off", Some((false, true)));
+        assert_eq!(
+            click(&mut window, connection::STUN_SWITCH),
+            vec![Action::SaveSettings(SettingsChange::Stun(true))]
+        );
+        let mut model = at_rest();
+        model.settings.router = false;
+        let mut window = open(model);
+        says_only(&window, "router off", &with_public);
+        sub_switches(&window, "router off", Some((true, false)));
+        assert_eq!(
+            click(&mut window, connection::ROUTER_SWITCH),
+            vec![Action::SaveSettings(SettingsChange::RouterMapping(true))]
+        );
+
+        // Off: every session through Tor, the sub-switches hidden.
+        let mut model = at_rest();
+        model.settings.direct = false;
+        let mut window = open(model);
+        assert_eq!(
+            switch(&window, connection::DIRECT_SWITCH_INTERNET)
+                .unwrap()
+                .toggled(),
+            Some(Toggled::False)
+        );
+        says_only(&window, "off", &[connection::DIRECT_OFF]);
+        sub_switches(&window, "off", None);
+        assert_eq!(
+            click(&mut window, connection::DIRECT_SWITCH_INTERNET),
+            vec![Action::SaveSettings(SettingsChange::Direct(true))]
+        );
+
+        // A bridge in use: the switches as saved, and why it is off anyway.
+        let mut model = at_rest();
+        model.settings.bridged_off = true;
+        let window = open(model);
+        assert_eq!(
+            switch(&window, connection::DIRECT_SWITCH_INTERNET)
+                .unwrap()
+                .toggled(),
+            Some(Toggled::True)
+        );
+        let mut bridged = on_lines.to_vec();
+        bridged.push(connection::BRIDGE_NOTE);
+        says_only(&window, "bridged", &bridged);
+        sub_switches(&window, "bridged", Some((true, true)));
+
+        // lan_only: on and disabled, its note, no sub-switch.
+        let mut model = at_rest();
+        model.settings.lan_only = true;
+        let mut window = open(model);
+        let shown = switch(&window, connection::DIRECT_SWITCH_INTERNET).expect("the switch");
+        assert_eq!(shown.toggled(), Some(Toggled::True));
+        assert!(shown.is_disabled());
+        says_only(&window, "lan_only", &[connection::LAN_ONLY_NOTE]);
+        sub_switches(&window, "lan_only", None);
+        assert!(
+            click(&mut window, connection::DIRECT_SWITCH_INTERNET).is_empty(),
+            "nothing to save"
+        );
+
+        // Shared: the hidden card instead of every switch.
+        let mut model = at_rest();
+        model.hosted_elsewhere = true;
+        let window = open(model);
+        for label in [
+            connection::DIRECT_SWITCH_INTERNET,
+            connection::STUN_SWITCH,
+            connection::ROUTER_SWITCH,
+        ] {
+            assert!(switch(&window, label).is_none(), "{label}");
+            assert!(!has_text(&window, label), "{label}");
+        }
         assert!(has_text(&window, HIDDEN_WHILE_SHARED));
     }
 

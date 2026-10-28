@@ -366,6 +366,12 @@ async fn run_host(
     source: Source,
 ) -> anyhow::Result<()> {
     let knobs = direct.knobs.clone();
+    let router = direct.router.clone();
+    // The STUN names' refresh follows the knobs (design `direct` §5.3): now,
+    // and again once Tor has said whether it uses a bridge.
+    if let Some(router) = &router {
+        router.follow_stun(&knobs, crate::direct::HOST);
+    }
     let prompter = Prompter::stdin();
     if prompter.is_none() {
         eprintln!("{}", crate::host::NO_TERMINAL_LINE);
@@ -426,6 +432,15 @@ async fn run_host(
     // `network.direct_with_bridges` (decision M1-86): set before the onion
     // service is published, so no accept is signed without it.
     knobs.bootstrapped(node.rung(), &cfg.tor);
+    if let Some(router) = &router {
+        router.follow_stun(&knobs, crate::direct::HOST);
+    }
+    // What an accept reveals from now on (design `direct` §3.5).
+    if let Some(line) =
+        crate::direct::notice_line(knobs.transport.get(), tornect_session::INTERNET_DIRECT)
+    {
+        crate::host::say(format_args!("{line}"));
+    }
     if node.rung() == tornect_signal::tor::Rung::Snowflake {
         // SLICE-A1 A1-7, kept as a warning rather than a refusal: in a censored
         // network where obfs4 is blocked too, Snowflake is the only way to host.
@@ -1049,11 +1064,23 @@ async fn run_connect(
     opts: ConnectOpts,
     prepared: Option<Prepared>,
 ) -> anyhow::Result<()> {
+    // The STUN names' refresh follows the knobs (design `direct` §5.3), now
+    // and once Tor has said whether it uses a bridge; for a session that may
+    // go direct only: one paired only, without media or relayed by
+    // `--tor-only` asks no STUN server.
+    let stun = opts.video && !opts.tor_only && !opts.pair_only;
+    let follow_stun = || {
+        if let (true, Some(router)) = (stun, &direct.router) {
+            router.follow_stun(&direct.knobs, crate::direct::VIEWER);
+        }
+    };
+    follow_stun();
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
     // The bridge rule from the way Tor went in (decision M1-86), before the
     // session decides its path.
     direct.knobs.bootstrapped(node.rung(), &cfg.tor);
+    follow_stun();
     let result = connect_session(&node, cfg, paths, id, direct, pins, opts, prepared).await;
     node.shutdown().await;
     result

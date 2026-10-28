@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -17,8 +18,8 @@ use tornect_core::config::{self, BridgeMode, Network};
 use tornect_core::session_log::{SessionEvent, SessionLog, SessionRecord, TransportKind};
 use tornect_core::{Config, DeviceIdentity, Paths};
 use tornect_net::{
-    AddrClass, CandidateKind, IfaceAddr, IfaceKind, MapEvent, MapEvents, NetEnv, RealNet,
-    RouteSources, SHUTDOWN_RELEASE_WAIT,
+    AddrClass, CandidateKind, IfaceAddr, IfaceKind, MapEvent, MapEvents, MappingLedger, NetEnv,
+    RealNet, RouteSources, SHUTDOWN_RELEASE_WAIT, TornectRole,
 };
 use tornect_session::{DirectSettings, INTERNET_DIRECT, Mine, PathEnd, ViewerDirect};
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
@@ -115,6 +116,9 @@ pub struct RouterPorts {
     log: Arc<RouterPortLog>,
     /// Whether the sweep was started.
     swept: Arc<AtomicBool>,
+    /// The STUN names the running refresh started with
+    /// ([`RouterPorts::follow_stun`]); `None` before it starts.
+    stun: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl RouterPorts {
@@ -138,6 +142,7 @@ impl RouterPorts {
             )),
             log,
             swept: Arc::new(AtomicBool::new(false)),
+            stun: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -169,6 +174,45 @@ impl RouterPorts {
     /// started it.
     pub fn not_hosting(&self) {
         self.sweep();
+    }
+
+    /// The background refresh of the STUN servers' names follows `knobs`
+    /// (design `direct` §5.3, [`RealNet::prefetch`]): it starts at the
+    /// first call, and starts again, with a round at once, whenever the
+    /// names [`stun_names`] gives for `roles` changed since the refresh
+    /// started. The app calls it at start, after each Tor bootstrap (the
+    /// bridge state) and after each settings save: a refresh that kept
+    /// running would leave a cleared cache cold, and a newly listed name
+    /// unanswered, until its next round, 10 minutes on. Each round reads
+    /// the knobs again; while no session may ask a STUN server the list is
+    /// empty, so nothing is looked up and the cache is emptied. Whether a
+    /// refresh was started (never outside a tokio runtime).
+    pub fn follow_stun(&self, knobs: &DirectKnobs, roles: &'static [TornectRole]) -> bool {
+        self.follow_stun_in(knobs, roles, INTERNET_DIRECT)
+    }
+
+    /// [`follow_stun`](Self::follow_stun) for a build whose direct
+    /// connections reach the internet (`internet`) or not.
+    fn follow_stun_in(
+        &self,
+        knobs: &DirectKnobs,
+        roles: &'static [TornectRole],
+        internet: bool,
+    ) -> bool {
+        let names = stun_names(knobs, roles, internet);
+        let mut started = self.stun.lock().unwrap_or_else(PoisonError::into_inner);
+        if started.as_ref() == Some(&names) {
+            return false;
+        }
+        let knobs = knobs.clone();
+        if !self
+            .net
+            .prefetch(move || stun_names(&knobs, roles, internet))
+        {
+            return false;
+        }
+        *started = Some(names);
+        true
     }
 
     /// The removal of the mappings an earlier run left begins in the
@@ -209,6 +253,42 @@ impl std::fmt::Debug for RouterPorts {
             .field("log", &self.log)
             .finish_non_exhaustive()
     }
+}
+
+/// The roles of a process that only connects (`connect`).
+pub const VIEWER: &[TornectRole] = &[TornectRole::Viewer];
+
+/// The roles of a process that only hosts (`host`).
+pub const HOST: &[TornectRole] = &[TornectRole::Host];
+
+/// The roles of a window that hosts and connects.
+pub const BOTH: &[TornectRole] = &[TornectRole::Viewer, TornectRole::Host];
+
+/// The STUN servers' names this process looks up ahead of its sessions
+/// (design `direct` §5.3): the parts of `network.stun_servers` its `roles`
+/// ask ([`tornect_net::partition`]), in order, each once, while a session
+/// may ask a STUN server at all: a build whose direct connections reach the
+/// internet (`internet`: [`INTERNET_DIRECT`] outside tests), the effective
+/// policy `Any` (direct connections on, no bridge in use without its
+/// override, not `lan_only`) and `enable_stun`. Otherwise none.
+#[must_use]
+pub fn stun_names(knobs: &DirectKnobs, roles: &[TornectRole], internet: bool) -> Vec<String> {
+    if !internet || knobs.transport.get() != TransportPolicy::Any {
+        return Vec::new();
+    }
+    let options = knobs.direct.get();
+    if !options.enable_stun {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = Vec::new();
+    for role in roles {
+        for entry in options.gather(*role).stun_partition.iter() {
+            if !names.contains(entry) {
+                names.push(entry.clone());
+            }
+        }
+    }
+    names
 }
 
 /// `run`, then the end of the router mappings' lifecycle
@@ -537,6 +617,19 @@ pub fn session_route_line(session_id: &str, route: TransportKind) -> String {
     format!("SESSION ROUTE {session_id} {route}")
 }
 
+/// The `host` command's line at its start (design `direct` §3.5) while
+/// `policy`, the effective one once Tor has said how it reaches the
+/// network, lets every accepted session learn this computer's IP address:
+/// in a build whose direct connections reach the internet (`internet`), the
+/// policy `Any`. None otherwise.
+#[must_use]
+pub fn notice_line(policy: TransportPolicy, internet: bool) -> Option<&'static str> {
+    (internet && policy == TransportPolicy::Any).then_some(
+        "NOTICE direct connections are on: a computer you accept learns this computer's IP \
+         address (set network.paranoid = true to relay every session through Tor)",
+    )
+}
+
 /// The viewer's `ROUTE` line (design `direct` §3.5): `ROUTE direct lan`,
 /// `ROUTE tor <reason>`, `ROUTE none`, `ROUTE none no-lan-path`, ...
 #[must_use]
@@ -629,16 +722,78 @@ pub fn network_line(addrs: &[IfaceAddr], sources: &RouteSources) -> String {
     line
 }
 
-/// `doctor`'s direct-path lines (design `direct` §3.5, Phase A): the state
-/// of direct connections for `cfg` (the bridge expected from `last_good`),
-/// then the kinds of address this computer has. The interfaces are read as
-/// a session reads them, at most one second; nothing is sent.
+/// Whether a session of this computer may reach beyond the same site
+/// with `network` (design `direct` §4): a build whose direct connections
+/// reach the internet (`internet`), and the policy `Any` with the bridge
+/// state `bridged`. Only then is a STUN server or the router asked.
 #[must_use]
-pub fn doctor_lines(cfg: &Config, last_good: Option<Rung>) -> Vec<String> {
-    let mut lines = vec![direct_line(
-        &cfg.network,
-        bridged_expected(&cfg.tor, last_good),
+fn internet_scope(network: &Network, bridged: bool, internet: bool) -> bool {
+    let knob = TransportKnob::new(network);
+    knob.set_bridged(bridged);
+    internet && knob.get() == TransportPolicy::Any
+}
+
+/// `doctor`'s `public STUN servers:` lines (design `direct` §3.5): on, with
+/// the length of the list, while a session may ask one (`internet`: see
+/// [`internet_scope`]) and `enable_stun` with a list; off otherwise. A list
+/// that is not the default adds that the operator split holds only when
+/// both computers use the same list (decision M1-81). No server is named.
+#[must_use]
+pub fn stun_lines(network: &Network, internet: bool) -> Vec<String> {
+    if !internet || !network.enable_stun || network.stun_servers.is_empty() {
+        return vec!["public STUN servers: off".to_owned()];
+    }
+    let mut lines = vec![format!(
+        "public STUN servers: on, {} in the list, one asked per session",
+        network.stun_servers.len()
     )];
+    if network.stun_servers != Network::default().stun_servers {
+        lines.push(
+            "public STUN servers: not the default list; one operator may be asked by both \
+             computers of a session unless both use the same list"
+                .to_owned(),
+        );
+    }
+    lines
+}
+
+/// `doctor`'s `router port mapping:` line (design `direct` §3.5): each
+/// protocol on while a session may ask the router (`internet`: see
+/// [`internet_scope`]) and its switch is on.
+#[must_use]
+pub fn router_line(network: &Network, internet: bool) -> String {
+    let state = |on: bool| if internet && on { "on" } else { "off" };
+    format!(
+        "router port mapping: UPnP {}, NAT-PMP {}, PCP {}",
+        state(network.upnp),
+        state(network.nat_pmp),
+        state(network.pcp)
+    )
+}
+
+/// `doctor`'s `router ports left from an earlier run:` line (design
+/// `direct` §3.5), only when there are any: `count` entries of the router
+/// ledger whose process is gone, which the next start removes.
+#[must_use]
+pub fn leftover_line(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("router ports left from an earlier run: {count}"))
+}
+
+/// `doctor`'s direct-path lines (design `direct` §3.5): the state of
+/// direct connections for `cfg` (the bridge expected from `last_good`),
+/// whether a session asks a public STUN server and the router, the
+/// mappings an earlier run left in the ledger in `router_dir`, then the
+/// kinds of address this computer has. The interfaces are read as a
+/// session reads them, at most one second; nothing is sent, and no
+/// address, port or server is printed.
+#[must_use]
+pub fn doctor_lines(cfg: &Config, last_good: Option<Rung>, router_dir: &Path) -> Vec<String> {
+    let bridged = bridged_expected(&cfg.tor, last_good);
+    let internet = internet_scope(&cfg.network, bridged, INTERNET_DIRECT);
+    let mut lines = vec![direct_line(&cfg.network, bridged)];
+    lines.extend(stun_lines(&cfg.network, internet));
+    lines.push(router_line(&cfg.network, internet));
+    lines.extend(leftover_line(MappingLedger::leftovers(router_dir)));
     let read = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -781,6 +936,30 @@ mod tests {
         );
     }
 
+    /// Design `direct` §3.5: `host` says at its start that an accepted
+    /// computer learns this computer's IP address, in a build whose direct
+    /// connections reach the internet and while the policy is `Any` only.
+    #[test]
+    fn the_host_notice_is_said_only_while_an_accept_reveals_the_ip_address() {
+        assert_eq!(
+            notice_line(TransportPolicy::Any, true),
+            Some(
+                "NOTICE direct connections are on: a computer you accept learns this \
+                 computer's IP address (set network.paranoid = true to relay every session \
+                 through Tor)"
+            )
+        );
+        for (policy, internet) in [
+            (TransportPolicy::Any, false),
+            (TransportPolicy::TorOnly, true),
+            (TransportPolicy::LanOnly, true),
+            (TransportPolicy::TorOnly, false),
+            (TransportPolicy::LanOnly, false),
+        ] {
+            assert_eq!(notice_line(policy, internet), None, "{policy:?} {internet}");
+        }
+    }
+
     /// Design `direct` §3.5: the `ROUTE` and `PATH` lines as the design
     /// words them.
     #[test]
@@ -793,9 +972,19 @@ mod tests {
             same_site: true,
             ipv6: true,
         };
+        let internet = Route {
+            same_site: false,
+            ipv6: false,
+        };
+        let internet6 = Route {
+            same_site: false,
+            ipv6: true,
+        };
         for (end, line) in [
             (PathEnd::Direct(lan), "ROUTE direct lan"),
             (PathEnd::Direct(lan6), "ROUTE direct lan ipv6"),
+            (PathEnd::Direct(internet), "ROUTE direct internet"),
+            (PathEnd::Direct(internet6), "ROUTE direct internet ipv6"),
             (PathEnd::Tor(TorWhy::OldHost), "ROUTE tor old-host"),
             (
                 PathEnd::Tor(TorWhy::Fallback(FallbackWhy::NoPath { heard: true })),
@@ -935,19 +1124,229 @@ mod tests {
     }
 
     /// `doctor` reads this machine's interfaces as a session does and
-    /// prints kinds only: two lines, the second `network:`.
+    /// prints kinds only: the direct connections, STUN and router lines,
+    /// then `network:`; with a router ledger an earlier run left, the count
+    /// of its ports before `network:`.
     #[test]
     fn doctor_reads_this_machine_without_naming_an_address() {
-        let lines = doctor_lines(&Config::default(), None);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("router-ports");
+        let lines = doctor_lines(&Config::default(), None, &dir);
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].starts_with("direct connections: "), "{lines:?}");
-        assert!(lines[1].starts_with("network: "), "{lines:?}");
+        assert!(lines[1].starts_with("public STUN servers: "), "{lines:?}");
+        assert!(lines[2].starts_with("router port mapping: "), "{lines:?}");
+        assert!(lines[3].starts_with("network: "), "{lines:?}");
         assert!(
-            !lines[1]
+            !lines[3]
                 .chars()
                 .any(|c| c.is_ascii_digit() && !"46".contains(c)),
             "only IPv4 and IPv6 may carry a digit: {lines:?}"
         );
+
+        // A process that died holding two mappings: its list, its lock
+        // file free.
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = tornect_net::LedgerEntry {
+            via: tornect_net::MapVia::Pcp,
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            client: Ipv4Addr::new(192, 168, 1, 20),
+            internal_port: 40000,
+            external_port: None,
+            pcp_nonce: Some([1, 2, 3]),
+            created: tornect_net::mapping::unix_now(),
+        };
+        let owner = "0123456789abcdef";
+        std::fs::write(
+            dir.join(format!("{owner}.cbor")),
+            tornect_net::mapping::encode_list(&[entry.clone(), entry]),
+        )
+        .unwrap();
+        std::fs::write(dir.join(format!("{owner}.lock")), b"").unwrap();
+        let lines = doctor_lines(&Config::default(), None, &dir);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[3], "router ports left from an earlier run: 2");
+        for line in &lines {
+            for named in ["192.168", "40000"] {
+                assert!(!line.contains(named), "{line}");
+            }
+        }
+    }
+
+    /// Design `direct` §3.5: `doctor`'s STUN and router lines say what a
+    /// session does: on only in a build whose direct connections reach the
+    /// internet, while the policy is `Any` (not paranoid, no bridge in use
+    /// without the override, not `lan_only`), each by its own switch; the
+    /// STUN line counts the list and names no server, and a list that is
+    /// not the default says the operator split needs the same list on both
+    /// computers. The leftover line shows only when there are some.
+    #[test]
+    fn doctor_says_whether_stun_servers_and_the_router_are_asked() {
+        let net = Network::default();
+        let n = net.stun_servers.len();
+        let on = format!("public STUN servers: on, {n} in the list, one asked per session");
+        let all_on = "router port mapping: UPnP on, NAT-PMP on, PCP on";
+        let all_off = "router port mapping: UPnP off, NAT-PMP off, PCP off";
+        assert_eq!(stun_lines(&net, true), vec![on.clone()]);
+        assert_eq!(router_line(&net, true), all_on);
+        // Not an internet build: neither is asked.
+        assert_eq!(stun_lines(&net, false), vec!["public STUN servers: off"]);
+        assert_eq!(router_line(&net, false), all_off);
+        assert!(internet_scope(&net, false, true));
+        assert!(!internet_scope(&net, false, false));
+        // Every policy but Any keeps both off.
+        let mut paranoid = net.clone();
+        paranoid.paranoid = true;
+        let mut lan = net.clone();
+        lan.lan_only = true;
+        for (case, network, bridged) in [
+            ("paranoid", &paranoid, false),
+            ("lan_only", &lan, false),
+            ("a bridge", &net, true),
+        ] {
+            assert!(!internet_scope(network, bridged, true), "{case}");
+        }
+        let mut overridden = net.clone();
+        overridden.direct_with_bridges = true;
+        assert!(internet_scope(&overridden, true, true));
+        // Each switch by itself.
+        let mut off = net.clone();
+        off.enable_stun = false;
+        assert_eq!(stun_lines(&off, true), vec!["public STUN servers: off"]);
+        off.enable_stun = true;
+        off.stun_servers.clear();
+        assert_eq!(stun_lines(&off, true), vec!["public STUN servers: off"]);
+        let mut router = net.clone();
+        router.nat_pmp = false;
+        assert_eq!(
+            router_line(&router, true),
+            "router port mapping: UPnP on, NAT-PMP off, PCP on"
+        );
+        router.upnp = false;
+        router.pcp = false;
+        assert_eq!(router_line(&router, true), all_off);
+        // An edited list: counted, its condition said, no server named.
+        let mut edited = net.clone();
+        edited
+            .stun_servers
+            .insert(0, "stun.example.org:3478".to_owned());
+        let lines = stun_lines(&edited, true);
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "public STUN servers: on, {} in the list, one asked per session",
+                    n + 1
+                ),
+                "public STUN servers: not the default list; one operator may be asked by both \
+                 computers of a session unless both use the same list"
+                    .to_owned(),
+            ]
+        );
+        for line in lines.iter().chain(stun_lines(&net, true).iter()) {
+            assert!(
+                !line.contains("example") && !line.contains("google"),
+                "{line}"
+            );
+        }
+        assert_eq!(leftover_line(0), None);
+        assert_eq!(
+            leftover_line(3).as_deref(),
+            Some("router ports left from an earlier run: 3")
+        );
+    }
+
+    /// Design `direct` §5.3: the STUN names looked up ahead of the
+    /// sessions are those of the roles this process plays, each once, only
+    /// while a session may ask a STUN server: an internet build, the policy
+    /// `Any` and `enable_stun`. Otherwise none, which empties the cache.
+    #[test]
+    fn the_stun_names_follow_the_roles_and_the_knobs() {
+        let mut cfg = Config::default();
+        cfg.network.stun_servers = [
+            "stun.a.example:3478",
+            "stun2.a.example:3478",
+            "stun.b.example:3478",
+            "stun.c.example:3478",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let knobs = DirectKnobs::new(&cfg);
+        let viewer = tornect_net::partition(&cfg.network.stun_servers, TornectRole::Viewer);
+        let host = tornect_net::partition(&cfg.network.stun_servers, TornectRole::Host);
+        assert_eq!(stun_names(&knobs, VIEWER, true), viewer);
+        assert_eq!(stun_names(&knobs, HOST, true), host);
+        let both = stun_names(&knobs, BOTH, true);
+        assert_eq!(both.len(), 4, "{both:?}");
+        for entry in &cfg.network.stun_servers {
+            assert_eq!(both.iter().filter(|e| *e == entry).count(), 1, "{entry}");
+        }
+        assert!(stun_names(&knobs, BOTH, false).is_empty());
+        // Every rule that keeps STUN from a session keeps the names.
+        type Case = (&'static str, fn(&mut Config));
+        let quiet: [Case; 4] = [
+            ("enable_stun off", |c| c.network.enable_stun = false),
+            ("paranoid", |c| c.network.paranoid = true),
+            ("lan_only", |c| c.network.lan_only = true),
+            ("a bridge", |c| c.tor.bridges = BridgeMode::Snowflake),
+        ];
+        for (case, set) in quiet {
+            let mut cfg = cfg.clone();
+            set(&mut cfg);
+            assert!(
+                stun_names(&DirectKnobs::new(&cfg), BOTH, true).is_empty(),
+                "{case}"
+            );
+        }
+        // A bridge Tor went in by after the start.
+        knobs.bootstrapped(Rung::Obfs4, &cfg.tor);
+        assert!(stun_names(&knobs, BOTH, true).is_empty());
+        knobs.bootstrapped(Rung::Direct, &cfg.tor);
+        assert_eq!(stun_names(&knobs, VIEWER, true), viewer);
+    }
+
+    /// Design `direct` §5.3 and the review of steps B2 and B3: the refresh
+    /// starts at the first call, again whenever the names changed (a save,
+    /// a bootstrap through a bridge, the other way back), and not for a call
+    /// that changes nothing; outside a tokio runtime nothing starts. The
+    /// list holds IP literals only, which are never looked up: nothing goes
+    /// to a resolver.
+    #[tokio::test]
+    async fn the_stun_refresh_starts_again_whenever_its_names_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let ports = RouterPorts::new(&paths);
+        let mut cfg = Config::default();
+        cfg.network.stun_servers =
+            vec!["192.0.2.1:3478".to_owned(), "198.51.100.1:3478".to_owned()];
+        let knobs = DirectKnobs::new(&cfg);
+        assert!(ports.follow_stun_in(&knobs, BOTH, true), "the first call");
+        assert!(!ports.follow_stun_in(&knobs, BOTH, true), "nothing changed");
+        // A save that turns STUN off: an empty list, started again.
+        let mut off = cfg.network.clone();
+        off.enable_stun = false;
+        knobs.set_from(&off);
+        assert!(ports.follow_stun_in(&knobs, BOTH, true));
+        assert!(!ports.follow_stun_in(&knobs, BOTH, true));
+        knobs.set_from(&cfg.network);
+        assert!(ports.follow_stun_in(&knobs, BOTH, true), "on again");
+        // A bootstrap through a bridge, then plain Tor again.
+        knobs.bootstrapped(Rung::Obfs4, &cfg.tor);
+        assert!(ports.follow_stun_in(&knobs, BOTH, true));
+        knobs.bootstrapped(Rung::Direct, &cfg.tor);
+        assert!(ports.follow_stun_in(&knobs, BOTH, true));
+        assert!(!ports.follow_stun_in(&knobs, BOTH, true));
+        assert!(ports.net().stun_dns().is_empty(), "no literal is cached");
+        // Outside a runtime nothing starts, and the next call in one does.
+        let other = RouterPorts::new(&paths);
+        let (other, started) = std::thread::spawn(move || {
+            let started = other.follow_stun_in(&DirectKnobs::new(&Config::default()), BOTH, true);
+            (other, started)
+        })
+        .join()
+        .unwrap();
+        assert!(!started);
+        assert!(other.follow_stun(&knobs, BOTH));
     }
 
     /// How long a test waits for the router lines' writer.

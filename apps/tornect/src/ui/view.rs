@@ -13,14 +13,12 @@ use tornect_core::levels::{
 };
 use tornect_core::unattended::ipc::ShownLink;
 use tornect_core::words::{Identicon, label_refusal};
-use tornect_session::INTERNET_DIRECT;
-use tornect_signal::consent::TransportPolicy;
 use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 use super::model::{
-    BlockRequest, Confirm, ManagerOp, Model, Popup, PopupKind, Prompt, Recognition, RotateFailed,
-    SettingsChange, Sharing, SheetLevels,
+    BlockRequest, Confirm, ManagerOp, Model, Popup, PopupKind, Prompt, Recognition, Reveals,
+    RotateFailed, SettingsChange, Sharing, SheetLevels,
 };
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, StreamInfo, TorState, Viewing};
@@ -721,6 +719,17 @@ pub fn main_window(
                     });
                 }
             }
+            // The one-time notice that direct connections are on (design
+            // `direct` §3.6), under the questions and the prompt, above the
+            // page. It waits while either is up, and while this screen is
+            // shared: its switch saves a setting, which is refused then.
+            // Without it the page's widgets keep the ids they always had;
+            // with it they move by one until its OK, once.
+            if model.direct_notice && !asking && model.prompt.is_none() && !model.screen_shared(now)
+            {
+                direct_notice(ui, model, actions);
+                ui.add_space(12.0);
+            }
             egui::ScrollArea::vertical()
                 .id_salt("page")
                 .auto_shrink(false)
@@ -747,6 +756,56 @@ pub fn main_window(
     if !model.popups.is_empty() || model.confirm.is_some() || !model.sharing.is_empty() {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
+}
+
+/// The one-time notice after the upgrade to direct connections across the
+/// internet (design `direct` §3.6): shown from the window's start while it
+/// is due (`Settings::direct_notice_due`), since a saved `network.paranoid =
+/// false` cannot be told apart from a deliberate choice.
+pub(super) const DIRECT_NOTICE: &str = "Direct connections are on. After a session is accepted, \
+    the two computers try to connect directly, which is faster, and each learns the other's IP \
+    address. To keep your IP address hidden from the computers you connect to, turn this off.";
+
+/// The notice's card: [`DIRECT_NOTICE`], the direct connections switch as
+/// Settings, Connection has it, and OK, which records that it was seen.
+fn direct_notice(ui: &mut egui::Ui, model: &Model, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
+    let width = ui.available_width().min(SHEET_WIDTH);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        widgets::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(RichText::new(DIRECT_NOTICE).color(t.text_primary))
+                    .wrap()
+                    .selectable(false),
+            );
+            ui.add_space(8.0);
+            let label = pages::direct_switch(model.settings.internet);
+            let mut on = model.settings.direct;
+            ui.horizontal_top(|ui| {
+                if widgets::toggle(ui, &mut on, label).clicked() {
+                    actions.push(Action::SaveSettings(SettingsChange::Direct(on)));
+                }
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(label)
+                            .font(theme::font(ui.ctx(), Face::Medium, 14.0))
+                            .color(t.text_primary),
+                    )
+                    .wrap()
+                    .selectable(false),
+                );
+            });
+            ui.add_space(8.0);
+            if widgets::Button::new(widgets::Kind::Primary, "OK")
+                .show(ui)
+                .clicked()
+            {
+                actions.push(Action::SaveSettings(SettingsChange::DirectNoticeSeen));
+            }
+        });
+    });
 }
 
 /// The id of the prompt's password field.
@@ -1041,7 +1100,7 @@ fn request_sheet(
                         paired_recently: model.paired_recently.contains(&popup.id),
                         screens: model.sheet_screens.get(&popup.id).copied().unwrap_or(1),
                         services: services.as_deref(),
-                        direct: model.settings.direct_policy() != TransportPolicy::TorOnly,
+                        direct: model.settings.reveals(),
                     };
                     let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
                     Some((popup.id, card))
@@ -1156,24 +1215,24 @@ fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
 }
 
 /// The session sheet's line while an accept may let the session connect
-/// directly (design `direct` §3.6, \[SEC\]; Phase A: the local address,
-/// the internet address once internet direct connections exist): what
-/// `label` then learns, and where to turn it off.
+/// directly (design `direct` §3.6, \[SEC\]): what `label` then learns
+/// (`reveals`: the local address on the same site only, the internet
+/// address where direct connections reach the internet), and where to turn
+/// it off.
 #[must_use]
-pub fn direct_consent_line(label: &str) -> String {
-    let what = if INTERNET_DIRECT {
-        "internet address"
-    } else {
-        "local address"
+pub fn direct_consent_line(label: &str, reveals: Reveals) -> String {
+    let what = match reveals {
+        Reveals::Local => "local address",
+        Reveals::Internet => "internet address",
     };
     format!("Accepting also lets \"{label}\" learn this computer's {what} (Settings > Connection).")
 }
 
-fn direct_line(ui: &mut egui::Ui, label: &str) {
+fn direct_line(ui: &mut egui::Ui, label: &str, reveals: Reveals) {
     let t = theme::tokens(ui.ctx());
     ui.add(
         egui::Label::new(
-            RichText::new(direct_consent_line(label))
+            RichText::new(direct_consent_line(label, reveals))
                 .small()
                 .color(t.text_muted),
         )
@@ -1585,10 +1644,10 @@ struct Sheet<'a> {
     /// under an "Ask before starting" sheet's when the session may be
     /// control.
     services: Option<&'a str>,
-    /// An accept may let the session connect directly (design `direct`
-    /// §3.6: the policy the host signs is not Tor only): the sheet says what
-    /// the other computer then learns.
-    direct: bool,
+    /// What an accept may let the other computer learn of this computer's
+    /// addresses (design `direct` §3.6: the policy the host signs is not Tor
+    /// only): the sheet says it. `None` while every session is relayed.
+    direct: Option<Reveals>,
 }
 
 /// The arming card of session sheet `id`'s administrator confirmation: its
@@ -1815,8 +1874,8 @@ fn host_popup(
             });
             if sheet.confirming && confirmable {
                 admin_confirmation(ui, popup.id, label, form, now, actions, left);
-                if sheet.direct {
-                    direct_line(ui, label);
+                if let Some(reveals) = sheet.direct {
+                    direct_line(ui, label, reveals);
                 }
                 if let Some(line) = sheet.services {
                     services_answer_line(ui, line);
@@ -1847,8 +1906,8 @@ fn host_popup(
                 .wrap()
                 .selectable(false),
             );
-            if sheet.direct {
-                direct_line(ui, label);
+            if let Some(reveals) = sheet.direct {
+                direct_line(ui, label, reveals);
             }
             // Without levels (a sheet from before them): the three answers.
             let answers = sheet.levels.map_or(
@@ -3817,48 +3876,145 @@ mod tests {
 
     /// Design `direct` §3.6 [SEC]: while an accept may let the session
     /// connect directly (this computer's policy is not Tor only: direct
-    /// connections on, or `lan_only`), the session sheet says that the
-    /// asking device then learns this computer's local address (Phase A),
-    /// under the request and again under the administrator confirmation;
-    /// with direct connections off, or a bridge in use, it says nothing of
-    /// it.
+    /// connections on, or `lan_only`), the session sheet says what the
+    /// asking device then learns, under the request and again under the
+    /// administrator confirmation: this computer's internet address where
+    /// direct connections reach the internet (Phase B), its local address
+    /// under `lan_only` or in a build whose direct connections stay on the
+    /// local network (Phase A). With direct connections off, or a bridge in
+    /// use, it says nothing of it.
     #[test]
     fn the_session_sheet_says_what_an_accept_discloses_on_a_direct_path() {
         let t0 = Instant::now();
-        let line = direct_consent_line("Laptop");
+        let local = direct_consent_line("Laptop", Reveals::Local);
         assert_eq!(
-            line,
+            local,
             "Accepting also lets \"Laptop\" learn this computer's local address (Settings > \
              Connection)."
         );
-        // A name, the settings, whether the line is said.
-        type Case = (&'static str, fn(&mut Model), bool);
-        let cases: [Case; 4] = [
-            ("direct on", |_| {}, true),
-            ("lan_only", |m| m.settings.lan_only = true, true),
-            ("direct off", |m| m.settings.direct = false, false),
-            ("a bridge in use", |m| m.settings.bridged_off = true, false),
+        let internet = direct_consent_line("Laptop", Reveals::Internet);
+        assert_eq!(
+            internet,
+            "Accepting also lets \"Laptop\" learn this computer's internet address (Settings > \
+             Connection)."
+        );
+        // A name, the settings, the line said in each build (local network
+        // only, internet).
+        type Case<'a> = (&'static str, fn(&mut Model), [Option<&'a String>; 2]);
+        let cases: [Case<'_>; 4] = [
+            ("direct on", |_| {}, [Some(&local), Some(&internet)]),
+            (
+                "lan_only",
+                |m| m.settings.lan_only = true,
+                [Some(&local), Some(&local)],
+            ),
+            ("direct off", |m| m.settings.direct = false, [None, None]),
+            (
+                "a bridge in use",
+                |m| m.settings.bridged_off = true,
+                [None, None],
+            ),
         ];
         for (case, set, said) in cases {
-            let mut model = with_popups(vec![session_popup(7, t0)]);
-            set(&mut model);
+            for (internet_build, said) in [false, true].into_iter().zip(said) {
+                let case = format!("{case} {internet_build}");
+                let prepare = |model: &mut Model| {
+                    model.settings.internet = internet_build;
+                    set(model);
+                };
+                let mut model = with_popups(vec![session_popup(7, t0)]);
+                prepare(&mut model);
+                let window = Harness::new(model, t0);
+                assert!(
+                    window
+                        .texts()
+                        .iter()
+                        .any(|t| t.starts_with("\"Laptop\" wants to see ")),
+                    "{case}"
+                );
+                for line in [&local, &internet] {
+                    assert_eq!(
+                        window.texts().contains(line),
+                        said == Some(line),
+                        "{case}: {line}"
+                    );
+                }
+                // Under the administrator confirmation too.
+                let mut model = with_popups(vec![session_popup(7, t0)]);
+                prepare(&mut model);
+                model.levels.insert(7, always_admin());
+                model.admin_confirm.insert(7);
+                let window = Harness::new(model, t0);
+                assert!(window.has("Allow as administrator"), "{case}");
+                for line in [&local, &internet] {
+                    assert_eq!(
+                        window.texts().contains(line),
+                        said == Some(line),
+                        "{case}: confirming: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Design `direct` §3.6: the one-time notice says that direct
+    /// connections are on and what each computer learns, with the direct
+    /// switch (saving `Direct(..)`) and OK (saving `DirectNoticeSeen`). It
+    /// shows while its latch is up only, and waits under a question and
+    /// while this screen is shared, where a save would be refused.
+    #[test]
+    fn the_direct_notice_says_what_an_accept_reveals_until_its_ok() {
+        let t0 = Instant::now();
+        assert_eq!(
+            DIRECT_NOTICE,
+            "Direct connections are on. After a session is accepted, the two computers try to \
+             connect directly, which is faster, and each learns the other's IP address. To keep \
+             your IP address hidden from the computers you connect to, turn this off."
+        );
+        let notice = DIRECT_NOTICE.to_owned();
+        let switch = pages::direct_switch(true);
+        let mut model = with_popups(Vec::new());
+        model.settings.internet = true;
+        model.direct_notice = true;
+        let mut window = Harness::new(model.clone(), t0);
+        assert!(window.texts().contains(&notice), "{:?}", window.texts());
+        assert!(window.has(switch));
+        let at = window.button(switch);
+        assert_eq!(
+            window.click(t0, at),
+            vec![Action::SaveSettings(SettingsChange::Direct(false))]
+        );
+        let at = window.button("OK");
+        assert_eq!(
+            window.click(t0, at),
+            vec![Action::SaveSettings(SettingsChange::DirectNoticeSeen)]
+        );
+        // Off already (the switch was turned off from the notice): the
+        // switch says so and turns it on again.
+        let mut off = model.clone();
+        off.settings.direct = false;
+        let mut window = Harness::new(off, t0);
+        assert!(window.texts().contains(&notice));
+        let at = window.button(switch);
+        assert_eq!(
+            window.click(t0, at),
+            vec![Action::SaveSettings(SettingsChange::Direct(true))]
+        );
+        // Without its latch, under a question, and while shared: nothing.
+        let mut cases: Vec<(&str, Model)> = Vec::new();
+        let mut down = model.clone();
+        down.direct_notice = false;
+        cases.push(("no latch", down));
+        let mut asking = model.clone();
+        asking.popups = vec![session_popup(7, t0)];
+        cases.push(("a question", asking));
+        let mut shared = model.clone();
+        shared.hosted_elsewhere = true;
+        cases.push(("shared", shared));
+        for (case, model) in cases {
             let window = Harness::new(model, t0);
-            assert!(
-                window
-                    .texts()
-                    .iter()
-                    .any(|t| t.starts_with("\"Laptop\" wants to see ")),
-                "{case}"
-            );
-            assert_eq!(window.texts().contains(&line), said, "{case}");
-            // Under the administrator confirmation too.
-            let mut model = with_popups(vec![session_popup(7, t0)]);
-            set(&mut model);
-            model.levels.insert(7, always_admin());
-            model.admin_confirm.insert(7);
-            let window = Harness::new(model, t0);
-            assert!(window.has("Allow as administrator"), "{case}");
-            assert_eq!(window.texts().contains(&line), said, "{case}: confirming");
+            assert!(!window.texts().contains(&notice), "{case}");
+            assert!(!window.has(switch), "{case}");
         }
     }
 

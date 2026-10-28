@@ -147,16 +147,25 @@ pub(in super::super) const AGAIN: &str = "Type it again";
 pub(in super::super) const DIFFER: &str = "The two entries differ.";
 
 /// The help line under "Pictures and input through Tor only" (design
-/// `direct` §3.6; Phase A: the local address, the internet address once
-/// internet direct connections exist). The operator-approved disclosures
-/// are not edited.
-pub(in super::super) const TOR_ONLY_HELP: &str = if tornect_session::INTERNET_DIRECT {
-    "Without this, sessions from this device may connect directly, and that device learns this \
-     computer's internet address."
-} else {
-    "Without this, sessions from this device may connect directly, and that device learns this \
-     computer's local address."
-};
+/// `direct` §3.6) in a build whose direct connections stay on the local
+/// network. The operator-approved disclosures are not edited.
+pub(in super::super) const TOR_ONLY_HELP_LAN: &str = "Without this, sessions from this device may \
+    connect directly, and that device learns this computer's local address.";
+
+/// The same in a build whose direct connections reach the internet.
+pub(in super::super) const TOR_ONLY_HELP_INTERNET: &str = "Without this, sessions from this \
+    device may connect directly, and that device learns this computer's internet address.";
+
+/// The help line in this build (`internet`: its direct connections reach
+/// the internet; `Settings::internet`).
+#[must_use]
+pub(in super::super) fn tor_only_help(internet: bool) -> &'static str {
+    if internet {
+        TOR_ONLY_HELP_INTERNET
+    } else {
+        TOR_ONLY_HELP_LAN
+    }
+}
 
 /// The hard lock off (`hard_lock_after` 0), as §B.8.7.1 ⑤ warns of it.
 pub(in super::super) const HARD_LOCK_OFF: &str = "With 0 the hard lock is off: guessing is then \
@@ -1721,7 +1730,7 @@ fn options(
         &mut o.require_tor_only,
         "Pictures and input through Tor only",
     );
-    line(ui, TOR_ONLY_HELP, t.text_muted);
+    line(ui, tor_only_help(model.settings.internet), t.text_muted);
     // "Only while nobody is using this computer" and "Lock this computer
     // when a session ends" are not offered: nothing carries them out yet
     // (OPEN in docs/VERIFICATION.md, as the operator ruled).
@@ -2943,21 +2952,43 @@ mod tests {
     }
 
     /// Design `direct` §3.6: the grant's Tor-only box says what leaving it
-    /// unticked lets that device learn (Phase A: the local address), ticked
-    /// or not.
+    /// unticked lets that device learn, ticked or not: the local address in
+    /// a build whose direct connections stay on the local network (Phase
+    /// A), the internet address in one whose reach the internet (Phase B).
     #[test]
     fn the_tor_only_box_says_what_a_direct_session_discloses() {
         assert_eq!(
-            TOR_ONLY_HELP,
+            TOR_ONLY_HELP_LAN,
             "Without this, sessions from this device may connect directly, and that device \
              learns this computer's local address."
         );
-        let mut window = at_options("My machines", false);
-        assert!(window.has_control("Pictures and input through Tor only"));
-        assert!(window.has_text(TOR_ONLY_HELP));
-        options_mut(&mut window).require_tor_only = true;
-        window.pass(Vec::new());
-        assert!(window.has_text(TOR_ONLY_HELP));
+        assert_eq!(
+            TOR_ONLY_HELP_INTERNET,
+            "Without this, sessions from this device may connect directly, and that device \
+             learns this computer's internet address."
+        );
+        for internet in [false, true] {
+            let mut window = at_options("My machines", false);
+            window.model.settings.internet = internet;
+            window.pass(Vec::new());
+            let (said, other) = if internet {
+                (TOR_ONLY_HELP_INTERNET, TOR_ONLY_HELP_LAN)
+            } else {
+                (TOR_ONLY_HELP_LAN, TOR_ONLY_HELP_INTERNET)
+            };
+            assert_eq!(tor_only_help(internet), said);
+            assert!(window.has_control("Pictures and input through Tor only"));
+            assert!(window.has_text(said), "{internet}");
+            assert!(!window.has_text(other), "{internet}");
+            options_mut(&mut window).require_tor_only = true;
+            window.pass(Vec::new());
+            assert!(window.has_text(said), "{internet}");
+        }
+        // Outside tests the window says the build's own words.
+        assert_eq!(
+            model(true).settings.internet,
+            tornect_session::INTERNET_DIRECT
+        );
     }
 
     /// §B.8.7.1 ⑤, §B.8.6.1: each option keeps its rule, and every option

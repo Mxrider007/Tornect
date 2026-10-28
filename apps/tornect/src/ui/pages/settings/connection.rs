@@ -5,12 +5,12 @@
 //! shown in a message, logged or put into a picture of this screen: a line
 //! that does not parse is named by its number only, and while this screen
 //! is shared the lines give way to the hidden card. Then direct connections
-//! (design `direct` §3.3): the switch and what each computer learns, from
-//! the next session on.
+//! (design `direct` §3.3): the switch and what each computer learns, and in
+//! a build whose direct connections reach the internet the STUN and router
+//! switches, from the next session on.
 
 use egui::{RichText, Ui};
 use tornect_core::config::BridgeMode;
-use tornect_session::INTERNET_DIRECT;
 use tornect_signal::tor::Ladder;
 
 use super::super::super::model::{BridgeLines, Model, SettingsChange, TorChoice};
@@ -43,30 +43,106 @@ pub(in super::super) const POW_NEXT_START: &str = "Takes effect the next time To
 /// The direct connections section's header.
 pub(in super::super) const DIRECT_HEADER: &str = "Direct connections";
 
-// Design `direct` §3.3, Phase A: the switch and the lines under it while
-// it is on are revision 2's (local network only); the rest is the design's
-// own. The Phase B copy (internet addresses, STUN, the router) lands with
-// internet direct connections (step B11): this build must not say less
-// than it does.
-const _: () = assert!(!INTERNET_DIRECT, "the Phase B copy is not written yet");
+// Design `direct` §3.3: the switch and the lines under it while it is on
+// say what this build does. A build whose direct connections stay on the
+// local network (Phase A, `INTERNET_DIRECT` off) uses revision 2's words;
+// one that reaches the internet uses Phase B's, with the STUN and router
+// switches. The page picks them by `Settings::internet`, which is the
+// constant outside tests, so that both sets are drawn and tested before
+// the constant flips.
 
-/// The switch (bound to `!network.paranoid`).
-pub(in super::super) const DIRECT_SWITCH: &str = "Connect directly when both computers are on the \
-                                                  same local network (faster; the other \
-                                                  computer learns this computer's local address)";
+/// The switch (bound to `!network.paranoid`) in a build whose direct
+/// connections stay on the local network.
+pub(in super::super) const DIRECT_SWITCH_LAN: &str = "Connect directly when both computers are on \
+                                                      the same local network (faster; the other \
+                                                      computer learns this computer's local \
+                                                      address)";
 
-/// How a direct connection comes about, while the switch is on.
-pub(in super::super) const DIRECT_HOW: &str = "After the other computer accepts, the two computers \
-                                               exchange their local network addresses over Tor \
-                                               and try to reach each other directly for a \
-                                               moment. If they are not on the same network, the \
-                                               session is relayed through Tor.";
+/// The switch in a build whose direct connections reach the internet.
+pub(in super::super) const DIRECT_SWITCH_INTERNET: &str = "Allow direct connections (faster; the \
+                                                           other computer learns your IP \
+                                                           address)";
 
-/// What stays private, while the switch is on.
+/// How a direct connection comes about, while the switch is on (local
+/// network only).
+pub(in super::super) const DIRECT_HOW_LAN: &str = "After the other computer accepts, the two \
+                                                   computers exchange their local network \
+                                                   addresses over Tor and try to reach each \
+                                                   other directly for a moment. If they are not \
+                                                   on the same network, the session is relayed \
+                                                   through Tor.";
+
+/// How a direct connection comes about, while the switch is on (the
+/// internet too).
+pub(in super::super) const DIRECT_HOW_INTERNET: &str = "After the other computer accepts, the two \
+                                                        computers exchange their addresses over \
+                                                        Tor and try to reach each other directly \
+                                                        for up to 4 seconds. If they cannot, the \
+                                                        session is relayed through Tor.";
+
+/// What stays private, while the switch is on (local network only).
 pub(in super::super) const DIRECT_PRIVATE: &str = "Only local addresses (like 192.168.1.20) are \
                                                    exchanged: no outside server is asked, your \
                                                    router is left alone, and your internet \
                                                    address stays hidden.";
+
+/// What the other computer learns, while the switch is on (the internet
+/// too).
+pub(in super::super) const DIRECT_EXPOSES: &str = "A computer you connect to, or that you let \
+                                                   connect here, learns this computer's local \
+                                                   and internet addresses (IPv4 and IPv6), only \
+                                                   after the session is accepted. Computers that \
+                                                   are refused, or never paired, learn nothing.";
+
+/// The STUN switch (bound to `network.enable_stun`), under the direct
+/// switch while it is on (the internet too).
+pub(in super::super) const STUN_SWITCH: &str = "Use public STUN servers";
+
+/// Under [`STUN_SWITCH`]. The design's words, with the condition the
+/// operator split holds under (decision M1-81, the review of steps B2 and
+/// B3): each computer splits its own list, so two different lists can put
+/// one operator in both computers' parts.
+pub(in super::super) const STUN_LINE: &str = "To find this computer's internet address, Tornect \
+                                              asks one public server per session (by default \
+                                              from Cloudflare, Google, Twilio or Nextcloud; the \
+                                              list is in config.toml). That server sees this \
+                                              computer's internet address and when a session \
+                                              starts, never which computer it connects to (when \
+                                              both computers use the same list, as with the \
+                                              default) and never the picture. Tornect looks up \
+                                              these servers' names when it starts and every 10 \
+                                              minutes. Off: direct connections across routers \
+                                              succeed less often.";
+
+/// The router switch: on only while `network.upnp`, `nat_pmp` and `pcp`
+/// all are; it sets all three.
+pub(in super::super) const ROUTER_SWITCH: &str = "Ask this network's router to open a port \
+                                                  (UPnP, NAT-PMP, PCP)";
+
+/// Under [`ROUTER_SWITCH`].
+pub(in super::super) const ROUTER_LINE: &str = "The opening is for one session and shows as \
+                                                \"Tornect\" in the router's settings. Tornect \
+                                                closes it when the session ends; if Tornect stops \
+                                                first, most routers drop it within 10 minutes, \
+                                                and Tornect removes it at its next start.";
+
+/// While the STUN or the router switch is off: neither hides this
+/// computer's internet address from the other computer.
+pub(in super::super) const PUBLIC_ANYWAY: &str = "With these off, the other computer still learns \
+                                                  this computer's internet address from the \
+                                                  direct connection itself. To keep it hidden, \
+                                                  turn direct connections off.";
+
+/// The switch's words in this build, or in the other one (`internet`):
+/// also the one-time notice's switch (design `direct` §3.6).
+#[must_use]
+pub(in crate::ui) fn direct_switch(internet: bool) -> &'static str {
+    if internet {
+        DIRECT_SWITCH_INTERNET
+    } else {
+        DIRECT_SWITCH_LAN
+    }
+}
 
 /// While the switch is off.
 pub(in super::super) const DIRECT_OFF: &str = "Every session is relayed through Tor: computers you \
@@ -226,39 +302,44 @@ pub(super) fn section(
 }
 
 /// The direct connections switch and what it means here (design `direct`
-/// §3.3): what each computer learns while it is on, why it is off while a
-/// bridge is in use, and `lan_only`'s rule, which only `config.toml` sets.
+/// §3.3): what each computer learns while it is on, in a build whose
+/// direct connections reach the internet the STUN and router switches
+/// under it, why it is off while a bridge is in use, and `lan_only`'s rule,
+/// which only `config.toml` sets.
 fn direct(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
     let t = theme::tokens(ui.ctx());
     let saved = &model.settings;
+    let label = direct_switch(saved.internet);
     // Under lan_only the switch shows on: sessions go direct or end.
     let mut on = saved.direct || saved.lan_only;
     ui.horizontal_top(|ui| {
         let switched = ui
             .add_enabled_ui(!saved.lan_only, |ui| {
-                widgets::toggle(ui, &mut on, DIRECT_SWITCH).clicked()
+                widgets::toggle(ui, &mut on, label).clicked()
             })
             .inner;
         if switched && !saved.lan_only {
             actions.push(Action::SaveSettings(SettingsChange::Direct(on)));
         }
-        ui.add(
-            egui::Label::new(
-                RichText::new(DIRECT_SWITCH)
-                    .font(theme::font(ui.ctx(), Face::Medium, 14.0))
-                    .color(t.text_primary),
-            )
-            .wrap(),
-        );
+        switch_label(ui, label);
     });
     ui.add_space(4.0);
     if saved.lan_only {
         line(ui, LAN_ONLY_NOTE, t.text_secondary);
     } else if saved.direct {
-        line(ui, DIRECT_HOW, t.text_secondary);
-        line(ui, DIRECT_PRIVATE, t.text_secondary);
+        if saved.internet {
+            line(ui, DIRECT_HOW_INTERNET, t.text_secondary);
+            line(ui, DIRECT_EXPOSES, t.text_secondary);
+        } else {
+            line(ui, DIRECT_HOW_LAN, t.text_secondary);
+            line(ui, DIRECT_PRIVATE, t.text_secondary);
+        }
         if saved.bridged_off {
             line(ui, BRIDGE_NOTE, t.warn);
+        }
+        if saved.internet {
+            ui.add_space(8.0);
+            ui.indent("direct-options", |ui| sub_switches(ui, model, actions));
         }
     } else {
         line(ui, DIRECT_OFF, t.text_secondary);
@@ -268,4 +349,45 @@ fn direct(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
     if cfg!(windows) {
         line(ui, DIRECT_WINDOWS, t.text_muted);
     }
+}
+
+/// The STUN and router switches under the direct switch, each with what it
+/// does, and, while either is off, that neither hides this computer's
+/// internet address from the other computer.
+fn sub_switches(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
+    let saved = &model.settings;
+    let mut stun = saved.stun;
+    ui.horizontal_top(|ui| {
+        if widgets::toggle(ui, &mut stun, STUN_SWITCH).clicked() {
+            actions.push(Action::SaveSettings(SettingsChange::Stun(stun)));
+        }
+        switch_label(ui, STUN_SWITCH);
+    });
+    line(ui, STUN_LINE, t.text_secondary);
+    ui.add_space(8.0);
+    let mut router = saved.router;
+    ui.horizontal_top(|ui| {
+        if widgets::toggle(ui, &mut router, ROUTER_SWITCH).clicked() {
+            actions.push(Action::SaveSettings(SettingsChange::RouterMapping(router)));
+        }
+        switch_label(ui, ROUTER_SWITCH);
+    });
+    line(ui, ROUTER_LINE, t.text_secondary);
+    if !saved.stun || !saved.router {
+        line(ui, PUBLIC_ANYWAY, t.text_secondary);
+    }
+}
+
+/// A switch's words beside it.
+fn switch_label(ui: &mut Ui, text: &str) {
+    let t = theme::tokens(ui.ctx());
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .font(theme::font(ui.ctx(), Face::Medium, 14.0))
+                .color(t.text_primary),
+        )
+        .wrap(),
+    );
 }

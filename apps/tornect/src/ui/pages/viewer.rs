@@ -90,15 +90,17 @@ const DIRECT_INTERNET: (&str, &str) = (
      other's internet address.",
 );
 
-/// A direct attempt that found no path (`no-path`): what this build can
-/// try, same-site only until the internet scope is on.
-const NO_PATH_LINE: &str = if INTERNET_DIRECT {
-    "The two computers could not reach each other directly: a router or firewall is in the way."
-} else {
-    "The two computers are not on the same local network, or a firewall blocks the direct path."
-};
+/// A direct attempt that found no path (`no-path`) in a build whose direct
+/// connections stay on the local network (design `direct` §3.1, Phase A).
+const NO_PATH_LAN: &str =
+    "The two computers are not on the same local network, or a firewall blocks the direct path.";
 
-/// After [`NO_PATH_LINE`] when the host's probes came but none of this
+/// The same in a build whose direct connections reach the internet (Phase
+/// B).
+const NO_PATH_INTERNET: &str =
+    "The two computers could not reach each other directly: a router or firewall is in the way.";
+
+/// After the no-path line when the host's probes came but none of this
 /// computer's was answered (`no-path-firewall`).
 const FIREWALL_LINE: &str = "The other computer's firewall may be blocking Tornect. On Windows, \
      choose \"Allow access\" when Windows asks about Tornect.";
@@ -1118,9 +1120,18 @@ pub fn route_title(route: &RouteView) -> String {
 /// `direct` §3.1; the CLI's name for the same reason is
 /// [`TorWhy::cli_name`]): one line, two when the host's probes came but
 /// none of this computer's was answered. None for the host's policy, which
-/// the title says.
+/// the title says. In this build's words ([`INTERNET_DIRECT`]: whether its
+/// direct connections reach the internet).
 #[must_use]
 pub fn tor_reason(why: TorWhy) -> &'static [&'static str] {
+    tor_reason_in(why, INTERNET_DIRECT)
+}
+
+/// [`tor_reason`] in the words of a build whose direct connections reach
+/// the internet (`internet`) or stay on the local network: only a direct
+/// attempt that found no path reads differently.
+#[must_use]
+pub fn tor_reason_in(why: TorWhy, internet: bool) -> &'static [&'static str] {
     match why {
         TorWhy::HostPolicy => &[],
         TorWhy::HereOff => {
@@ -1148,8 +1159,10 @@ pub fn tor_reason(why: TorWhy) -> &'static [&'static str] {
                 &["The other computer could not open a network port for a direct connection."]
             }
             FallbackWhy::HostSilent => &["The other computer did not answer in time."],
-            FallbackWhy::NoPath { heard: false } => &[NO_PATH_LINE],
-            FallbackWhy::NoPath { heard: true } => &[NO_PATH_LINE, FIREWALL_LINE],
+            FallbackWhy::NoPath { heard: false } if internet => &[NO_PATH_INTERNET],
+            FallbackWhy::NoPath { heard: false } => &[NO_PATH_LAN],
+            FallbackWhy::NoPath { heard: true } if internet => &[NO_PATH_INTERNET, FIREWALL_LINE],
+            FallbackWhy::NoPath { heard: true } => &[NO_PATH_LAN, FIREWALL_LINE],
             FallbackWhy::Quic => {
                 &["The computers found each other, but the secure direct connection failed."]
             }
@@ -3076,17 +3089,37 @@ mod tests {
             ),
         ];
         assert_eq!(table.len(), every_tor_why().len());
-        for (why, lines) in table {
-            assert_eq!(tor_reason(why), lines, "{why:?}");
-            for line in lines {
-                assert!(
-                    !line.chars().any(|c| c.is_ascii_digit()),
-                    "{why:?} names no address: {line}"
-                );
+        // Phase B's words for a direct attempt that found no path; every
+        // other reason reads as in Phase A.
+        const NO_PATH_B: &str = "The two computers could not reach each other directly: a \
+                                 router or firewall is in the way.";
+        const FIREWALL: &str = "The other computer's firewall may be blocking Tornect. On \
+                                Windows, choose \"Allow access\" when Windows asks about \
+                                Tornect.";
+        for internet in [false, true] {
+            for (why, lines) in table {
+                let lines: Vec<&str> = match why {
+                    TorWhy::Fallback(FallbackWhy::NoPath { heard: false }) if internet => {
+                        vec![NO_PATH_B]
+                    }
+                    TorWhy::Fallback(FallbackWhy::NoPath { heard: true }) if internet => {
+                        vec![NO_PATH_B, FIREWALL]
+                    }
+                    _ => lines.to_vec(),
+                };
+                assert_eq!(tor_reason_in(why, internet), lines, "{why:?} {internet}");
+                for line in &lines {
+                    assert!(
+                        !line.chars().any(|c| c.is_ascii_digit()),
+                        "{why:?} names no address: {line}"
+                    );
+                }
             }
         }
-        // Phase A: the internet copy waits for Phase B (B11).
-        const { assert!(!INTERNET_DIRECT) };
+        // The window says the build's words.
+        for why in every_tor_why() {
+            assert_eq!(tor_reason(why), tor_reason_in(why, INTERNET_DIRECT));
+        }
     }
 
     /// Design `direct` §3.1: the details' Route row says the route, what
