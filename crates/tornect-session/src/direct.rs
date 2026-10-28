@@ -199,11 +199,12 @@ impl DirectSettings {
 /// (the direct design §6.7): the services stream, which
 /// [`ServicesHost::second_stream`](crate::services::ServicesHost::second_stream)
 /// serves. [`DirectHost`] accepts that stream only after the session's
-/// media was claimed on this connection, at [`SERVICES_PRIORITY`], and
-/// serves it beside the media stream, neither waiting on the other; a kill,
-/// the linger or the session's end drop it with the link. A host without
-/// one never accepts a second stream: the viewer's waits unread, within the
-/// stream window ([`tornect_net::quic::HOST_STREAMS`]).
+/// media was claimed on this connection, sets its send priority to 0
+/// (below the media stream's 1) and serves it beside the media stream,
+/// neither waiting on the other; a kill, the linger or the session's end
+/// drop it with the link. A host without one never accepts a second
+/// stream: the viewer's waits unread, within the stream window
+/// ([`tornect_net::quic::HOST_STREAMS`]).
 pub trait SecondStream: Send + Sync {
     /// Serve `stream` for session `expected_session`, on a connection whose
     /// TLS proved the device `peer`, whose exporter output is `ekm` (what
