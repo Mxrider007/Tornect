@@ -42,6 +42,7 @@ pub use ledger::{
     MAX_LEDGER_OWNERS, MappingLedger, decode_list, encode_list, unix_now,
 };
 pub use real::{RealMapper, Router, SWEEP_CAP, SweepReport};
+pub(crate) use release::ReleaseHold;
 pub use release::{MAP_RELEASE_CAP, ReleaseTracker, SHUTDOWN_RELEASE_WAIT};
 
 /// The lease every mapping asks for (design §7.4 "Leases", decision M1-81):
@@ -350,6 +351,15 @@ pub trait MapEvents: Send + Sync {
 pub trait PortMapper: Send + Sync {
     /// At most one mapping for `req`, within `req.deadline`.
     fn map(&self, req: MapRequest) -> BoxFuture<'static, Result<Mapping, MapFail>>;
+
+    /// The tracker that counts the releases of the mappings this mapper
+    /// makes (they release themselves through it when dropped); `None` for
+    /// a mapper whose mappings release nothing on drop. A link that shuts
+    /// counts its mapping's release there from the moment it shuts
+    /// (design §7.4 "Release", §8.5).
+    fn release_tracker(&self) -> Option<ReleaseTracker> {
+        None
+    }
 }
 
 /// A mapper with no router behind it: every request is

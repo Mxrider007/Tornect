@@ -34,7 +34,9 @@
 //! the link starts on is captured: the driver and the gathering run on it.
 //! The gathering holds the router mapping and renews it for as long as the
 //! link lives; the link's end aborts it, and the mapping, dropped, is
-//! released on that runtime (design §7.4 "Release").
+//! released on that runtime (design §7.4 "Release"). The release counts in
+//! the mapper's tracker from the moment the link ends, before the aborted
+//! task has been dropped, so the app's wait at exit never misses it.
 //!
 //! Nothing here logs. Every type has a redacted `Debug` (decision M1-83),
 //! and [`LinkStats`] holds counts only.
@@ -57,7 +59,7 @@ use zeroize::Zeroizing;
 use crate::addr::{AddrClass, Candidate, CandidateKind, RemoteFilter, Scope, canon, canon_ip};
 use crate::checklist::{Action, Checklist, PunchRole, PunchStats};
 use crate::env::NetEnv;
-use crate::gather::{self, GatherConfig, GatherStats, Gathered, Gatherer};
+use crate::gather::{self, GatherConfig, GatherStats, Gathered, Gatherer, ReleaseBridge};
 use crate::local;
 use crate::probe::ProbeKey;
 use crate::quic::{self, QuicError, QuicIdentity};
@@ -258,6 +260,10 @@ struct LinkInner {
     /// runs: aborted, it drops the mapping, which releases itself on the
     /// runtime the mapper captured (this link's, design §7.4 "Release").
     gatherer: Option<tokio::task::AbortHandle>,
+    /// Counts the mapping's release from the moment the link shuts until
+    /// the aborted gathering is gone (when the plan asks the router and
+    /// its mapper counts releases).
+    release: Option<Arc<ReleaseBridge>>,
     shared: Arc<Shared>,
     /// The runtime the link started on: the driver and the gathering run
     /// there.
@@ -267,10 +273,15 @@ struct LinkInner {
 impl LinkInner {
     /// Stops the driver and the gathering (releasing the router mapping)
     /// and closes the endpoint with every connection on it; no new
-    /// connection can start or complete afterwards. Needs no runtime
-    /// context, so a drop anywhere closes.
+    /// connection can start or complete afterwards. The mapping's release
+    /// counts as running from here, before the abort, so that a wait for
+    /// the releases started after this returns cannot miss it. Needs no
+    /// runtime context, so a drop anywhere closes.
     fn shut(&self) {
         self.driver.abort();
+        if let Some(release) = &self.release {
+            release.shut();
+        }
         if let Some(gatherer) = &self.gatherer {
             gatherer.abort();
         }
@@ -492,11 +503,18 @@ impl DirectLink {
         // At most two gathered batches and `Done`.
         let (local_tx, local) = mpsc::channel(4);
         let (gathered_tx, gathered_rx) = mpsc::channel(4);
+        // The mapper is taken once, and only when the plan asks the router.
+        let mapper = (gathers && plan.map.is_some()).then(|| env.mapper());
+        let release = mapper
+            .as_ref()
+            .and_then(|m| m.release_tracker())
+            .map(ReleaseBridge::new);
         let (gatherer, unread_stun) = if gathers {
             let gatherer = Gatherer {
                 filter: local::stun_filter(&addrs, &sources, admit_loopback),
                 plan,
                 env: Arc::clone(&env),
+                mapper,
                 socket: Arc::clone(&socket),
                 replies: stun,
                 hosts: offered.iter().map(|c| c.addr).collect(),
@@ -533,12 +551,17 @@ impl DirectLink {
             floor: None,
         };
         let driver = runtime.spawn(driver.run()).abort_handle();
-        let gatherer = gatherer.map(|g| runtime.spawn(g.run()).abort_handle());
+        let gatherer = gatherer.map(|g| {
+            runtime
+                .spawn(g.task(release.as_ref().map(Arc::clone)))
+                .abort_handle()
+        });
         let inner = Arc::new(LinkInner {
             endpoint,
             socket,
             driver,
             gatherer,
+            release,
             shared,
             _runtime: runtime,
         });

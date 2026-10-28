@@ -158,13 +158,12 @@ pub fn sweep_router_leftovers(net: &RealNet) {
 
 /// The end of it: waits, at most [`SHUTDOWN_RELEASE_WAIT`], for the
 /// releases of the mappings this process's links held; whether none still
-/// runs. A release unfinished by then lapses with the router's lease, and
-/// its ledger entry is the next start's to sweep.
+/// runs. A link that ended before this call counts its mapping's release
+/// from the moment it ended, before its aborted gathering has dropped the
+/// mapping, so the wait cannot miss it. A release unfinished by then
+/// lapses with the router's lease, and its ledger entry is the next start's
+/// to sweep; so does the mapping of a link still open at exit.
 pub async fn wait_router_releases(net: &RealNet) -> bool {
-    // A link closed just before this drops its mapping when its aborted
-    // gathering task is next polled, and only then is the release counted:
-    // one yield lets the runtime get there first.
-    tokio::task::yield_now().await;
     net.releases().wait(SHUTDOWN_RELEASE_WAIT).await
 }
 

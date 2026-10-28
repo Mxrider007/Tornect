@@ -61,11 +61,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -79,7 +81,10 @@ use crate::addr::{
 use crate::env::NetEnv;
 use crate::link::LocalBatch;
 use crate::local::{IfaceAddr, RouteSources, global_families, owner};
-use crate::mapping::{MAP_LEASE, MapFail, MapProtocols, MapRequest, MapVia, Mapping};
+use crate::mapping::{
+    MAP_LEASE, MapFail, MapProtocols, MapRequest, MapVia, Mapping, PortMapper, ReleaseHold,
+    ReleaseTracker,
+};
 use crate::stun::{self, StunReply, StunTxid, TXID_LEN, binding_request, parse_response};
 use crate::udp::{PunchSocket, RawSend, TeedStun};
 
@@ -968,6 +973,9 @@ pub(crate) struct Gatherer {
     /// What to gather; it gathers something ([`GatherPlan::gathers`]).
     pub plan: GatherPlan,
     pub env: Arc<dyn NetEnv>,
+    /// The machine's router mapper, taken once by the link when the plan
+    /// asks the router (`None` otherwise).
+    pub mapper: Option<Arc<dyn PortMapper>>,
     pub socket: Arc<PunchSocket>,
     /// The session socket's STUN tee.
     pub replies: mpsc::Receiver<TeedStun>,
@@ -1015,7 +1023,101 @@ async fn due(at: Option<Instant>) {
     }
 }
 
+/// The link's end and the gathering's task, about the release of the
+/// mapping the task holds (design §7.4 "Release", §8.5): from the moment
+/// the link shuts until the task is gone, and with it the mapping, whose
+/// own release is counted by then, one release counts as running in the
+/// mapper's tracker. The aborted task is dropped only when its runtime next
+/// gets to it, so without this the app's wait at exit could look in between
+/// and see nothing running.
+pub(crate) struct ReleaseBridge {
+    tracker: ReleaseTracker,
+    state: Mutex<Bridge>,
+}
+
+/// Where the gathering's task stands, for its link's end.
+enum Bridge {
+    /// The task runs (or has not run yet).
+    Running,
+    /// The link shut while the task ran: one release counts until the task
+    /// is gone.
+    Shutting { _hold: ReleaseHold },
+    /// The task ended or was dropped.
+    Gone,
+}
+
+impl ReleaseBridge {
+    /// A bridge counting in `tracker`.
+    pub(crate) fn new(tracker: ReleaseTracker) -> Arc<Self> {
+        Arc::new(Self {
+            tracker,
+            state: Mutex::new(Bridge::Running),
+        })
+    }
+
+    /// The link shuts: while the task has not gone, one release counts as
+    /// running until it has. Called before the task is aborted; a second
+    /// call changes nothing.
+    pub(crate) fn shut(&self) {
+        let mut state = lock(&self.state);
+        if matches!(*state, Bridge::Running) {
+            *state = Bridge::Shutting {
+                _hold: self.tracker.hold(),
+            };
+        }
+    }
+
+    /// The task is gone (its mapping dropped, so its release counted).
+    fn gone(&self) {
+        let held = std::mem::replace(&mut *lock(&self.state), Bridge::Gone);
+        drop(held);
+    }
+}
+
+impl fmt::Debug for ReleaseBridge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReleaseBridge").finish_non_exhaustive()
+    }
+}
+
+/// The gathering's task: [`Gatherer::run`], and when that ends, is aborted
+/// or is dropped unrun, the bridge told that the task is gone.
+pub(crate) struct GatherTask {
+    // Fields drop in declaration order: `run`, with the mapping it holds
+    // (whose release is then spawned and counted), before `_gone` lets the
+    // link's hold go.
+    run: Pin<Box<dyn Future<Output = ()> + Send>>,
+    _gone: TaskGone,
+}
+
+/// Tells the bridge, if any, that the task is gone when dropped.
+struct TaskGone(Option<Arc<ReleaseBridge>>);
+
+impl Drop for TaskGone {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.0.take() {
+            bridge.gone();
+        }
+    }
+}
+
+impl Future for GatherTask {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.run.as_mut().poll(cx)
+    }
+}
+
 impl Gatherer {
+    /// The task that runs this gathering, telling `bridge` when it is gone.
+    pub(crate) fn task(self, bridge: Option<Arc<ReleaseBridge>>) -> GatherTask {
+        GatherTask {
+            run: Box::pin(self.run()),
+            _gone: TaskGone(bridge),
+        }
+    }
+
     /// Gathers, says `Done` to the owner and the driver, then renews the
     /// mapping (if any) until the link aborts this task, which drops the
     /// mapping and so releases it.
@@ -1039,6 +1141,7 @@ impl Gatherer {
         let Self {
             plan,
             env,
+            mapper,
             socket,
             mut replies,
             filter,
@@ -1071,8 +1174,8 @@ impl Gatherer {
             let _ = driver.try_send(Gathered::Public(addr.ip()));
         };
 
-        let mut router = match (plan.map, NonZeroU16::new(port)) {
-            (Some(target), Some(internal_port)) => Some(env.mapper().map(MapRequest {
+        let mut router = match (plan.map, NonZeroU16::new(port), mapper) {
+            (Some(target), Some(internal_port), Some(mapper)) => Some(mapper.map(MapRequest {
                 gateway: target.gateway,
                 client: target.client,
                 internal_port,

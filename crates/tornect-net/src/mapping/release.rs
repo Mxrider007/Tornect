@@ -61,6 +61,15 @@ impl Drop for Running {
     }
 }
 
+/// A release on its way: counted as running from [`ReleaseTracker::hold`]
+/// until dropped. A link that shuts takes one before it aborts the task
+/// that holds its mapping, and the task's end drops it only after the
+/// mapping's own release has been counted, so that the count never reads
+/// zero in between.
+pub(crate) struct ReleaseHold {
+    _running: Running,
+}
+
 impl ReleaseTracker {
     /// A tracker with nothing running.
     #[must_use]
@@ -80,6 +89,13 @@ impl ReleaseTracker {
             let _running = running;
             let _ = tokio::time::timeout(MAP_RELEASE_CAP, release).await;
         }));
+    }
+
+    /// Counts one release as running until the returned hold is dropped.
+    pub(crate) fn hold(&self) -> ReleaseHold {
+        ReleaseHold {
+            _running: Running::new(&self.running),
+        }
     }
 
     /// How many releases run now.

@@ -131,7 +131,7 @@ impl Scripted {
 
     /// Waits until a release ran and none is still running: a dropped
     /// mapping's release is spawned when the task that held it is dropped,
-    /// a moment after the abort.
+    /// a moment after the abort (and counted from the abort on).
     async fn released(&self) {
         within(async {
             while self.releases() == 0 {
@@ -195,6 +195,10 @@ impl PortMapper for Scripted {
                 RouterAnswer::Silent => std::future::pending().await,
             }
         })
+    }
+
+    fn release_tracker(&self) -> Option<ReleaseTracker> {
+        Some(self.releases.clone())
     }
 }
 
@@ -587,6 +591,90 @@ async fn the_mapping_is_renewed_with_the_link_and_released_at_its_end() {
         tokio::time::sleep(Duration::from_secs(600)).await;
         assert_eq!(router.renewals().len(), 2, "no renewal after the end");
     }
+}
+
+/// Design §7.4 "Release", §8.5 (review of steps B6 and B7): the link's end
+/// counts its mapping's release in the mapper's tracker at once, before the
+/// aborted gathering has been dropped, so that the app's wait at exit
+/// (`releases().wait`) cannot look in between and find nothing running; the
+/// wait returns once the release ran. A link whose gathering is still
+/// waiting for the router counts until the task is gone, and one whose
+/// gathering ended without a mapping counts nothing.
+#[tokio::test(start_paused = true)]
+async fn the_release_counts_from_the_moment_the_link_ends() {
+    for close in [true, false] {
+        let world = World::new();
+        let (env, router) = world.routed("192.168.1.20/24", grant(10));
+        let t0 = Instant::now();
+        let (mut link, _) = DirectLink::start(
+            params(TornectRole::Host, 2, 1, config(&[], MapProtocols::ALL)),
+            env,
+        )
+        .await
+        .expect("a link");
+        assert_eq!(batches(&mut link, t0).await.len(), 2, "the mapping, Done");
+        assert_eq!(router.releases.running(), 0, "nothing while the link lives");
+        // Nothing else runs between the link's end and the read below, so
+        // the aborted task has not been dropped yet: what counts is the
+        // link's own hold.
+        if close {
+            // One poll of `close`, which shuts the link before its first
+            // await (the zero timeout polls it once and yields to nothing).
+            let mut closing = Box::pin(link.close());
+            let first = tokio::time::timeout(Duration::ZERO, &mut closing).await;
+            assert_eq!(router.releases.running(), 1, "close: counted at once");
+            if first.is_err() {
+                closing.await;
+            }
+        } else {
+            drop(link);
+            assert_eq!(router.releases.running(), 1, "drop: counted at once");
+        }
+        assert!(router.releases.wait(Duration::from_secs(1)).await);
+        assert_eq!(router.releases(), 1, "the wait ends after the release ran");
+    }
+
+    // The router has not answered when the link ends: counted until the
+    // gathering is gone, then nothing, and no release.
+    let world = World::new();
+    let (env, router) = world.routed("192.168.1.20/24", RouterAnswer::Silent);
+    let (link, _) = DirectLink::start(
+        params(TornectRole::Host, 2, 1, config(&[], MapProtocols::ALL)),
+        env,
+    )
+    .await
+    .expect("a link");
+    tokio::time::sleep(ms(100)).await;
+    drop(link);
+    assert_eq!(router.releases.running(), 1);
+    assert!(router.releases.wait(Duration::from_secs(1)).await);
+    assert_eq!(router.releases(), 0);
+
+    // The router refused: the gathering ended with nothing to release, and
+    // the link's end counts nothing.
+    let world = World::new();
+    let (env, router) = world.routed(
+        "192.168.1.20/24",
+        RouterAnswer::Fail {
+            after: ms(10),
+            fail: MapFail::Refused,
+        },
+    );
+    let t0 = Instant::now();
+    let (mut link, _) = DirectLink::start(
+        params(TornectRole::Host, 2, 1, config(&[], MapProtocols::ALL)),
+        env,
+    )
+    .await
+    .expect("a link");
+    assert_eq!(
+        batches(&mut link, t0).await,
+        vec![(ms(10), LocalBatch::Done)]
+    );
+    tokio::time::sleep(ms(1)).await;
+    drop(link);
+    assert_eq!(router.releases.running(), 0);
+    assert_eq!(router.releases(), 0);
 }
 
 // ---------------------------------------------------------------------------

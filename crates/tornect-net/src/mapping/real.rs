@@ -514,6 +514,10 @@ impl PortMapper for RealMapper {
     fn map(&self, req: MapRequest) -> BoxFuture<'static, Result<Mapping, MapFail>> {
         Box::pin(self.clone().map_now(req))
     }
+
+    fn release_tracker(&self) -> Option<ReleaseTracker> {
+        Some(self.releases().clone())
+    }
 }
 
 #[cfg(test)]
