@@ -607,10 +607,16 @@ fn follow_knobs(m: &mut super::model::Model, knobs: &crate::direct::DirectKnobs)
 
 /// What the window says once, from its start: what history keeps, on the
 /// first run of a home, and that direct connections are on while that
-/// notice is due (design `direct` §3.6).
-fn start_notices(m: &mut super::model::Model, first: bool) {
+/// notice is due (design `direct` §3.6). Until its OK the window host signs
+/// its unattended sessions `tor_only` (`knobs`' unattended hold, decision
+/// M1-84): no question comes before one, and a grant made before direct
+/// connections reached the internet was never told that a session reveals
+/// this computer's IP address. In background mode the notice waits for the
+/// window to be opened, and the hold with it.
+fn start_notices(m: &mut super::model::Model, first: bool, knobs: &crate::direct::DirectKnobs) {
     m.history_notice = first;
     m.direct_notice = m.settings.direct_notice_due();
+    knobs.transport.hold_unattended(m.direct_notice);
 }
 
 /// The roles of this window: it connects, and hosts unless started without
@@ -691,9 +697,11 @@ fn save_settings(
         cfg.save(&path).map(|()| cfg)
     });
     // The one-time notice's OK closes it, saved or not: unsaved, it asks
-    // again at the next start (design `direct` §3.6).
+    // again at the next start (design `direct` §3.6). It was read: the
+    // unattended sessions are no longer held on Tor (`start_notices`).
     if *change == SettingsChange::DirectNoticeSeen {
         shared.update(|m| m.direct_notice = false);
+        knobs.transport.hold_unattended(false);
     }
     match saved {
         Ok(cfg) => {
@@ -2936,7 +2944,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
         return;
     };
     let b = Arc::new(b);
-    b.shared.update(|m| start_notices(m, first));
+    b.shared.update(|m| start_notices(m, first, &b.knobs));
     refresh_diagnostics(&b);
     {
         let (paths, shared) = (b.paths.clone(), Arc::clone(&b.shared));
@@ -7342,48 +7350,82 @@ mod tests {
     /// Design `direct` §3.6: the notice that direct connections are on is
     /// up from a start while it is due, and its OK closes it and saves that
     /// it was seen, so the next start says nothing; an OK whose save fails
-    /// closes it too, and the next start asks again.
+    /// closes it too, and the next start asks again. The review of step B11
+    /// (decision M1-84): from that start until its OK, saved or not, the
+    /// window host signs its unattended sessions `tor_only` (the knobs'
+    /// unattended hold), whether the window is shown or in background mode,
+    /// while attended accepts, whose question says what an accept
+    /// discloses, keep the policy as it is.
     #[test]
     fn the_direct_notice_shows_from_a_start_until_its_ok() {
+        use tornect_core::unattended::limiter::HostTransport;
+        let paranoid = HostTransport {
+            paranoid: true,
+            lan_only: false,
+        };
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().join("home"));
         let path = paths.config_file();
         Config::default().save(&path).unwrap();
-        let start = |paths: &Paths| {
+        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        let start = |paths: &Paths, knobs: &crate::direct::DirectKnobs| {
             let mut model = Model {
                 settings: Settings::of(&Config::load(&paths.config_file()).unwrap()),
                 ..Model::default()
             };
             // An internet build's window.
             model.settings.internet = true;
-            start_notices(&mut model, false);
+            start_notices(&mut model, false, knobs);
             model
         };
-        let model = start(&paths);
+        let model = start(&paths, &knobs);
         assert!(model.direct_notice && !model.history_notice);
+        assert!(knobs.transport.unattended_held());
+        assert_eq!(knobs.transport.host_transport(), paranoid);
+        assert_eq!(
+            knobs.transport.get(),
+            tornect_signal::consent::TransportPolicy::Any,
+            "attended"
+        );
         let shared = Shared::new(model, Arc::new(|_| {}));
-        let knobs = crate::direct::DirectKnobs::new(&Config::default());
+        // A save of another setting keeps the hold.
+        save_settings(&paths, &shared, &knobs, &SettingsChange::Stun(true));
+        assert_eq!(knobs.transport.host_transport(), paranoid);
         save_settings(&paths, &shared, &knobs, &SettingsChange::DirectNoticeSeen);
         assert!(Config::load(&path).unwrap().general.direct_notice_seen);
         shared.read(|m| assert!(!m.direct_notice));
-        assert!(!start(&paths).direct_notice, "seen: never again");
+        assert!(!knobs.transport.unattended_held());
+        assert_eq!(knobs.transport.host_transport(), HostTransport::default());
+        assert!(!start(&paths, &knobs).direct_notice, "seen: never again");
+        assert!(!knobs.transport.unattended_held(), "and nothing held");
 
         // Not saved (the file cannot be read): closed, and asked again.
         let other = Paths::from_home(tmp.path().join("other"));
         Config::default().save(&other.config_file()).unwrap();
-        let shared = Shared::new(start(&other), Arc::new(|_| {}));
+        let held = crate::direct::DirectKnobs::new(&Config::default());
+        let shared = Shared::new(start(&other, &held), Arc::new(|_| {}));
+        assert!(held.transport.unattended_held());
         std::fs::write(other.config_file(), "not toml [").unwrap();
-        save_settings(&other, &shared, &knobs, &SettingsChange::DirectNoticeSeen);
+        save_settings(&other, &shared, &held, &SettingsChange::DirectNoticeSeen);
         shared.read(|m| {
             assert!(!m.direct_notice);
             assert_eq!(m.settings.problem, Some(NOT_SAVED_FILE));
         });
+        assert!(!held.transport.unattended_held(), "read, though not saved");
         Config::default().save(&other.config_file()).unwrap();
-        assert!(start(&other).direct_notice);
+        assert!(start(&other, &held).direct_notice);
+        assert!(held.transport.unattended_held());
         // The first run's history notice comes along.
-        let mut first = start(&paths);
-        start_notices(&mut first, true);
+        let mut first = start(&paths, &knobs);
+        start_notices(&mut first, true, &knobs);
         assert!(first.history_notice);
+        // A build whose direct connections stay on the local network holds
+        // nothing: no session reveals an internet address.
+        let mut lan = Model::default();
+        lan.settings.internet = false;
+        let local = crate::direct::DirectKnobs::new(&Config::default());
+        start_notices(&mut lan, false, &local);
+        assert!(!lan.direct_notice && !local.transport.unattended_held());
     }
 
     /// The review of step B11 (design `direct` §5.3, decision M1-86): the
