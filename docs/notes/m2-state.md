@@ -9,9 +9,11 @@ is implemented in this container: B1 to B7 (2026-10-27), B8 to B13 (2026-10-28; 
 Phase B steps" below). **`INTERNET_DIRECT` is `true` since step B12 (`c1ec5a15`).** No tag was
 made; what the dev VM and real networks still owe is listed under B12 and B13 below. **The close
 is done (2026-10-28):** C1 wrote the final text of decisions M1-77 to M1-86 and the plan's final
-words (the threat model included), C2 reviewed the whole feature's security and found no defect
-(the C1 and C2 entries at the end of "OPEN, owned by Phase B steps"). What is left before `m2` is the owner's: the three blockers below, then the
-tag.
+words (the threat model included), C2 reviewed the whole feature's security and found no code
+defect (the C1 and C2 entries at the end of "OPEN, owned by Phase B steps"); the review of C1 and
+C2 corrected the live demos' expected lines for two instances on one VM, which never go direct on
+the site (decision M1-82 item 11). What is left before `m2` is the owner's: the three blockers
+below, then the tag.
 
 ## Blockers: no release zip to users, no `m2` tag
 
@@ -26,9 +28,13 @@ check is the owner's call. Until both are settled:
 2. **The `live_stun` run is pasted** from the dev VM (`cargo test -p tornect-net --test live_stun
    -- --ignored --nocapture`; ledger row "Step B12: the live STUN check"): four lines, each
    `srflx` or `no-nat`.
-3. **The Accept demo is pasted** from the dev VM (design §15 step C2 [VM]; ledger row "C2: the
-   Accept demo on the dev VM", which runs the live demos of both phases with one build of the
-   close's head).
+3. **The Accept demo is pasted** from the dev VM and two machines on one LAN (design §15 step C2
+   [VM]; ledger row "C2: the Accept demo on the dev VM", which runs the live demos of both phases
+   with one build of the close's head). Two instances on one VM give `ROUTE tor no-path` (or
+   `ROUTE direct internet` through routers that hairpin), never `ROUTE direct lan`: each refuses
+   the other's addresses as its own (design §7.7, decision M1-82 item 11), so the same-site lines
+   come from two machines (case (1) of the ledger row "Step A15: the direct bind between two real
+   machines").
 
 No zip from `cargo xtask dist` goes to users and no `m2` tag is made before all three. If the owner
 rejects "no published terms", or an entry is silent in the run (asked, nothing global back), the
@@ -108,9 +114,13 @@ ledger rows "Final review: …"):
 
 ## Before `m2a` (all [VM] or device; recipes in the ledger)
 
-1. The live Phase A demo on the dev VM (design §12.5): `ROUTE direct lan`, `PATH host`, `MEDIA`,
-   `SESSION ROUTE … lan`, `--tor-only`, `paranoid`, `--no-video`, the `ss -uanp` socket check and
-   the `sessions.log` lines. Row "Checkpoint A22: the live Phase A demo on the dev VM".
+1. The live Phase A demo on the dev VM (design §12.5): two instances on one VM → `ROUTE tor
+   no-path`, `PATH -`, `MEDIA`, `SESSION ROUTE … tor`, `--tor-only`, `paranoid`, `--no-video`, the
+   `ss -uanp` check before the connect and the `sessions.log` lines. Row "Checkpoint A22: the live
+   Phase A demo on the dev VM" (corrected at the review of steps C1 and C2: it expected `ROUTE
+   direct lan`, which the own-address rule refuses on one machine). The same-site lines (`ROUTE
+   direct lan`, `PATH host`, `SESSION ROUTE … lan`, one UDP socket per process) need two machines
+   on one LAN: case (1) of the row "Step A15: the direct bind between two real machines".
 2. The 10-minute fuzz campaigns: `candidates`, `probe`, `framing`, `envelope`, `media` (nightly and
    cargo-fuzz are not in this container). Row "Checkpoint A22: the 10-minute fuzz campaigns".
 3. `cargo xtask dist` with the feature check, the licence texts in both zips, and `doctor` from the
@@ -307,8 +317,10 @@ and the crates below ring check here).
   M2 text says Phase B is built (a minimal edit; C1 writes the final text). The leftover flake of
   the B11 review is settled (`6ef9372e`: the count was read before the refused stream's task
   ended; 100 runs in four parallel copies clean). Left as NEEDS-DEVICE (ledger rows, recipes):
-  the live STUN run, two instances on one VM, the bridge demo, the `host` `NOTICE` line after a
-  real bootstrap, the B11 review's strace and background-mode checks, the B11 desktop row. OPEN:
+  the live STUN run, two instances on one VM (`ROUTE tor no-path`, or `direct internet` through
+  a hairpinning router, since the review of steps C1 and C2), the bridge demo, the `host`
+  `NOTICE` line after a real bootstrap, the B11 review's strace and background-mode checks, the
+  B11 desktop row. OPEN:
   the owner's call on the Google and Nextcloud STUN terms (`nat-traversal.md` §2.7; the list is
   unchanged), a blocker with the live STUN run ("Blockers" above).
 - B13 (done in this container 2026-10-28; ledger rows "Step B13"): the gnullvm cross-clippy of the
@@ -361,6 +373,19 @@ and the crates below ring check here).
   (`tests::direct_bind::a_view_only_direct_session_never_decodes_or_injects_input`; switching it
   to control makes it fail). The Accept demo on the dev VM is NEEDS-DEVICE with its recipe
   (blocker 3); no tag was made (the design's C2 tags `m2`; tags are the owner's).
+- Review of steps C1 and C2 (2026-10-28; ledger rows "Review of steps C1 and C2"; decision M1-82
+  item 11): one major, four minor, all addressed. Major: the live recipes (checkpoint A22 part
+  (1), step B12 part (1), the B11 review's background-mode check, the Accept demo) expected
+  `ROUTE direct lan` from two instances on one VM, after design §12.5; the own-address rule of
+  design §7.7 refuses every address of this computer, so two instances on one machine never go
+  direct on the site. The rule stays (a reflection guard); the recipes now expect `ROUTE tor
+  no-path` there (or `direct internet` through hairpinning routers), the same-site lines moved to
+  the two-machine row, and four tests pin it (`tornect-net`: two links on one `MemHost`, on one
+  `127.0.0.x`, and on one machine behind a router with and without hairpinning; `tornect-session`:
+  the whole session on one machine in both scopes). Minor: the plan's §B.8.4.3 note (the Tor
+  fallback as built; nothing gathered before `SESSION_ACCEPT`) and D6 (when same-site candidates
+  are offered), the "release README" in §B.6, `README.md`'s privacy bullet (the same-list
+  condition, the router), the Phase A close row's dated prefix and `netdev` in the C2 row.
 
 ## Gotchas found at this checkpoint
 

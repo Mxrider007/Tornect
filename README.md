@@ -70,7 +70,9 @@ Host                          Tor network                       Client
   Wayland. No root, no kernel hacks.
 - **Privacy modes:** default (signaling via Tor, media direct when the two
   computers can reach each other, otherwise through Tor; the other computer of a
-  session sees your IP address, and so does one public STUN server; off while Tor
+  session sees your IP address, and so does one public STUN server, though no
+  STUN operator sees both computers when both use the same list, as with the
+  default; the router is asked for one UDP port per session; off while Tor
   uses a bridge), *paranoid* (everything via Tor), LAN-only (direct on the
   local network only, never through Tor).
 - **No telemetry.** Session events are logged locally only.
