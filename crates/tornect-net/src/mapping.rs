@@ -15,7 +15,8 @@
 //! next start removes what a crash left ([`RealMapper::sweep`]), and a
 //! mapping dropped without [`Mapping::release`] is released on the runtime
 //! it was made on through the [`ReleaseTracker`]. [`NoMapper`] asks no
-//! router; the in-memory router follows at step B8.
+//! router; the in-memory network's routers answer through `mem::MemMapper`
+//! (tests and the `test-support` feature only).
 
 use std::convert::Infallible;
 use std::fmt;
@@ -363,10 +364,9 @@ pub trait PortMapper: Send + Sync {
 }
 
 /// A mapper with no router behind it: every request is
-/// [`MapFail::NoGateway`] at once, and nothing is sent. The in-memory and
-/// loopback machines use it until step B8 gives the in-memory network
-/// routers, and the real machine until [`RealNet::with_router`] gives it a
-/// ledger.
+/// [`MapFail::NoGateway`] at once, and nothing is sent. The loopback
+/// machines use it, and the real machine until [`RealNet::with_router`]
+/// gives it a ledger.
 ///
 /// [`RealNet::with_router`]: crate::RealNet::with_router
 #[derive(Debug, Clone, Copy, Default)]

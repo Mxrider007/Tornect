@@ -25,9 +25,17 @@
 //!   wraps, for the privacy rules' "zero calls" (design §5.2).
 //! - [`LaggedDuplex`]: an in-memory byte pipe with a one-way delay, the
 //!   signalling stream of a session over a slow circuit (design §12.4).
+//! - [`NatBox`]: a NAT (endpoint-independent, address-dependent or
+//!   address-and-port-dependent mapping and filtering, hairpinning, port
+//!   preservation, forwards, a 30 s timeout) or, with `translate: false`, a
+//!   stateful IPv6 firewall, between the segments behind it and the one
+//!   outside (design §12.4).
+//! - [`MemStun`]: a STUN server on a segment, honest, lying or silent.
+//! - [`MemMapper`]: the mapper of a machine whose gateway is a [`NatBox`]
+//!   with a router ([`MapperMode`]): a granted mapping is a forward on that
+//!   box, renewed and released through the router.
 //!
-//! Phase B adds NATs, STUN servers and router mappers to [`MemNet`]
-//! (design §12.4, step B8).
+//! Names resolve from the network's own table ([`MemNet::name`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -50,10 +58,16 @@ use tokio::time::{Instant, Sleep};
 use crate::addr::{self, AddrClass, canon, canon_ip, to_socket_family};
 use crate::env::NetEnv;
 use crate::local::{IfaceAddr, IfaceKind, RouteSources};
-use crate::mapping::{NoMapper, PortMapper};
+use crate::mapping::{NoMapper, PortMapper, ReleaseTracker};
 use crate::socket::{BoundSocket, RECV_BUFFER};
 use crate::udp::{BoundUdp, is_probe, is_stun};
 use crate::{BoxFuture, NetError};
+
+mod nat;
+mod servers;
+
+pub use nat::{MemNat, NAT_TIMEOUT, NatBox, NatFiltering, NatFlow, NatMapping};
+pub use servers::{MapperMode, MemMapper, MemStun, RouterSeen, StunHeard, StunMode};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -233,6 +247,10 @@ pub struct MemAddr {
     pub kind: IfaceKind,
     /// IPv6: a temporary (privacy) address.
     pub temporary: bool,
+    /// The IPv4 default gateway of its interface ([`IfaceAddr::gateway_v4`]):
+    /// the inside address of a [`NatBox`] ([`NatBox::lan`]) whose router
+    /// its [`MemMapper`] asks.
+    pub gateway_v4: Option<Ipv4Addr>,
 }
 
 impl MemAddr {
@@ -251,6 +269,7 @@ impl MemAddr {
             prefix_len: net.prefix_len(),
             kind: IfaceKind::Physical,
             temporary: false,
+            gateway_v4: None,
         }
     }
 
@@ -271,7 +290,7 @@ impl MemAddr {
             iface_index: u32::try_from(self.segment.0 + 1).unwrap_or(u32::MAX),
             iface_kind: self.kind,
             up: true,
-            gateway_v4: None,
+            gateway_v4: self.gateway_v4,
         }
     }
 }
@@ -323,6 +342,20 @@ impl MachineSpec {
         self
     }
 
+    /// The same machine, its last address's interface reporting `gateway`
+    /// as its IPv4 default gateway ([`MemAddr::gateway_v4`]).
+    ///
+    /// # Panics
+    ///
+    /// If the machine has no address yet, or `gateway` is not an IPv4
+    /// address.
+    #[must_use]
+    pub fn gateway(mut self, gateway: &str) -> Self {
+        let last = self.addrs.last_mut().expect("an address to give a gateway");
+        last.gateway_v4 = Some(gateway.parse().expect("an IPv4 gateway"));
+        self
+    }
+
     fn route_sources(&self) -> RouteSources {
         self.sources.unwrap_or_else(|| RouteSources {
             v4: self.addrs.iter().find_map(|a| match a.ip {
@@ -354,6 +387,14 @@ pub enum Fate {
     Filtered,
     /// The receiving socket's queue was full ([`INBOX_LIMIT`]).
     Overflow,
+    /// A [`NatBox`] had nothing for it: no mapping and no forward at its
+    /// destination port (a firewall: no flow of its destination address).
+    NoMapping,
+    /// A [`NatBox`]'s filtering refused its source ([`NatFiltering`]).
+    NatFiltered,
+    /// It was sent from inside a [`NatBox`] to that box's own public
+    /// address, and the box does not hairpin.
+    NoHairpin,
 }
 
 /// What a datagram on the wire looks like.
@@ -383,6 +424,9 @@ pub struct WireRecord {
     pub kind: WireKind,
     /// What became of it.
     pub fate: Fate,
+    /// Delivered: its source as the receiver saw it, after the
+    /// [`NatBox`]es on its way translated it.
+    pub seen_from: Option<SocketAddr>,
 }
 
 /// A machine's socket counters, over all its sockets.
@@ -423,6 +467,8 @@ struct NetState {
     segments: Vec<LinkSpec>,
     links: Vec<(Segment, Segment, LinkSpec)>,
     machines: Vec<Machine>,
+    nats: Vec<nat::Nat>,
+    names: HashMap<String, Vec<IpAddr>>,
     wire: Vec<WireRecord>,
 }
 
@@ -430,6 +476,35 @@ struct Machine {
     spec: MachineSpec,
     sockets: Vec<(u16, Weak<MemUdp>)>,
     counters: MemCounters,
+    /// Counts the releases of the mappings its [`MemMapper`] made.
+    releases: ReleaseTracker,
+}
+
+/// The most boxes a datagram crosses (a loop in a test's topology ends
+/// there as [`Fate::Unroutable`]).
+const MAX_HOPS: usize = 8;
+
+/// The next step of a datagram from a segment toward an address.
+enum Hop {
+    /// To a machine holding the address, over this spec.
+    Machine(usize, LinkSpec),
+    /// Into a [`NatBox`] from its outside (to its public address, or to an
+    /// address behind a firewall), over this spec.
+    Inbound(usize, LinkSpec),
+    /// Out through the [`NatBox`] behind which the segment is, over the
+    /// segment.
+    Outbound(usize, LinkSpec),
+}
+
+/// Where a datagram arrives: the machine, its source and destination as
+/// the machine sees them, the latency of the hops before the last, and the
+/// last hop's spec.
+struct Arrives {
+    machine: usize,
+    from: SocketAddr,
+    to: SocketAddr,
+    before: Duration,
+    last: LinkSpec,
 }
 
 impl NetState {
@@ -451,31 +526,166 @@ impl NetState {
         draw < loss
     }
 
-    /// The machine holding `ip` that `from` reaches, and the path's spec:
-    /// one on the same segment first, then one on a linked segment.
-    fn reach(&self, from: Segment, ip: IpAddr) -> Option<(usize, LinkSpec)> {
-        let holders = || {
-            self.machines.iter().enumerate().flat_map(move |(id, m)| {
+    /// The machines holding `ip` on `segment`, in order.
+    fn holders(&self, segment: Segment, ip: IpAddr) -> impl Iterator<Item = usize> + '_ {
+        self.machines
+            .iter()
+            .enumerate()
+            .filter(move |(_, m)| {
                 m.spec
                     .addrs
                     .iter()
-                    .filter(move |a| a.ip == ip)
-                    .map(move |a| (id, a.segment))
+                    .any(|a| a.ip == ip && a.segment == segment)
             })
-        };
-        holders()
-            .find(|(_, segment)| *segment == from)
-            .map(|(id, segment)| (id, self.segments[segment.0]))
-            .or_else(|| {
-                holders().find_map(|(id, segment)| {
-                    self.links
-                        .iter()
-                        .find(|(a, b, _)| {
-                            (*a == from && *b == segment) || (*a == segment && *b == from)
-                        })
-                        .map(|(_, _, spec)| (id, *spec))
-                })
-            })
+            .map(|(id, _)| id)
+    }
+
+    /// Whether `segment` holds `ip`: a machine's address, or the public
+    /// address of a translating [`NatBox`] outside on it.
+    fn has(&self, segment: Segment, ip: IpAddr) -> bool {
+        self.holders(segment, ip).next().is_some()
+            || self
+                .nats
+                .iter()
+                .any(|n| n.spec.outside == segment && n.public_is(ip))
+    }
+
+    /// The [`NatBox`] outside on `segment` that takes a datagram to `ip`
+    /// in: a translating one at its public address, a firewall when a
+    /// segment behind it holds `ip`.
+    fn inbound_at(&self, segment: Segment, ip: IpAddr) -> Option<usize> {
+        self.nats.iter().position(|n| {
+            n.spec.outside == segment
+                && if n.spec.translate {
+                    n.public_is(ip)
+                } else {
+                    ip.is_ipv6() && n.spec.inside.iter().any(|s| self.has(*s, ip))
+                }
+        })
+    }
+
+    /// The link between `a` and `b`, if any.
+    fn link_between(&self, a: Segment, b: Segment) -> Option<LinkSpec> {
+        self.links
+            .iter()
+            .find(|(x, y, _)| (*x == a && *y == b) || (*x == b && *y == a))
+            .map(|(_, _, spec)| *spec)
+    }
+
+    /// The next hop from `segment` toward `ip`: a machine holding it on
+    /// the segment, a box taking it in there, then the same on a linked
+    /// segment, then a machine on another segment behind the same box, then
+    /// out through the box the segment is behind (IPv4 through a
+    /// translating box, IPv6 through a firewall).
+    fn hop(&self, segment: Segment, ip: IpAddr) -> Option<Hop> {
+        let here = self.segments[segment.0];
+        if let Some(id) = self.holders(segment, ip).next() {
+            return Some(Hop::Machine(id, here));
+        }
+        if let Some(n) = self.inbound_at(segment, ip) {
+            return Some(Hop::Inbound(n, here));
+        }
+        let linked = self.machines.iter().enumerate().find_map(|(id, m)| {
+            m.spec
+                .addrs
+                .iter()
+                .filter(|a| a.ip == ip)
+                .find_map(|a| self.link_between(segment, a.segment))
+                .map(|spec| Hop::Machine(id, spec))
+        });
+        if linked.is_some() {
+            return linked;
+        }
+        for (a, b, spec) in &self.links {
+            let other = if *a == segment {
+                *b
+            } else if *b == segment {
+                *a
+            } else {
+                continue;
+            };
+            if let Some(n) = self.inbound_at(other, ip) {
+                return Some(Hop::Inbound(n, *spec));
+            }
+        }
+        let behind = |n: &nat::Nat| n.spec.inside.contains(&segment);
+        for n in self.nats.iter().filter(|n| behind(n)) {
+            for inside in &n.spec.inside {
+                if let Some(id) = self.holders(*inside, ip).next() {
+                    return Some(Hop::Machine(id, here));
+                }
+            }
+        }
+        self.nats
+            .iter()
+            .position(|n| behind(n) && n.carries(ip))
+            .map(|n| Hop::Outbound(n, here))
+    }
+
+    /// The segment behind box `n` that holds `ip` (its first otherwise).
+    fn inside_toward(&self, n: usize, ip: IpAddr) -> Segment {
+        let inside = &self.nats[n].spec.inside;
+        inside
+            .iter()
+            .copied()
+            .find(|s| self.has(*s, ip))
+            .unwrap_or(inside[0])
+    }
+
+    /// The way of a datagram from `from` on `segment` to `to` (both
+    /// canonical) through the boxes on its way: where it arrives, or why
+    /// it does not. The hops through boxes draw their loss here; the last
+    /// hop's is drawn by the caller, after the receiving socket and its
+    /// firewall, as before there were boxes.
+    fn route(
+        &mut self,
+        segment: Segment,
+        from: SocketAddr,
+        to: SocketAddr,
+        now: Instant,
+    ) -> Result<Arrives, Fate> {
+        let (mut segment, mut from, mut to) = (segment, from, to);
+        let mut before = Duration::ZERO;
+        for _ in 0..MAX_HOPS {
+            match self.hop(segment, to.ip()).ok_or(Fate::Unroutable)? {
+                Hop::Machine(machine, last) => {
+                    return Ok(Arrives {
+                        machine,
+                        from,
+                        to,
+                        before,
+                        last,
+                    });
+                }
+                Hop::Inbound(n, spec) => {
+                    if self.lost(spec.loss) {
+                        return Err(Fate::Lost);
+                    }
+                    before += spec.latency;
+                    to = self.nats[n].inbound(from, to, now)?;
+                    segment = self.inside_toward(n, to.ip());
+                }
+                Hop::Outbound(n, spec) => {
+                    if self.lost(spec.loss) {
+                        return Err(Fate::Lost);
+                    }
+                    before += spec.latency;
+                    let nat = &mut self.nats[n];
+                    let hairpin = nat.spec.translate && nat.public_is(to.ip());
+                    if hairpin && !nat.spec.hairpin {
+                        return Err(Fate::NoHairpin);
+                    }
+                    from = nat.outbound(from, to, now);
+                    if hairpin {
+                        to = nat.inbound(from, to, now)?;
+                        segment = self.inside_toward(n, to.ip());
+                    } else {
+                        segment = nat.spec.outside;
+                    }
+                }
+            }
+        }
+        Err(Fate::Unroutable)
     }
 }
 
@@ -496,6 +706,8 @@ impl MemNet {
                     segments: Vec::new(),
                     links: Vec::new(),
                     machines: Vec::new(),
+                    nats: Vec::new(),
+                    names: HashMap::new(),
                     wire: Vec::new(),
                 }),
             }),
@@ -523,11 +735,36 @@ impl MemNet {
             spec,
             sockets: Vec::new(),
             counters: MemCounters::default(),
+            releases: ReleaseTracker::new(),
         });
         MemHost {
             net: Arc::clone(&self.net),
             id: state.machines.len() - 1,
         }
+    }
+
+    /// A new [`NatBox`] between its inside segments and its outside one.
+    ///
+    /// # Panics
+    ///
+    /// If `spec` has no inside segment.
+    #[must_use]
+    pub fn nat(&self, spec: NatBox) -> MemNat {
+        assert!(!spec.inside.is_empty(), "a box with a segment behind it");
+        let mut state = lock(&self.net.state);
+        state.nats.push(nat::Nat::new(spec));
+        MemNat {
+            net: Arc::clone(&self.net),
+            id: state.nats.len() - 1,
+        }
+    }
+
+    /// `host` resolves to `ips` for every machine of the network, from now
+    /// on.
+    pub fn name(&self, host: &str, ips: &[IpAddr]) {
+        lock(&self.net.state)
+            .names
+            .insert(host.to_owned(), ips.to_vec());
     }
 
     /// Every datagram sent so far, in order.
@@ -543,6 +780,7 @@ impl fmt::Debug for MemNet {
         f.debug_struct("MemNet")
             .field("segments", &state.segments.len())
             .field("machines", &state.machines.len())
+            .field("nats", &state.nats.len())
             .field("datagrams", &state.wire.len())
             .finish()
     }
@@ -605,6 +843,7 @@ impl MemHost {
             machine: self.id,
             port,
             dual_stack: machine.spec.dual_stack,
+            spoof: Mutex::new(None),
             state: Mutex::default(),
         });
         machine.sockets.push((port, Arc::downgrade(&socket)));
@@ -638,16 +877,22 @@ impl NetEnv for MemHost {
         })
     }
 
-    /// No name resolves on an in-memory network yet: its STUN servers
-    /// arrive at step B8.
-    fn resolve(&self, _host: &str, _port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
-        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    /// The network's table ([`MemNet::name`]), at once; a name it lacks
+    /// is `NotFound`.
+    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        let found = lock(&self.net.state).names.get(host).map(|ips| {
+            ips.iter()
+                .map(|ip| SocketAddr::new(*ip, port))
+                .collect::<Vec<_>>()
+        });
+        Box::pin(async move { found.ok_or_else(|| io::ErrorKind::NotFound.into()) })
     }
 
-    /// No router yet ([`NoMapper`]): the in-memory routers arrive at step
-    /// B8.
+    /// The machine's [`MemMapper`]: it asks the router of the [`NatBox`]
+    /// whose inside address is the request's gateway.
     fn mapper(&self) -> Arc<dyn PortMapper> {
-        Arc::new(NoMapper)
+        let releases = lock(&self.net.state).machines[self.id].releases.clone();
+        Arc::new(MemMapper::new(Arc::clone(&self.net), self.id, releases))
     }
 }
 
@@ -667,6 +912,9 @@ pub struct MemUdp {
     machine: usize,
     port: u16,
     dual_stack: bool,
+    /// The source every datagram carries instead of this machine's own
+    /// ([`MemUdp::spoof_as`]).
+    spoof: Mutex<Option<SocketAddr>>,
     state: Mutex<UdpState>,
 }
 
@@ -697,6 +945,14 @@ impl MemUdp {
     #[must_use]
     pub fn dual_stack(&self) -> bool {
         self.dual_stack
+    }
+
+    /// From now on, every datagram this socket sends carries `from` as its
+    /// source (an off-path attacker's forged datagrams), leaving from the
+    /// segment of the machine's first address; `None` ends it. The wire
+    /// records the forged source.
+    pub fn spoof_as(&self, from: Option<SocketAddr>) {
+        *lock(&self.spoof) = from.map(canon);
     }
 
     fn count(&self, change: impl FnOnce(&mut MemCounters)) {
@@ -776,43 +1032,53 @@ impl MemUdp {
         true
     }
 
-    /// Puts one datagram on the wire from `from` (this machine's) to `to`
-    /// (both canonical) and logs its fate.
-    fn carry(&self, from: SocketAddr, to: SocketAddr, bytes: &[u8], now: Instant) {
+    /// Puts one datagram on the wire from `from` on `segment` (this
+    /// machine's, unless spoofed) to `to` (both canonical) and logs its
+    /// fate.
+    fn carry(
+        &self,
+        segment: Option<Segment>,
+        from: SocketAddr,
+        to: SocketAddr,
+        bytes: &[u8],
+        now: Instant,
+    ) {
         let mut state = lock(&self.net.state);
         state.machines[self.machine].counters.sent += 1;
-        let segment = state.machines[self.machine]
-            .spec
-            .addrs
-            .iter()
-            .find(|a| a.ip == from.ip())
-            .map(|a| a.segment);
-        let fate = match segment.and_then(|segment| state.reach(segment, to.ip())) {
-            None => Fate::Unroutable,
-            Some((target, spec)) => {
+        let routed = match segment {
+            None => Err(Fate::Unroutable),
+            Some(segment) => state.route(segment, from, to, now),
+        };
+        let mut seen_from = None;
+        let fate = match routed {
+            Err(fate) => fate,
+            Ok(arrives) => {
+                let target = arrives.machine;
                 let socket = state.machines[target]
                     .sockets
                     .iter()
-                    .find(|(port, _)| *port == to.port())
+                    .find(|(port, _)| *port == arrives.to.port())
                     .and_then(|(_, socket)| socket.upgrade())
-                    .filter(|socket| socket.dual_stack || to.is_ipv4());
+                    .filter(|socket| socket.dual_stack || arrives.to.is_ipv4());
                 match socket {
                     None => Fate::NoSocket,
                     Some(socket) => {
                         let admitted = match state.machines[target].spec.inbound {
                             InboundRule::Open => true,
-                            InboundRule::Stateful => socket.solicited(from, now),
+                            InboundRule::Stateful => socket.solicited(arrives.from, now),
                             InboundRule::Blocked => false,
                         };
                         if !admitted {
                             Fate::Filtered
-                        } else if state.lost(spec.loss) {
+                        } else if state.lost(arrives.last.loss) {
                             Fate::Lost
                         } else {
                             state.seq += 1;
                             let seq = state.seq;
-                            if socket.arrive(now + spec.latency, seq, from, to.ip(), bytes) {
+                            let at = now + arrives.before + arrives.last.latency;
+                            if socket.arrive(at, seq, arrives.from, arrives.to.ip(), bytes) {
                                 state.machines[target].counters.received += 1;
+                                seen_from = Some(arrives.from);
                                 Fate::Delivered
                             } else {
                                 Fate::Overflow
@@ -836,6 +1102,7 @@ impl MemUdp {
             len: bytes.len(),
             kind,
             fate,
+            seen_from,
         });
     }
 }
@@ -868,16 +1135,33 @@ impl AsyncUdpSocket for MemUdp {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let to = canon(transmit.destination);
-        let src = self.source(to.ip(), transmit.src_ip.map(canon_ip))?;
+        let spoofed = *lock(&self.spoof);
+        let (from, segment) = match spoofed {
+            Some(forged) => {
+                let state = lock(&self.net.state);
+                let first = state.machines[self.machine].spec.addrs.first();
+                (forged, first.map(|a| a.segment))
+            }
+            None => {
+                let src = self.source(to.ip(), transmit.src_ip.map(canon_ip))?;
+                let state = lock(&self.net.state);
+                let segment = state.machines[self.machine]
+                    .spec
+                    .addrs
+                    .iter()
+                    .find(|a| a.ip == src)
+                    .map(|a| a.segment);
+                (SocketAddr::new(src, self.port), segment)
+            }
+        };
         let now = Instant::now();
         lock(&self.state).sent_to.insert(to, now);
-        let from = SocketAddr::new(src, self.port);
         let size = transmit
             .segment_size
             .unwrap_or(transmit.contents.len())
             .max(1);
-        for segment in transmit.contents.chunks(size) {
-            self.carry(from, to, segment, now);
+        for chunk in transmit.contents.chunks(size) {
+            self.carry(segment, from, to, chunk, now);
         }
         Ok(())
     }

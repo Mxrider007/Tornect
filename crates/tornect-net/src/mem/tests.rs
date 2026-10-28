@@ -2,6 +2,8 @@ use super::*;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+mod nat;
+
 fn ip(text: &str) -> IpAddr {
     text.parse().expect("an address")
 }
