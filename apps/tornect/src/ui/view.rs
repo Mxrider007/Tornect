@@ -712,23 +712,25 @@ pub fn main_window(
                 password_prompt(ui, prompt, model.screen_shared(now), form, now, actions);
                 ui.add_space(12.0);
             } else {
-                ui.skip_ahead_auto_ids(1);
                 if model.prompt.is_none() {
                     ui.ctx().data_mut(|d| {
                         d.remove::<egui::text_edit::TextEditState>(egui::Id::new(PASSWORD_FIELD));
                     });
                 }
-            }
-            // The one-time notice that direct connections are on (design
-            // `direct` §3.6), under the questions and the prompt, above the
-            // page. It waits while either is up, and while this screen is
-            // shared: its switch saves a setting, which is refused then.
-            // Without it the page's widgets keep the ids they always had;
-            // with it they move by one until its OK, once.
-            if model.direct_notice && !asking && model.prompt.is_none() && !model.screen_shared(now)
-            {
-                direct_notice(ui, model, actions);
-                ui.add_space(12.0);
+                // The one-time notice that direct connections are on (design
+                // `direct` §3.6), in the prompt's place (never both), above
+                // the page. It waits under a question, while the prompt is up
+                // and while this screen is shared: its switch saves a
+                // setting, which is refused then. Drawn or not, it takes the
+                // prompt's one id (the card is one child), so the page's
+                // widgets keep their ids and a field of the page keeps the
+                // focus when the card waits for a question and comes back.
+                if model.direct_notice && !asking && !model.screen_shared(now) {
+                    direct_notice(ui, model, actions);
+                    ui.add_space(12.0);
+                } else {
+                    ui.skip_ahead_auto_ids(1);
+                }
             }
             egui::ScrollArea::vertical()
                 .id_salt("page")
@@ -4016,6 +4018,54 @@ mod tests {
             assert!(!window.texts().contains(&notice), "{case}");
             assert!(!window.has(switch), "{case}");
         }
+    }
+
+    /// The review of step B11: with the notice latched, a field of the page
+    /// being typed into keeps the focus while a question comes, which the
+    /// card waits under, and goes again: the page's widgets have the same
+    /// ids whether the card is drawn or not.
+    #[test]
+    fn a_page_field_keeps_the_focus_while_the_notice_waits_under_a_question() {
+        let t0 = Instant::now();
+        let notice = DIRECT_NOTICE.to_owned();
+        let mut model = with_popups(Vec::new());
+        model.settings.internet = true;
+        model.direct_notice = true;
+        let mut window = Harness::new(model, t0);
+        assert!(window.texts().contains(&notice));
+        let b = window
+            .nodes
+            .iter()
+            .find(|n| n.role() == egui::accesskit::Role::TextInput)
+            .and_then(egui::accesskit::Node::bounds)
+            .expect("the connect field");
+        let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+        assert!(window.click(t0, at).is_empty());
+        let field = window.ctx.memory(|m| m.focused());
+        assert!(field.is_some(), "the field has the focus");
+        // egui's clock only moves forward: each pass 100 ms after the last.
+        let mut now = t0 + Duration::from_millis(50);
+        let mut pass = |window: &mut Harness, events: Vec<egui::Event>| {
+            now += Duration::from_millis(100);
+            window.pass(now, events)
+        };
+        pass(&mut window, vec![egui::Event::Text("ab".to_owned())]);
+        assert_eq!(window.form.connect_to, "ab");
+
+        window.model.popups = vec![session_popup(7, t0)];
+        for _ in 0..2 {
+            pass(&mut window, Vec::new());
+        }
+        assert!(!window.texts().contains(&notice), "the card waits");
+        assert_eq!(window.ctx.memory(|m| m.focused()), field, "a question");
+        window.model.popups.clear();
+        for _ in 0..2 {
+            pass(&mut window, Vec::new());
+        }
+        assert!(window.texts().contains(&notice), "the card is back");
+        assert_eq!(window.ctx.memory(|m| m.focused()), field, "it went");
+        pass(&mut window, vec![egui::Event::Text("c".to_owned())]);
+        assert_eq!(window.form.connect_to, "abc", "typed into the same field");
     }
 
     /// Decision M1-75 (3), the final review: once capture says it lists two
