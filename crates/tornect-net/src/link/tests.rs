@@ -617,3 +617,4 @@ async fn no_debug_prints_an_address() {
 }
 
 mod memnet;
+mod nat;
