@@ -511,6 +511,48 @@ async fn shut_ends_the_link_whoever_else_holds_it() {
     assert!(held.is_shut());
 }
 
+/// Design §6.5 and §6.7: a connection lets the viewer open the media
+/// stream only; [`Established::allow_second_stream`] on the host's end
+/// lets a second open (the services stream), and no third.
+#[tokio::test]
+async fn a_second_stream_opens_only_once_the_host_allows_it() {
+    let mut pair = start_pair(
+        Arc::new(LoopbackNet::new(90)),
+        Arc::new(LoopbackNet::new(91)),
+        (1, 2),
+    )
+    .await;
+    let (viewer, host) = both_established(&mut pair).await;
+    let (_viewer_media, _host_media) = media_stream(&viewer, &host).await;
+    let waits = Duration::from_millis(300);
+    assert!(
+        tokio::time::timeout(waits, viewer.open_stream(0))
+            .await
+            .is_err(),
+        "a second stream before the host allowed it"
+    );
+    host.allow_second_stream();
+    let mut services = within(5, viewer.open_stream(0))
+        .await
+        .expect("the services stream");
+    services.write_all(b"svc").await.expect("a write");
+    let mut host_services = within(5, host.accept_stream())
+        .await
+        .expect("the services stream");
+    let mut first = [0; 3];
+    host_services
+        .read_exact(&mut first)
+        .await
+        .expect("the first bytes");
+    assert_eq!(&first, b"svc");
+    assert!(
+        tokio::time::timeout(waits, viewer.open_stream(0))
+            .await
+            .is_err(),
+        "a third stream"
+    );
+}
+
 /// Every message of `e` and of each error under it, and its `Debug`.
 fn error_texts(e: &(dyn std::error::Error + 'static)) -> Vec<String> {
     let mut texts = vec![format!("{e:?}")];

@@ -451,9 +451,10 @@ async fn chat_heard(heard: &mut mpsc::UnboundedReceiver<(String, HostEvent)>, id
 
 /// Step B10 (the direct design §6.7, §12.1 "services direct") over real
 /// sockets: the viewer opens the services stream as the second stream of
-/// the session's QUIC connection once its media is bound, `DirectHost`
-/// hands it to the services host, which binds it under the direct services
-/// MAC and grants the direct bulk window; chat goes both ways over it while
+/// the session's QUIC connection once its media is bound (not before: the
+/// connection allows it only from the claim on), `DirectHost` hands it to
+/// the services host, which binds it under the direct services MAC and
+/// grants the direct bulk window; chat goes both ways over it while
 /// pictures keep arriving on the media stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_direct_session_carries_its_services_beside_the_media() {
@@ -471,6 +472,13 @@ async fn a_direct_session_carries_its_services_beside_the_media() {
     let PathChoice::Direct(media) = choice else {
         panic!("not direct: {choice:?}");
     };
+    // Before the `Bind`, the connection allows the media stream only.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), media.link.open_stream(0))
+            .await
+            .is_err(),
+        "a second stream before the media's claim"
+    );
     let DirectBound {
         media: viewer_media,
         services: direct,
@@ -489,8 +497,9 @@ async fn a_direct_session_carries_its_services_beside_the_media() {
     assert_eq!(welcome.bulk_window, DIRECT_BULK_WINDOW);
     assert_ne!(welcome.caps & tornect_proto::services::caps::CHAT, 0);
     assert_eq!(services.host.open_streams(), 1);
-    // The host's transport parameters allow two bidirectional streams
-    // (`tornect_net::quic::HOST_STREAMS`): a third waits for credit.
+    // The host raised the connection's limit to two bidirectional streams
+    // at the claim (`tornect_net::quic::HOST_STREAMS_WITH_SERVICES`): a
+    // third waits for credit.
     assert!(
         tokio::time::timeout(Duration::from_millis(300), direct.open())
             .await
@@ -559,6 +568,62 @@ async fn a_direct_session_carries_its_services_beside_the_media() {
         media_task.await.unwrap().expect("the media ran"),
         ViewerEnd::Stopped
     );
+    lx.session.bye(bye::USER).await.unwrap();
+    let (transport, path) = lx.ends.line().await;
+    assert_eq!(transport, Some(TransportKind::Lan));
+    assert_eq!(path.expect("a path summary").outcome, "direct");
+    lx.fsm.await.unwrap().unwrap();
+}
+
+/// A host without services (no [`SecondStream`]) never lets a direct
+/// connection carry a second stream (the direct design §6.5, §6.7): its
+/// limit stays at the media stream (`tornect_net::quic::HOST_STREAMS`)
+/// after the claim too, and the session runs direct as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_host_without_services_lets_the_media_stream_only_open() {
+    let mut lx = on_loopback(46, 47).await;
+    assert!(!lx.session.host_has(feats::SVC1));
+    let choice = lx
+        .viewer
+        .choose_path(
+            &mut lx.session,
+            Mine::of(TransportPolicy::Any),
+            true,
+            pending(),
+        )
+        .await;
+    let PathChoice::Direct(media) = choice else {
+        panic!("not direct: {choice:?}");
+    };
+    let link = media.link.clone();
+    let DirectBound {
+        media: viewer_media,
+        services,
+    } = media.bind(BIND_WAIT).await.expect("bound");
+    assert!(services.is_none(), "no svc1, no services binding");
+    assert_eq!(lx.rig.host.route(&lx.session_id), Some(TransportKind::Lan));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), link.open_stream(0))
+            .await
+            .is_err(),
+        "a second stream on a host without services"
+    );
+    let (stop_media, media_stopped) = oneshot::channel::<()>();
+    let media_task = tokio::spawn(async move {
+        let mut sink = Tally(Arc::new(AtomicUsize::new(0)));
+        let mut stats = ViewerStats::default();
+        viewer_media
+            .run(&mut sink, &mut stats, async {
+                let _ = media_stopped.await;
+            })
+            .await
+    });
+    stop_media.send(()).unwrap();
+    assert_eq!(
+        media_task.await.unwrap().expect("the media ran"),
+        ViewerEnd::Stopped
+    );
+    drop(link);
     lx.session.bye(bye::USER).await.unwrap();
     let (transport, path) = lx.ends.line().await;
     assert_eq!(transport, Some(TransportKind::Lan));
@@ -794,8 +859,13 @@ impl Serving {
             assert_eq!(stopped, Some(TransferState::ended(code)));
         }
         assert_eq!(summary.files_out, 0);
-        assert_eq!(self.services.host.open_streams(), 0);
         assert!(!self.services.host.has_control(&self.lx.session_id));
+        // The stream's count drops as its task returns, just after it told
+        // its summary.
+        until("the host's services stream over", || {
+            self.services.host.open_streams() == 0
+        })
+        .await;
 
         tokio::time::timeout(WAIT, self.media_task)
             .await

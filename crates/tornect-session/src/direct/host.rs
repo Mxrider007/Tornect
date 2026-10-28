@@ -229,8 +229,9 @@ impl DirectHost {
     /// is recognised), `settings` the `[network]` options, `env` the
     /// network, `kill` the host-wide kill switch, `on_media` what hears each
     /// direct media stream's end. `second` serves the connection's second
-    /// stream ([`SecondStream`]): the services stream; `None` accepts no
-    /// second stream.
+    /// stream ([`SecondStream`]): the services stream; `None` never lets a
+    /// connection carry one (its limit stays at the media stream,
+    /// [`tornect_net::quic::HOST_STREAMS`]).
     #[must_use]
     pub fn new(
         media: Arc<MediaHost>,
@@ -741,7 +742,9 @@ impl Task {
     }
 
     /// The session's media was claimed on its link: the link stays for it,
-    /// and the second stream may come.
+    /// and, when this host serves services, the viewer may open the second
+    /// stream on this connection (its limit is raised here, never before
+    /// the claim, never on another connection).
     fn on_direct_claim(&mut self) {
         if self.direct_claim {
             return;
@@ -756,6 +759,7 @@ impl Task {
         };
         open.linger_at = None;
         if let (Some(second), Some(conn)) = (&self.second, &open.conn) {
+            conn.allow_second_stream();
             let (second, conn) = (Arc::clone(second), conn.clone());
             let (id, token) = (self.id.clone(), self.token.clone());
             // Its own task, as the onion path's services streams run: the

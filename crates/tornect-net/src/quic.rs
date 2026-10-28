@@ -122,11 +122,21 @@ pub const INCOMING_BUFFER: u64 = 64 << 10;
 /// ignored while they run; none is ever dropped for a newer one.
 pub const MAX_PENDING_HANDSHAKES: usize = 4;
 
-/// The bidirectional streams a viewer may open to the host at once (design
-/// §6.5): the media stream and the services stream (§6.7). The host
-/// accepts the second only once the media was claimed on the connection; a
-/// stream past those it never accepts holds at most the stream window.
-pub const HOST_STREAMS: u32 = 2;
+/// The bidirectional streams a viewer may open to the host at once from
+/// the handshake on (design §6.5): the media stream only. A host that
+/// serves services raises it to [`HOST_STREAMS_WITH_SERVICES`] on one
+/// connection once the session's media was claimed there
+/// ([`Established::allow_second_stream`]); no other connection, and no
+/// connection before its claim, can open a second.
+///
+/// [`Established::allow_second_stream`]: crate::link::Established::allow_second_stream
+pub const HOST_STREAMS: u32 = 1;
+
+/// The bidirectional streams a viewer may open to the host at once on a
+/// connection whose media was claimed, when the host serves services: the
+/// media stream and the services stream (design §6.7). A stream past those
+/// waits for credit and never reaches the host.
+pub const HOST_STREAMS_WITH_SERVICES: u32 = 2;
 
 /// The application close code of a connection that failed [`check_peer`];
 /// its peer is not the device this side pinned, so no Tornect reason
@@ -555,8 +565,8 @@ pub fn endpoint_config() -> quinn::EndpointConfig {
 /// The transport parameters of `role` (design §6.5): idle 10 s, keep-alive
 /// 2 s, initial RTT 100 ms, no spin bit, no datagrams, no unidirectional
 /// streams; the viewer opens the bidirectional streams ([`HOST_STREAMS`]
-/// to the host, none the other way); 4 MiB per stream, 16 MiB per
-/// connection.
+/// to the host, which a host with services raises per connection; none the
+/// other way); 4 MiB per stream, 16 MiB per connection.
 #[must_use]
 pub fn transport(role: TornectRole) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();

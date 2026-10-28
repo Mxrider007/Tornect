@@ -763,6 +763,17 @@ impl Established {
         Ok(self.stream(send, recv))
     }
 
+    /// Lets the viewer open a second bidirectional stream beside the media
+    /// stream on this connection (the host, once the session's media was
+    /// claimed on it, when it serves services: design §6.7): the limit goes
+    /// from [`quic::HOST_STREAMS`] to [`quic::HOST_STREAMS_WITH_SERVICES`],
+    /// which quinn tells the viewer in a `MAX_STREAMS` frame. A viewer's open
+    /// waiting for that credit then completes.
+    pub fn allow_second_stream(&self) {
+        self.conn
+            .set_max_concurrent_bi_streams(VarInt::from_u32(quic::HOST_STREAMS_WITH_SERVICES));
+    }
+
     /// Accepts the next stream the viewer opened (the host).
     ///
     /// # Errors

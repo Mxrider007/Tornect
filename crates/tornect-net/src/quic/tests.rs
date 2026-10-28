@@ -710,7 +710,7 @@ fn the_configurations_are_the_designs() {
             );
         }
     }
-    assert!(host.contains("max_concurrent_bidi_streams: 2"), "{host}");
+    assert!(host.contains("max_concurrent_bidi_streams: 1"), "{host}");
     assert!(
         viewer.contains("max_concurrent_bidi_streams: 0"),
         "{viewer}"
@@ -810,8 +810,9 @@ fn hex(bytes: &[u8]) -> String {
 /// "quic"): both peers pass `check_peer`, present exactly their pinned
 /// keys, negotiate no ALPN and send no SNI; the exporters agree on one
 /// connection and differ across connections and tokens; the viewer opens
-/// the two streams the host allows (media and services) and no third, and
-/// the host can open none; every QUIC
+/// the one stream the host allows (media), then, once the host raised its
+/// limit for services, a second and no third; the host can open none;
+/// every QUIC
 /// datagram has the fixed bit set.
 #[tokio::test(start_paused = true)]
 async fn the_pinned_handshake_completes_with_either_side_dialling() {
@@ -887,8 +888,16 @@ async fn the_pinned_handshake_completes_with_either_side_dialling() {
                 .is_err(),
             "the viewer allows the host no stream"
         );
-        // The services stream (design §6.7): a second while the media
-        // stream is open, and no third.
+        // The services stream (design §6.7): none beside the media stream
+        // until the host raises its limit (after the media's claim), then a
+        // second, and no third.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), viewer_conn.open_bi())
+                .await
+                .is_err(),
+            "the host allows the viewer one stream until it raises the limit"
+        );
+        host_conn.set_max_concurrent_bi_streams(VarInt::from_u32(HOST_STREAMS_WITH_SERVICES));
         let _services = tokio::time::timeout(Duration::from_secs(1), viewer_conn.open_bi())
             .await
             .expect("the host allows the viewer a second stream")

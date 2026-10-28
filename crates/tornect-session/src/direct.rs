@@ -207,8 +207,10 @@ impl DirectSettings {
 /// media stream, and the link stays until both ended, within
 /// [`DIRECT_DRAIN`]; a link closed under it ends it through its I/O. The
 /// future [`Self::serve`] returns is always run to its end, so it may
-/// rely on its own teardown. A host without one never accepts a second
-/// stream: the viewer's waits unread, within the stream window
+/// rely on its own teardown. The connection's limit lets the viewer open
+/// the media stream only until that claim; [`DirectHost`] then raises it to
+/// two ([`Established::allow_second_stream`]) on that connection alone. A
+/// host without one never raises it, so a second stream never opens
 /// ([`tornect_net::quic::HOST_STREAMS`]).
 pub trait SecondStream: Send + Sync {
     /// Serve `stream` for session `expected_session`, on a connection whose

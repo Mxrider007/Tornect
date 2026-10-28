@@ -322,10 +322,11 @@ impl DirectServices {
     }
 
     /// Opens the stream. Call it only after the media stream's `BindOk`:
-    /// the host accepts it only once the media was claimed on this
-    /// connection. The host sees it once the `Bind` is written. A host
-    /// whose transport parameters allow one stream only never lets it open,
-    /// so the caller bounds the wait.
+    /// the host lets the viewer open it only once the media was claimed on
+    /// this connection (until then the connection allows the media stream
+    /// alone, [`tornect_net::quic::HOST_STREAMS`]), so the open waits for
+    /// that credit; a host that never gives it never lets it open, so the
+    /// caller bounds the wait. The host sees it once the `Bind` is written.
     ///
     /// # Errors
     ///
