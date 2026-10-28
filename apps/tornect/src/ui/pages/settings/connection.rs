@@ -101,7 +101,9 @@ pub(in super::super) const STUN_SWITCH: &str = "Use public STUN servers";
 /// Under [`STUN_SWITCH`]. The design's words, with the condition the
 /// operator split holds under (decision M1-81, the review of steps B2 and
 /// B3): each computer splits its own list, so two different lists can put
-/// one operator in both computers' parts.
+/// one operator in both computers' parts; and with the time of the first
+/// lookup (the review of step B11): once Tor is connected, which says
+/// whether it uses a bridge, not when Tornect starts.
 pub(in super::super) const STUN_LINE: &str = "To find this computer's internet address, Tornect \
                                               asks one public server per session (by default \
                                               from Cloudflare, Google, Twilio or Nextcloud; the \
@@ -110,9 +112,9 @@ pub(in super::super) const STUN_LINE: &str = "To find this computer's internet a
                                               starts, never which computer it connects to (when \
                                               both computers use the same list, as with the \
                                               default) and never the picture. Tornect looks up \
-                                              these servers' names when it starts and every 10 \
-                                              minutes. Off: direct connections across routers \
-                                              succeed less often.";
+                                              these servers' names once Tor is connected and \
+                                              every 10 minutes. Off: direct connections across \
+                                              routers succeed less often.";
 
 /// The router switch: on only while `network.upnp`, `nat_pmp` and `pcp`
 /// all are; it sets all three.

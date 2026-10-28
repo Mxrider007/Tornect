@@ -36,6 +36,9 @@ pub struct DirectKnobs {
     pub transport: TransportKnob,
     /// `network.direct_port` and `network.punch_timeout_ms`.
     pub direct: DirectSettings,
+    /// Whether Tor has bootstrapped once in this process
+    /// ([`DirectKnobs::bootstrapped`]).
+    tor_known: Arc<AtomicBool>,
 }
 
 impl DirectKnobs {
@@ -43,7 +46,9 @@ impl DirectKnobs {
     /// Tor went in ([`DirectKnobs::bootstrapped`]), the bridge state is what
     /// the configuration alone tells ([`bridged`] with the plain rung): a
     /// configured bridge counts from the start, so nothing goes direct
-    /// before Tor has said otherwise.
+    /// before Tor has said otherwise. With `tor.bridges = "auto"` that state
+    /// is a guess (the ladder may still go in through a bridge), so the STUN
+    /// names wait for the bootstrap ([`DirectKnobs::tor_known`]).
     #[must_use]
     pub fn new(cfg: &Config) -> Self {
         let transport = TransportKnob::new(&cfg.network);
@@ -51,6 +56,7 @@ impl DirectKnobs {
         Self {
             transport,
             direct: DirectSettings::from_network(&cfg.network),
+            tor_known: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -58,6 +64,18 @@ impl DirectKnobs {
     /// (decision M1-86), after every bootstrap.
     pub fn bootstrapped(&self, rung: Rung, tor: &config::Tor) {
         self.transport.set_bridged(bridged(rung, tor));
+        self.tor_known.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether Tor has said how it reaches the network: it bootstrapped
+    /// once in this process ([`DirectKnobs::bootstrapped`]). Until then no
+    /// STUN server's name is looked up ([`stun_names`], design `direct`
+    /// §5.3): a lookup would show a network where Tor needs a bridge that
+    /// Tornect is in use (decision M1-86), which the configuration alone
+    /// cannot rule out.
+    #[must_use]
+    pub fn tor_known(&self) -> bool {
+        self.tor_known.load(Ordering::SeqCst)
     }
 
     /// The `[network]` settings saved now (design `direct` §3.3: after each
@@ -119,6 +137,9 @@ pub struct RouterPorts {
     /// The STUN names the running refresh started with
     /// ([`RouterPorts::follow_stun`]); `None` before it starts.
     stun: Arc<Mutex<Option<Vec<String>>>>,
+    /// Whether this build's direct connections reach the internet
+    /// ([`INTERNET_DIRECT`]; tests set either).
+    internet: bool,
 }
 
 impl RouterPorts {
@@ -143,7 +164,28 @@ impl RouterPorts {
             log,
             swept: Arc::new(AtomicBool::new(false)),
             stun: Arc::new(Mutex::new(None)),
+            internet: INTERNET_DIRECT,
         }
+    }
+
+    /// The same, for a build whose direct connections reach the internet
+    /// (`internet`) or not, whatever [`INTERNET_DIRECT`] says.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_internet(mut self, internet: bool) -> Self {
+        self.internet = internet;
+        self
+    }
+
+    /// The STUN names the running refresh started with; `None` before one
+    /// started.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn stun_started(&self) -> Option<Vec<String>> {
+        self.stun
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The machine.
@@ -178,17 +220,19 @@ impl RouterPorts {
 
     /// The background refresh of the STUN servers' names follows `knobs`
     /// (design `direct` §5.3, [`RealNet::prefetch`]): it starts at the
-    /// first call, and starts again, with a round at once, whenever the
-    /// names [`stun_names`] gives for `roles` changed since the refresh
-    /// started. The app calls it at start, after each Tor bootstrap (the
-    /// bridge state) and after each settings save: a refresh that kept
-    /// running would leave a cleared cache cold, and a newly listed name
-    /// unanswered, until its next round, 10 minutes on. Each round reads
-    /// the knobs again; while no session may ask a STUN server the list is
-    /// empty, so nothing is looked up and the cache is emptied. Whether a
-    /// refresh was started (never outside a tokio runtime).
+    /// first call once Tor has bootstrapped ([`DirectKnobs::tor_known`];
+    /// before that a call starts nothing), and starts again, with a round at
+    /// once, whenever the names [`stun_names`] gives for `roles` changed
+    /// since the refresh started. The app calls it after each Tor bootstrap
+    /// (the bridge state, [`tor_bootstrapped`]) and after each settings
+    /// save: a refresh that kept running would leave a cleared cache cold,
+    /// and a newly listed name unanswered, until its next round, 10 minutes
+    /// on. Each round reads the knobs again; while no session may ask a STUN
+    /// server the list is empty, so nothing is looked up and the cache is
+    /// emptied. Whether a refresh was started (never outside a tokio
+    /// runtime).
     pub fn follow_stun(&self, knobs: &DirectKnobs, roles: &'static [TornectRole]) -> bool {
-        self.follow_stun_in(knobs, roles, INTERNET_DIRECT)
+        self.follow_stun_in(knobs, roles, self.internet)
     }
 
     /// [`follow_stun`](Self::follow_stun) for a build whose direct
@@ -199,6 +243,9 @@ impl RouterPorts {
         roles: &'static [TornectRole],
         internet: bool,
     ) -> bool {
+        if !knobs.tor_known() {
+            return false;
+        }
         let names = stun_names(knobs, roles, internet);
         let mut started = self.stun.lock().unwrap_or_else(PoisonError::into_inner);
         if started.as_ref() == Some(&names) {
@@ -268,12 +315,14 @@ pub const BOTH: &[TornectRole] = &[TornectRole::Viewer, TornectRole::Host];
 /// (design `direct` §5.3): the parts of `network.stun_servers` its `roles`
 /// ask ([`tornect_net::partition`]), in order, each once, while a session
 /// may ask a STUN server at all: a build whose direct connections reach the
-/// internet (`internet`: [`INTERNET_DIRECT`] outside tests), the effective
-/// policy `Any` (direct connections on, no bridge in use without its
-/// override, not `lan_only`) and `enable_stun`. Otherwise none.
+/// internet (`internet`: [`INTERNET_DIRECT`] outside tests), Tor has
+/// bootstrapped in this process and so said whether it uses a bridge
+/// ([`DirectKnobs::tor_known`]), the effective policy is `Any` (direct
+/// connections on, no bridge in use without its override, not `lan_only`)
+/// and `enable_stun` is on. Otherwise none.
 #[must_use]
 pub fn stun_names(knobs: &DirectKnobs, roles: &[TornectRole], internet: bool) -> Vec<String> {
-    if !internet || knobs.transport.get() != TransportPolicy::Any {
+    if !internet || !knobs.tor_known() || knobs.transport.get() != TransportPolicy::Any {
         return Vec::new();
     }
     let options = knobs.direct.get();
@@ -289,6 +338,26 @@ pub fn stun_names(knobs: &DirectKnobs, roles: &[TornectRole], internet: bool) ->
         }
     }
     names
+}
+
+/// Tor has bootstrapped through `rung` (configured as `tor`): the knobs
+/// take the bridge rule from now on (decision M1-86), then the STUN names'
+/// refresh, which waits for the first bootstrap, follows them
+/// ([`RouterPorts::follow_stun`]) with the parts of the list `roles` ask;
+/// none when `roles` is empty (a session that asks no STUN server). The
+/// window, `host` and `connect` call it after each bootstrap, before an
+/// onion service is published or a session starts.
+pub fn tor_bootstrapped(
+    knobs: &DirectKnobs,
+    router: Option<&RouterPorts>,
+    rung: Rung,
+    tor: &config::Tor,
+    roles: &'static [TornectRole],
+) {
+    knobs.bootstrapped(rung, tor);
+    if let (false, Some(router)) = (roles.is_empty(), router) {
+        router.follow_stun(knobs, roles);
+    }
 }
 
 /// `run`, then the end of the router mappings' lifecycle
@@ -1256,10 +1325,19 @@ mod tests {
         );
     }
 
+    /// Knobs for `cfg` after a bootstrap on plain Tor: the bridge state as
+    /// `cfg` alone says it, and Tor known.
+    fn bootstrapped_plain(cfg: &Config) -> DirectKnobs {
+        let knobs = DirectKnobs::new(cfg);
+        knobs.bootstrapped(Rung::Direct, &cfg.tor);
+        knobs
+    }
+
     /// Design `direct` §5.3: the STUN names looked up ahead of the
     /// sessions are those of the roles this process plays, each once, only
-    /// while a session may ask a STUN server: an internet build, the policy
-    /// `Any` and `enable_stun`. Otherwise none, which empties the cache.
+    /// while a session may ask a STUN server: an internet build, Tor
+    /// bootstrapped, the policy `Any` and `enable_stun`. Otherwise none,
+    /// which empties the cache.
     #[test]
     fn the_stun_names_follow_the_roles_and_the_knobs() {
         let mut cfg = Config::default();
@@ -1272,6 +1350,11 @@ mod tests {
         .map(str::to_owned)
         .to_vec();
         let knobs = DirectKnobs::new(&cfg);
+        assert!(
+            stun_names(&knobs, BOTH, true).is_empty(),
+            "before Tor has bootstrapped"
+        );
+        knobs.bootstrapped(Rung::Direct, &cfg.tor);
         let viewer = tornect_net::partition(&cfg.network.stun_servers, TornectRole::Viewer);
         let host = tornect_net::partition(&cfg.network.stun_servers, TornectRole::Host);
         assert_eq!(stun_names(&knobs, VIEWER, true), viewer);
@@ -1294,7 +1377,7 @@ mod tests {
             let mut cfg = cfg.clone();
             set(&mut cfg);
             assert!(
-                stun_names(&DirectKnobs::new(&cfg), BOTH, true).is_empty(),
+                stun_names(&bootstrapped_plain(&cfg), BOTH, true).is_empty(),
                 "{case}"
             );
         }
@@ -1320,6 +1403,9 @@ mod tests {
         cfg.network.stun_servers =
             vec!["192.0.2.1:3478".to_owned(), "198.51.100.1:3478".to_owned()];
         let knobs = DirectKnobs::new(&cfg);
+        assert!(!ports.follow_stun_in(&knobs, BOTH, true), "before Tor");
+        assert_eq!(ports.stun_started(), None);
+        knobs.bootstrapped(Rung::Direct, &cfg.tor);
         assert!(ports.follow_stun_in(&knobs, BOTH, true), "the first call");
         assert!(!ports.follow_stun_in(&knobs, BOTH, true), "nothing changed");
         // A save that turns STUN off: an empty list, started again.
@@ -1339,14 +1425,65 @@ mod tests {
         assert!(ports.net().stun_dns().is_empty(), "no literal is cached");
         // Outside a runtime nothing starts, and the next call in one does.
         let other = RouterPorts::new(&paths);
+        let known = knobs.clone();
         let (other, started) = std::thread::spawn(move || {
-            let started = other.follow_stun_in(&DirectKnobs::new(&Config::default()), BOTH, true);
+            let started = other.follow_stun_in(&known, BOTH, true);
             (other, started)
         })
         .join()
         .unwrap();
         assert!(!started);
         assert!(other.follow_stun(&knobs, BOTH));
+    }
+
+    /// The review of step B11 (design `direct` §5.3, decision M1-86): no
+    /// STUN server's name is looked up before Tor has said how it reaches
+    /// the network. With `tor.bridges = "auto"` the configuration alone
+    /// reads as plain Tor, though the last start went in through obfs4: a
+    /// refresh asked for then starts nothing. The first bootstrap through
+    /// the bridge starts it with no name (the cache is emptied, nothing
+    /// asked), one on plain Tor with this process's names; a process whose
+    /// session asks no STUN server (no roles) starts none.
+    #[tokio::test]
+    async fn no_stun_name_is_looked_up_before_tor_has_said_how_it_goes_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        paths.ensure().unwrap();
+        std::fs::write(paths.tor_transport_file(), Rung::Obfs4.as_str()).unwrap();
+        let last = tornect_signal::tor::last_good(&paths);
+        assert_eq!(last, Some(Rung::Obfs4));
+        let mut cfg = Config::default();
+        assert_eq!(cfg.tor.bridges, BridgeMode::Auto);
+        cfg.network.stun_servers =
+            vec!["192.0.2.1:3478".to_owned(), "198.51.100.1:3478".to_owned()];
+        let knobs = DirectKnobs::new(&cfg);
+        assert_eq!(knobs.transport.get(), TransportPolicy::Any, "the guess");
+        assert!(bridged_expected(&cfg.tor, last), "what doctor expects");
+        assert!(!knobs.tor_known());
+        assert!(stun_names(&knobs, BOTH, true).is_empty());
+
+        let ports = RouterPorts::new(&paths).with_internet(true);
+        assert!(!ports.follow_stun(&knobs, BOTH));
+        assert!(!ports.follow_stun(&knobs, HOST));
+        assert_eq!(ports.stun_started(), None, "nothing started");
+
+        tor_bootstrapped(&knobs, Some(&ports), Rung::Obfs4, &cfg.tor, BOTH);
+        assert!(knobs.tor_known());
+        assert_eq!(knobs.transport.get(), TransportPolicy::TorOnly);
+        assert_eq!(ports.stun_started(), Some(Vec::new()), "the bridge");
+        tor_bootstrapped(&knobs, Some(&ports), Rung::Direct, &cfg.tor, BOTH);
+        assert_eq!(
+            ports.stun_started(),
+            Some(stun_names(&knobs, BOTH, true)),
+            "plain Tor"
+        );
+        assert_eq!(ports.stun_started().map(|n| n.len()), Some(2));
+        assert!(ports.net().stun_dns().is_empty(), "no literal is cached");
+
+        let quiet = RouterPorts::new(&paths).with_internet(true);
+        tor_bootstrapped(&knobs, Some(&quiet), Rung::Direct, &cfg.tor, &[]);
+        assert_eq!(quiet.stun_started(), None, "no roles, no refresh");
+        tor_bootstrapped(&knobs, None, Rung::Direct, &cfg.tor, BOTH);
     }
 
     /// How long a test waits for the router lines' writer.

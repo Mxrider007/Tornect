@@ -5226,7 +5226,9 @@ mod tests {
         );
         assert_eq!(connection::STUN_SWITCH, "Use public STUN servers");
         // The design's words, with the condition the operator split holds
-        // under (decision M1-81; the review of steps B2 and B3).
+        // under (decision M1-81; the review of steps B2 and B3) and the time
+        // of the first lookup (the review of step B11: once Tor is
+        // connected, never before it has said whether it uses a bridge).
         assert_eq!(
             connection::STUN_LINE,
             "To find this computer's internet address, Tornect asks one public server per \
@@ -5234,8 +5236,8 @@ mod tests {
              config.toml). That server sees this computer's internet address and when a session \
              starts, never which computer it connects to (when both computers use the same list, \
              as with the default) and never the picture. Tornect looks up these servers' names \
-             when it starts and every 10 minutes. Off: direct connections across routers succeed \
-             less often."
+             once Tor is connected and every 10 minutes. Off: direct connections across routers \
+             succeed less often."
         );
         assert_eq!(
             connection::ROUTER_SWITCH,

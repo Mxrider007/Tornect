@@ -367,11 +367,6 @@ async fn run_host(
 ) -> anyhow::Result<()> {
     let knobs = direct.knobs.clone();
     let router = direct.router.clone();
-    // The STUN names' refresh follows the knobs (design `direct` §5.3): now,
-    // and again once Tor has said whether it uses a bridge.
-    if let Some(router) = &router {
-        router.follow_stun(&knobs, crate::direct::HOST);
-    }
     let prompter = Prompter::stdin();
     if prompter.is_none() {
         eprintln!("{}", crate::host::NO_TERMINAL_LINE);
@@ -431,10 +426,15 @@ async fn run_host(
     // Through a bridge, sessions are signed `tor_only` unless
     // `network.direct_with_bridges` (decision M1-86): set before the onion
     // service is published, so no accept is signed without it.
-    knobs.bootstrapped(node.rung(), &cfg.tor);
-    if let Some(router) = &router {
-        router.follow_stun(&knobs, crate::direct::HOST);
-    }
+    // The STUN names' refresh (design `direct` §5.3) starts only now, once
+    // Tor has said whether it uses a bridge.
+    crate::direct::tor_bootstrapped(
+        &knobs,
+        router.as_ref(),
+        node.rung(),
+        &cfg.tor,
+        crate::direct::HOST,
+    );
     // What an accept reveals from now on (design `direct` §3.5).
     if let Some(line) =
         crate::direct::notice_line(knobs.transport.get(), tornect_session::INTERNET_DIRECT)
@@ -1064,26 +1064,33 @@ async fn run_connect(
     opts: ConnectOpts,
     prepared: Option<Prepared>,
 ) -> anyhow::Result<()> {
-    // The STUN names' refresh follows the knobs (design `direct` §5.3), now
-    // and once Tor has said whether it uses a bridge; for a session that may
-    // go direct only: one paired only, without media or relayed by
-    // `--tor-only` asks no STUN server.
-    let stun = opts.video && !opts.tor_only && !opts.pair_only;
-    let follow_stun = || {
-        if let (true, Some(router)) = (stun, &direct.router) {
-            router.follow_stun(&direct.knobs, crate::direct::VIEWER);
-        }
-    };
-    follow_stun();
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
     // The bridge rule from the way Tor went in (decision M1-86), before the
-    // session decides its path.
-    direct.knobs.bootstrapped(node.rung(), &cfg.tor);
-    follow_stun();
+    // session decides its path; the STUN names' refresh (design `direct`
+    // §5.3) starts only now, once Tor has said whether it uses a bridge.
+    crate::direct::tor_bootstrapped(
+        &direct.knobs,
+        direct.router.as_ref(),
+        node.rung(),
+        &cfg.tor,
+        connect_stun_roles(&opts),
+    );
     let result = connect_session(&node, cfg, paths, id, direct, pins, opts, prepared).await;
     node.shutdown().await;
     result
+}
+
+/// The roles whose part of the STUN list `connect` looks up ahead of its
+/// session (design `direct` §5.3): the viewer's, for a session that may go
+/// direct; none for one paired only, without media, or relayed by
+/// `--tor-only`, which asks no STUN server.
+fn connect_stun_roles(opts: &ConnectOpts) -> &'static [tornect_net::TornectRole] {
+    if opts.video && !opts.tor_only && !opts.pair_only {
+        crate::direct::VIEWER
+    } else {
+        &[]
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // the command's context, one argument each
@@ -4499,6 +4506,39 @@ mod tests {
             router: None,
         }
         .ctx(tor_only)
+    }
+
+    /// The review of step B11 (design `direct` §5.3): `connect` looks up
+    /// the viewer's part of the STUN list, once its Tor has bootstrapped
+    /// (`crate::direct::tor_bootstrapped`), only for a session that may go
+    /// direct; one paired only, without media or relayed by `--tor-only`
+    /// starts no refresh at all.
+    #[test]
+    fn connect_looks_up_stun_names_only_for_a_session_that_may_go_direct() {
+        let video = ConnectOpts {
+            video: true,
+            ..ConnectOpts::default()
+        };
+        assert_eq!(connect_stun_roles(&video), crate::direct::VIEWER);
+        for (case, opts) in [
+            ("--no-video", ConnectOpts::default()),
+            (
+                "--pair-only",
+                ConnectOpts {
+                    pair_only: true,
+                    ..video
+                },
+            ),
+            (
+                "--tor-only",
+                ConnectOpts {
+                    tor_only: true,
+                    ..video
+                },
+            ),
+        ] {
+            assert!(connect_stun_roles(&opts).is_empty(), "{case}");
+        }
     }
 
     /// Who is told a session's route ([`crate::direct::OnRoute`]), and

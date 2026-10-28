@@ -613,19 +613,50 @@ fn start_notices(m: &mut super::model::Model, first: bool) {
     m.direct_notice = m.settings.direct_notice_due();
 }
 
+/// The roles of this window: it connects, and hosts unless started without
+/// its host role.
+fn window_roles(host: bool) -> &'static [tornect_net::TornectRole] {
+    if host {
+        crate::direct::BOTH
+    } else {
+        crate::direct::VIEWER
+    }
+}
+
 /// The STUN names' background refresh follows the knobs (design `direct`
-/// §5.3, [`crate::direct::RouterPorts::follow_stun`]): at the start, after
-/// each Tor bootstrap and after each save. This window connects, and hosts
-/// unless started without its host role.
+/// §5.3, [`crate::direct::RouterPorts::follow_stun`]) after each save; it
+/// starts at the first Tor bootstrap ([`tor_started`]), and a save before
+/// that starts nothing.
 fn follow_stun(b: &Backend) {
     if let Some(router) = &b.router {
-        let roles = if b.host {
-            crate::direct::BOTH
-        } else {
-            crate::direct::VIEWER
-        };
-        router.follow_stun(&b.knobs, roles);
+        router.follow_stun(&b.knobs, window_roles(b.host));
     }
+}
+
+/// Tor has bootstrapped through `rung`: the knobs take the bridge rule
+/// (decision M1-86), the window says what follows from it, and the STUN
+/// names' refresh starts or follows (design `direct` §5.3,
+/// [`crate::direct::tor_bootstrapped`]). Before the onion service is
+/// published again.
+fn tor_started(b: &Backend, rung: tornect_signal::tor::Rung) {
+    crate::direct::tor_bootstrapped(
+        &b.knobs,
+        b.router.as_ref(),
+        rung,
+        &b.cfg.tor,
+        window_roles(b.host),
+    );
+    b.shared.update(|m| follow_knobs(m, &b.knobs));
+}
+
+/// A settings change from the window ([`save_settings`]), then, once it was
+/// saved, the STUN names' refresh follows the saved knobs ([`follow_stun`]).
+fn save_from_window(b: &Backend, change: &SettingsChange) -> Option<Config> {
+    let saved = save_settings(&b.paths, &b.shared, &b.knobs, change);
+    if saved.is_some() {
+        follow_stun(b);
+    }
+    saved
 }
 
 /// The settings page's line when a change was not saved because this screen
@@ -2800,9 +2831,7 @@ async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Co
                 break;
             }
             Some(Command::SaveSettings(change)) => {
-                if save_settings(&b.paths, &b.shared, &b.knobs, &change).is_some() {
-                    follow_stun(b);
-                }
+                let _ = save_from_window(b, &change);
             }
             Some(Command::SetHistory(on)) => change_book(b, &Change::History(on)),
             Some(Command::ClearHistory) => change_book(b, &Change::Clear),
@@ -2898,9 +2927,10 @@ async fn take_host_role(b: &Backend, early: JoinHandle<()>) -> Option<Hosted> {
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
 pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     // What the window says of direct connections follows the knobs the
-    // sessions read: they took the command line's bridge choice too.
+    // sessions read: they took the command line's bridge choice too. The
+    // STUN names' refresh waits for Tor's first bootstrap (design `direct`
+    // §5.3, `tor_started`).
     b.shared.update(|m| follow_knobs(m, &b.knobs));
-    follow_stun(&b);
     let Some((first, early)) = before_the_start(&mut b, &mut commands).await else {
         b.shared.update(|m| m.closed = true);
         return;
@@ -2998,9 +3028,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     // The way into Tor that worked is known now, and with it
                     // whether direct paths are off for the bridge (decision
                     // M1-86): before the onion service is published again.
-                    b.knobs.bootstrapped(started.rung(), &b.cfg.tor);
-                    b.shared.update(|m| follow_knobs(m, &b.knobs));
-                    follow_stun(&b);
+                    tor_started(&b, started.rung());
                     refresh_diagnostics(&b);
                     let started = Arc::new(started);
                     b.shared.update(|m| m.tor_retry = None);
@@ -3251,10 +3279,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => {
-                        let saved = save_settings(&b.paths, &b.shared, &b.knobs, &change);
-                        if saved.is_some() {
-                            follow_stun(&b);
-                        }
+                        let saved = save_from_window(&b, &change);
                         if let (Some(saved), Some(hosted)) = (saved, &hosted) {
                             let lacks = b.shared.read(|m| m.portal_lacks_clipboard());
                             republish(&hosted.policy, &saved, lacks);
@@ -7359,6 +7384,61 @@ mod tests {
         let mut first = start(&paths);
         start_notices(&mut first, true);
         assert!(first.history_notice);
+    }
+
+    /// The review of step B11 (design `direct` §5.3, decision M1-86): the
+    /// window starts the STUN names' refresh only once Tor has bootstrapped
+    /// (`tor_started`). A save before it (the first run's question takes
+    /// saves) starts nothing, though `tor.bridges = "auto"` reads as plain
+    /// Tor and the last start went in through obfs4. A bootstrap through the
+    /// bridge starts it with no name, one on plain Tor with this window's
+    /// names (both roles' parts; the viewer's alone without the host role).
+    /// A save that turns STUN off empties them, one that turns it on again
+    /// brings them back.
+    #[tokio::test]
+    async fn the_window_refreshes_the_stun_names_only_once_tor_has_started() {
+        use crate::direct::{BOTH, DirectKnobs, RouterPorts, stun_names};
+        use tornect_signal::tor::Rung;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        std::fs::write(paths.tor_transport_file(), Rung::Obfs4.as_str()).unwrap();
+        let mut cfg = Config::default();
+        cfg.network.stun_servers =
+            vec!["192.0.2.1:3478".to_owned(), "198.51.100.1:3478".to_owned()];
+        cfg.save(&paths.config_file()).unwrap();
+        b.knobs = DirectKnobs::new(&cfg);
+        b.cfg = cfg.clone();
+        let router = RouterPorts::new(&paths).with_internet(true);
+        b.router = Some(router.clone());
+
+        assert!(save_from_window(&b, &SettingsChange::Stun(true)).is_some());
+        assert_eq!(router.stun_started(), None, "a save before Tor");
+        tor_started(&b, Rung::Obfs4);
+        assert_eq!(router.stun_started(), Some(Vec::new()), "the bridge");
+        shared.read(|m| assert!(m.settings.bridged_off));
+        tor_started(&b, Rung::Direct);
+        shared.read(|m| assert!(!m.settings.bridged_off));
+        let both = stun_names(&b.knobs, BOTH, true);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert_eq!(router.stun_started(), Some(both.clone()), "plain Tor");
+        assert!(save_from_window(&b, &SettingsChange::Stun(false)).is_some());
+        assert_eq!(router.stun_started(), Some(Vec::new()), "STUN off");
+        assert!(save_from_window(&b, &SettingsChange::Stun(true)).is_some());
+        assert_eq!(router.stun_started(), Some(both), "STUN on again");
+
+        let viewer = RouterPorts::new(&paths).with_internet(true);
+        b.router = Some(viewer.clone());
+        b.host = false;
+        tor_started(&b, Rung::Direct);
+        assert_eq!(
+            viewer.stun_started(),
+            Some(tornect_net::partition(
+                &cfg.network.stun_servers,
+                tornect_net::TornectRole::Viewer
+            )),
+            "no host role"
+        );
+        assert!(router.net().stun_dns().is_empty(), "no literal is cached");
     }
 
     /// A window's backend for the first run's tests, in a fresh home under
