@@ -972,9 +972,11 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
   session's time except from a cold cache (the one-shot `connect`); the router, used only when its address is the
   default gateway (asked by unicast first), is asked for one UDP port for 600 s, released when the session ends and
   swept at the next start if Tornect stopped first (the ledger, `0600` under `TORNECT_HOME`, holds LAN addresses
-  only), and a mapping whose external address is not global is removed. **A VPN user's physical address:** global
+  only), and a mapping whose external address is not global is removed; a UPnP delete is sent only when the router's
+  table gives that port to this computer under Tornect's name, so another device's forwarding is never removed. **A VPN user's physical address:** global
   candidates come only from each family's route-source interface, and VPN mode (a tunnel, an unknown or a split
-  route source) asks no router, sends no SSDP and asks STUN only through the tunnel. **Never logged** (decision M1-83): no address, port or device key; the network crates'
+  route source) asks no router, sends no SSDP, asks STUN only through the tunnel and sends nothing to a peer's
+  global address whose own route leaves outside the tunnel (a split tunnel's excluded prefix). **Never logged** (decision M1-83): no address, port or device key; the network crates'
   targets (`quinn`, `quinn_proto`, `quinn_udp`, `rustls` — which logs both device keys at TRACE — `netdev`,
   `netlink_*`, `igd_next`, `crab_nat`, `hyper`, `hyper_util`, `h2`, `xmltree`, `xml`) are dropped unless identifiers
   are opted in; `sessions.log` keeps the route kind and a `path_summary` (outcome, winner kind, IPv6 or not, ms).

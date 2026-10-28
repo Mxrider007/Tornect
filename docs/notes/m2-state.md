@@ -12,8 +12,9 @@ is done (2026-10-28):** C1 wrote the final text of decisions M1-77 to M1-86 and 
 words (the threat model included), C2 reviewed the whole feature's security and found no code
 defect (the C1 and C2 entries at the end of "OPEN, owned by Phase B steps"); the review of C1 and
 C2 corrected the live demos' expected lines for two instances on one VM, which never go direct on
-the site (decision M1-82 item 11). What is left before `m2` is the owner's: the three blockers
-below, then the tag.
+the site (decision M1-82 item 11). The feature's final review (security and correctness) found three
+minor defects, fixed in `0ac8dd03`, `625aabdc` and `03cbfc95` (the last entry of "OPEN, owned by
+Phase B steps"). What is left before `m2` is the owner's: the three blockers below, then the tag.
 
 ## Blockers: no release zip to users, no `m2` tag
 
@@ -138,7 +139,9 @@ account, `kill` of the host), row 2 (dual-stack IPv4 on Windows and macOS, read 
 debug counters), row 12 (macOS firewall and `ROUTE direct lan`), row 13 (Windows: a dead candidate
 and `WSAECONNRESET`, `doctor`, the 1 s interface read, a same-account `SO_REUSEADDR` bind of the
 fixed port; row 12 has the macOS one), row 14 (roaming), the two-machine run of
-the row "Step A15: the direct bind between two real machines", `LoopbackNet` and the loopback link
+the row "Step A15: the direct bind between two real machines", the final review's two device rows
+(a UPnP router with a neighbour's mapping; a WireGuard full tunnel with the host's address
+excluded) and its `ledger` ASan campaign, `LoopbackNet` and the loopback link
 tests on macOS and Windows, msvc and darwin builds of the crates above ring (only `tornect-core`
 and the crates below ring check here).
 
@@ -386,6 +389,21 @@ and the crates below ring check here).
   fallback as built; nothing gathered before `SESSION_ACCEPT`) and D6 (when same-site candidates
   are offered), the "release README" in §B.6, `README.md`'s privacy bullet (the same-list
   condition, the router), the Phase A close row's dated prefix and `netdev` in the C2 row.
+- The feature's final review (2026-10-28; ledger section "Direct connections, the final review";
+  decision M1-81's history): five minor findings, three defects, all fixed. (1) `0ac8dd03`: the
+  ledger loader looped over a list's declared length, so a crafted or corrupt list in
+  `<state>/router-ports/` hung the sweep's blocking thread, the exit and `doctor`; a full list
+  now stops reading, and a `ledger` fuzz target ran 10 coverage-guided minutes here (12.8 M runs,
+  clean; the ASan campaign is the dev VM's). (2) `625aabdc`: every UPnP delete (a release, a
+  sweep, the removal after a cut add) first reads the router's table
+  (`GetGenericPortMappingEntry`, at most 32 entries) and deletes only the entry that forwards to
+  this computer's address and port as `Tornect`; a router that hides its table still gets a
+  release's or a sweep's delete, never the cut add's. `FakeIgd` now keeps a table and answers
+  one request at a time. (3) `03cbfc95`: in VPN mode a peer's global address passes only when
+  `NetEnv::route_source_to` toward it returns the tunnel's source (`RemoteFilter.tunnel_route`;
+  `local::remote_filter` takes `Option<RouteLookup>` in place of the `vpn` flag), so a split
+  tunnel's excluded prefix gets nothing. The reviewers' alternative of recording residuals was
+  not taken for any of the three.
 
 ## Gotchas found at this checkpoint
 
@@ -398,6 +416,10 @@ and the crates below ring check here).
   fuzz/Cargo.toml --locked --release --target x86_64-unknown-linux-gnu --bin <t>` (the explicit
   `--target` keeps build scripts uninstrumented), then run `target/x86_64-unknown-linux-gnu/
   release/<t> <fresh corpus> <seeds> -max_total_time=600`; about 3 GB of disk, removed after.
+- A UPnP release reads the router's table before its delete: a mapping test that pins a whole
+  control sequence sees `IgdHeard::MappingEntry { index }` before `DeletePort`, and a `FakeIgd`
+  answers one control request at a time, so a slowed `AddPortMapping` (`add_delay`) holds the
+  lookups behind it, as a router's single control thread does.
 - The release README is shipped in every zip; a change of the direct switch's words or of
   `INTERNET_DIRECT` fails `cargo test -p xtask` until the README follows.
 
