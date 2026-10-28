@@ -10,6 +10,27 @@ Phase B steps" below). **`INTERNET_DIRECT` is `true` since step B12 (`c1ec5a15`)
 made; what the dev VM and real networks still owe is listed under B12 and B13 below. C1 and C2
 are next.
 
+## Blockers: no release zip to users, no `m2` tag
+
+Since `c1ec5a15` every default-configured session sends this computer's IP address and the
+session's time to one public STUN server of its part of the default list (design §5.3, §5.4;
+decision M1-81). Two of the four operators (Twilio, Nextcloud) were never checked live, and
+whether Google's and Nextcloud's lack of published terms for third-party use fails §5.4's terms
+check is the owner's call. Until both are settled:
+
+1. **The owner decides the terms question** (`docs/research/nat-traversal.md` §2.7; ledger row
+   "Step B1: the default STUN servers' operators and published terms", OPEN).
+2. **The `live_stun` run is pasted** from the dev VM (`cargo test -p tornect-net --test live_stun
+   -- --ignored --nocapture`; ledger row "Step B12: the live STUN check"): four lines, each
+   `srflx` or `no-nat`.
+
+No zip from `cargo xtask dist` goes to users and no `m2` tag is made before both. If the owner
+rejects "no published terms", or an entry is silent in the run (asked, nothing global back), the
+entry is replaced with one of another operator as §5.4 says: `DEFAULT_STUN` and `config.rs`'s
+default-list test, the migration (saved configs hold today's four entries), `STUN_LINE`'s
+operator names, the release README and M1-81's note. A name that did not resolve in the run is
+checked against the resolver first; it is no reason by itself to replace a server.
+
 ## What Phase A does
 
 - After `SESSION_ACCEPT` both sides send `CANDIDATES` over the onion channel: same-site scope only
@@ -283,12 +304,13 @@ and the crates below ring check here).
   the live STUN run, two instances on one VM, the bridge demo, the `host` `NOTICE` line after a
   real bootstrap, the B11 review's strace and background-mode checks, the B11 desktop row. OPEN:
   the owner's call on the Google and Nextcloud STUN terms (`nat-traversal.md` §2.7; the list is
-  unchanged).
+  unchanged), a blocker with the live STUN run ("Blockers" above).
 - B13 (done in this container 2026-10-28; ledger rows "Step B13"): the gnullvm cross-clippy of the
   three crates the flip touched, `tornect-core` on msvc and darwin (ring still stops the crates
   above it there), the licences and `dist` feature-check tests, the ten fuzz targets' clippy with
   `fuzz/Cargo.lock` unchanged, 10-minute uninstrumented stable runs of `stun`, `candidates`,
-  `probe`, `framing` and `envelope` (no crash; no coverage feedback, so weak), and `doctor` from a
+  `probe`, `framing` and `envelope` (no crash; no coverage feedback, so no evidence: the review
+  below replaced them with coverage-guided runs), and `doctor` from a
   gnullvm build under Wine 9.0 with the internet lines (`direct connections: on (local network and
   internet)`). Wine still reads "VPN mode", which with the internet half on would send every
   internet session of a real Windows machine misread that way to Tor: a NEEDS-DEVICE(windows) row
@@ -296,12 +318,39 @@ and the crates below ring check here).
   summary row points at each recipe). Left: the [VM] and [DEV] runs of those rows, the nightly
   fuzz campaigns, `cargo xtask dist` (this container's proxy refuses archive.torproject.org, so
   lyrebird cannot be fetched); no tag (the design tags `m2a` and `m2`; tags are the owner's).
+- Review of steps B12 and B13 (2026-10-28, `53339cd5`, `2c354e59`, `77f41a85`, `f4145423`; ledger
+  rows "Review of steps B12 and B13"; decision M1-81's note): one major, four minor, all
+  addressed. The release README in every zip, `README.md` and both plan copies said the internet
+  path was off and named the Phase A switch: the README's "Direct connections" now says what an
+  accepted peer, a STUN server, the resolver, the router and the ISP learn and how to stay on Tor,
+  and an xtask test reads the switch labels and `INTERNET_DIRECT` from source so the README
+  cannot drift again (the plan edits are minimal; C1 writes the final text). The fuzz runs are now
+  coverage-guided (cargo-fuzz's sancov flags on stable, no ASan): `stun`, `candidates`, `probe`,
+  `framing`, `envelope`, `media` and `services`, 10 minutes each, no crash, corpora 161 to 3412
+  inputs; the ASan campaigns stay on the dev VM. `live_stun` runs one refresh round first and
+  tells a silent server from a name that did not resolve. The STUN list's checks are now the
+  "Blockers" at the top of this note. The tautological nine-cell loop in `decide`'s test became a
+  check of `decide` against the internet-scope table (fails with the constant off).
 - C1: the final text of decision rows M1-77 to M1-86 (still placeholders with step notes) and of
   the plan: `docs/PLAN.md` describes Phase A since the Phase A close (Part C M2 amended, §B.2,
-  §B.6, §B.8.6.4, §B.8.17 item 7, Parts E and G), in words C1 replaces with the final ones.
+  §B.6, §B.8.6.4, §B.8.17 item 7, Parts E and G), and Phase B in minimal edits since the review
+  of B12 and B13 (§B.2, §B.6, the release's limits, the r7 roadmap entry, Part G), in words C1
+  replaces with the final ones; the release README's "Direct connections" follows C1's words.
 - C2: the security-reviewer pass over the whole feature, the Accept demo, tag `m2`.
 
 ## Gotchas found at this checkpoint
+
+- A fuzz run without coverage instrumentation proves nothing: libFuzzer finds no features, keeps
+  no input (`corp: 1/1b`) and never gets past a magic number. Without nightly, build the fuzz
+  manifest with cargo-fuzz's flags minus ASan: `RUSTFLAGS="--cfg fuzzing -Cpasses=sancov-module
+  -Cllvm-args=-sanitizer-coverage-level=4 -Cllvm-args=-sanitizer-coverage-inline-8bit-counters
+  -Cllvm-args=-sanitizer-coverage-pc-table -Cllvm-args=-sanitizer-coverage-trace-compares
+  -Cdebug-assertions -Coverflow-checks" CARGO_TARGET_DIR=target cargo build --manifest-path
+  fuzz/Cargo.toml --locked --release --target x86_64-unknown-linux-gnu --bin <t>` (the explicit
+  `--target` keeps build scripts uninstrumented), then run `target/x86_64-unknown-linux-gnu/
+  release/<t> <fresh corpus> <seeds> -max_total_time=600`; about 3 GB of disk, removed after.
+- The release README is shipped in every zip; a change of the direct switch's words or of
+  `INTERNET_DIRECT` fails `cargo test -p xtask` until the README follows.
 
 - `cargo xtask verify --no-tests` runs no rustdoc. Run `RUSTDOCFLAGS="-D warnings" cargo doc
   --workspace --no-deps` too: a moved `use` broke an intra-doc link that clippy and the tests did
