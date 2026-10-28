@@ -2124,6 +2124,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         audit,
         pins,
         polkit,
+        services: services_slot,
     } = crate::host::wire_window(
         &b.paths,
         &b.cfg,
@@ -2200,6 +2201,9 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         )
         .with_lock_watcher(),
     );
+    // Each direct connection's second stream too (design `direct` §6.7),
+    // before the onion service is published.
+    services_slot.set(&services);
     let lock_watch = tokio::spawn(crate::services::watch_lock(
         crate::services::SystemLock::default(),
         Arc::clone(&services),

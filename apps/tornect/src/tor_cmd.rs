@@ -28,10 +28,10 @@ use tornect_session::services::{
     ViewerOp, ViewerServicesEnd,
 };
 use tornect_session::{
-    AfterBind, Binding, Decision, DesktopBackend, DirectBindFailed, FallbackWhy, FrameSink,
-    MediaHost, MediaLimits, MediaViewer, PathChoice, PathEnd, QuicStream, Screens, ScreensNews,
-    Source, SystemBackend, TorWhy, ViewerChannels, ViewerEnd, ViewerError, ViewerRequest,
-    ViewerStats, decide,
+    AfterBind, Binding, Decision, DesktopBackend, DirectBindFailed, DirectServices, FallbackWhy,
+    FrameSink, MediaHost, MediaLimits, MediaViewer, PathChoice, PathEnd, QuicStream, Screens,
+    ScreensNews, Source, SystemBackend, TorWhy, ViewerChannels, ViewerEnd, ViewerError,
+    ViewerRequest, ViewerStats, decide,
 };
 use tornect_signal::framing::FrameError;
 use tornect_signal::fsm::client::{
@@ -391,6 +391,7 @@ async fn run_host(
         audit,
         pins: _,
         polkit: _,
+        services: services_slot,
     } = crate::host::wire_cli(
         paths,
         cfg,
@@ -403,6 +404,8 @@ async fn run_host(
     helpers.wire(deps.kill.clone(), audit.clone(), host_cfg.levels);
     deps.admin_helper = helpers;
     let services = terminal_services(&media);
+    // Each direct connection's second stream too (design `direct` §6.7).
+    services_slot.set(&services);
     // A kill ends every session's media at once, without waiting for the FSM's
     // `BYE` to a peer that may not be reading (SLICE-B1 B1-2).
     let kill_watch = media.watch_kill(deps.kill.clone());
@@ -1416,6 +1419,11 @@ pub(crate) struct WatchOptions<'a> {
 /// 10 s) and the desktop's clipboard opened (up to 5 s), over Tor.
 const SERVICES_BIND_WAIT: Duration = Duration::from_secs(45);
 
+/// How long the viewer waits for its direct connection to let the services
+/// stream open (design `direct` §6.7). Opening it is local while the host
+/// allows two streams; a host that allows one never lets it open.
+const DIRECT_SERVICES_OPEN: Duration = Duration::from_secs(5);
+
 /// Events of the services stream queued between its run and the window.
 const SERVICES_EVENTS: usize = 64;
 
@@ -1465,6 +1473,29 @@ async fn run_services<F>(
         node.connect_on(id, SERVICES_PORT, isolation)
             .await
             .map_err(|e| ServicesBindError::Io(std::io::Error::other(e.to_string())))
+    };
+    services_over(opened, start, stop).await;
+}
+
+/// Open the session's services stream as the second stream of its direct
+/// connection (design `direct` §6.7: never the onion service while the
+/// media is direct), bound with the direct services binding in place of
+/// `start`'s, and serve it as [`run_services`] does. An open the connection
+/// does not allow within [`DIRECT_SERVICES_OPEN`] fails as a timeout.
+async fn run_direct_services<F>(direct: DirectServices, start: ServicesStart, stop: F)
+where
+    F: Future<Output = ()>,
+{
+    let opened = async {
+        match tokio::time::timeout(DIRECT_SERVICES_OPEN, direct.open()).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(ServicesBindError::Io(std::io::Error::other(e.to_string()))),
+            Err(_) => Err(ServicesBindError::Timeout),
+        }
+    };
+    let start = ServicesStart {
+        binding: direct.binding().clone(),
+        ..start
     };
     services_over(opened, start, stop).await;
 }
@@ -1554,10 +1585,13 @@ pub(crate) struct BoundMedia<O> {
     /// From the accept to the open direct stream or to `TOR_FALLBACK` (the
     /// `PATH` line).
     pub elapsed: Duration,
-    /// Whether the services stream may go over the onion service: not for a
-    /// `lan_only` session, which the host refuses it (decision M1-85). The
-    /// direct services stream is step B10's.
+    /// Whether the services stream may go over the onion service: only
+    /// with onion media (design `direct` §6.7; a `lan_only` session's never,
+    /// decision M1-85).
     pub onion_services: bool,
+    /// What opens the services stream on the direct connection: with
+    /// direct media, when the host offers services.
+    pub direct_services: Option<DirectServices>,
 }
 
 impl<O> std::fmt::Debug for BoundMedia<O> {
@@ -1574,6 +1608,7 @@ impl<O> std::fmt::Debug for BoundMedia<O> {
             .field("winner", &self.winner)
             .field("elapsed", &self.elapsed)
             .field("onion_services", &self.onion_services)
+            .field("direct_services", &self.direct_services.is_some())
             .finish()
     }
 }
@@ -1716,6 +1751,8 @@ where
             // The connection is up with the host's key pinned: the window
             // says so while the host opens its capture.
             direct.tell(PathEnd::Direct(route));
+            // The services ride the same connection (design `direct` §6.7).
+            let direct_services = media.services();
             match unless_interrupted(media.bind(MEDIA_BIND_WAIT), interrupted).await {
                 None => return Err(End::You),
                 Some(Ok(viewer)) => {
@@ -1724,7 +1761,8 @@ where
                         end: PathEnd::Direct(route),
                         winner: Some(winner),
                         elapsed,
-                        onion_services: !lan_only,
+                        onion_services: false,
+                        direct_services,
                     });
                 }
                 // A `lan_only` session never falls back: it ends as one
@@ -1785,6 +1823,7 @@ where
             winner: None,
             elapsed,
             onion_services: true,
+            direct_services: None,
         }),
         Some(Err(e)) => Err(End::NoPicture(e)),
     }
@@ -1869,6 +1908,7 @@ where
         id,
         isolation,
         onion: bound.onion_services,
+        direct: bound.direct_services,
     };
     match bound.media {
         MediaPath::Direct(viewer) => {
@@ -1885,9 +1925,11 @@ struct Services<'a> {
     node: &'a TorNode,
     id: &'a TornectId,
     isolation: &'a Isolation,
-    /// Over the onion service (on the session's circuit); `false`: not at
-    /// all (a `lan_only` session's, until the direct services stream).
+    /// Over the onion service (on the session's circuit): only with onion
+    /// media.
     onion: bool,
+    /// On the direct connection, with direct media (design `direct` §6.7).
+    direct: Option<DirectServices>,
 }
 
 /// Receive the screen on the bound `viewer` while `session` keeps the
@@ -1937,15 +1979,16 @@ where
         viewed
     };
     let services = async {
-        match services {
-            Some(start) if at.onion => {
-                let stop = async {
-                    let _ = stopped.await;
-                };
+        let stop = async {
+            let _ = stopped.await;
+        };
+        match (services, at.direct) {
+            (Some(start), Some(direct)) => run_direct_services(direct, start, stop).await,
+            (Some(start), None) if at.onion => {
                 run_services(at.node, at.id, at.isolation, start, stop).await;
             }
-            Some(start) => (start.report)(ServicesNews::NotOpened(None)),
-            None => {}
+            (Some(start), None) => (start.report)(ServicesNews::NotOpened(None)),
+            (None, _) => {}
         }
     };
     let ((viewed, end), ()) = tokio::join!(viewing, services);
@@ -4653,13 +4696,225 @@ mod tests {
             path.starts_with("PATH host ") && path.ends_with(" ms"),
             "{path}"
         );
-        assert!(
-            bound.onion_services,
-            "an `any` session's services stay on Tor until B10"
-        );
+        // Its services ride the direct connection, never the onion service
+        // (design `direct` §6.7; the host offers `svc1`).
+        assert!(!bound.onion_services);
+        assert!(bound.direct_services.is_some());
         assert_eq!(media.route(&sid), Some(TransportKind::Lan));
         assert_eq!(log.opens.load(Ordering::SeqCst), 1, "opened beside the try");
         assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
+    }
+
+    /// Design `direct` §6.7 through the caller, with the host wired as
+    /// `tornect host` wires it and its services in the wiring's slot: a
+    /// session bound direct opens its services stream as the connection's
+    /// second stream, never the onion service. The terminal host's all-off
+    /// services answer it there (`Refused{NOT_OFFERED}` once capture is
+    /// live) and the session goes on; the one onion stream opened is the
+    /// media pre-open, dropped unused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_direct_sessions_services_ride_its_connection() {
+        use tornect_proto::services::reason;
+        let (viewer_net, host_net) = lan_pair(14);
+        let media = test_card();
+        let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let services = terminal_services(&media);
+        rig._wiring.services.set(&services);
+        let session = &mut rig.session;
+        assert!(session.host_has(feats::SVC1));
+        let sid = session.session_token().session_id();
+        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        assert!(!bound.onion_services);
+        let MediaPath::Direct(_viewer) = bound.media else {
+            panic!("not direct");
+        };
+        let direct = bound
+            .direct_services
+            .expect("svc1 offered: the direct services stream");
+        let (start, news, _ops) = kept_services(session.session_token());
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_direct_services(direct, start, std::future::pending()),
+        )
+        .await
+        .expect("the refusal comes once capture is live");
+        let heard = std::mem::take(&mut *news.lock().unwrap());
+        assert!(
+            matches!(
+                heard.as_slice(),
+                [ServicesNews::NotOpened(Some(reason::NOT_OFFERED))]
+            ),
+            "{heard:?}"
+        );
+        assert_eq!(media.route(&sid), Some(TransportKind::Lan));
+        assert_eq!(media.live(), 1, "the session goes on");
+        assert_eq!(services.open_streams(), 0);
+        assert_eq!(
+            log.opens.load(Ordering::SeqCst),
+            1,
+            "the media pre-open only: no onion services stream"
+        );
+        assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
+    }
+
+    /// One circuit's streams on a fake onion service, counted: the
+    /// signaling stream is open from the start, and each stream opened
+    /// counts until its viewer end is gone (its host end then reads the
+    /// end).
+    #[derive(Clone)]
+    struct Circuit {
+        open: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl Circuit {
+        fn new() -> Self {
+            Self {
+                open: Arc::new(AtomicUsize::new(1)),
+                peak: Arc::new(AtomicUsize::new(1)),
+                opens: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// A stream on the circuit whose host end `answer` serves, then
+        /// reads to its end.
+        fn stream<A, Fut>(&self, answer: A) -> DuplexStream
+        where
+            A: FnOnce(DuplexStream) -> Fut + Send + 'static,
+            Fut: Future<Output = DuplexStream> + Send,
+        {
+            use tokio::io::AsyncReadExt as _;
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let (viewer_end, host_end) = duplex(1 << 16);
+            let open = Arc::clone(&self.open);
+            tokio::spawn(async move {
+                let mut host_end = answer(host_end).await;
+                let mut buf = [0; 1024];
+                while matches!(host_end.read(&mut buf).await, Ok(n) if n > 0) {}
+                open.fetch_sub(1, Ordering::SeqCst);
+            });
+            viewer_end
+        }
+
+        /// The onion media streams: each answers a `Bind` with `BindOk`.
+        fn media(&self) -> impl Fn() -> Opening + use<> {
+            let circuit = self.clone();
+            move || {
+                let stream = circuit.stream(|mut host| async move {
+                    if let Ok(Some(tornect_proto::Msg::Bind { .. })) =
+                        tornect_proto::read_msg(&mut host).await
+                    {
+                        let ok = tornect_proto::Msg::BindOk {
+                            width: 1280,
+                            height: 720,
+                            codec: tornect_proto::codec::H264,
+                            mode: 0,
+                            quality: QualityInfo {
+                                preset: tornect_proto::quality::BALANCED,
+                                max_fps: 15,
+                                kbps: 1500,
+                                max_long: 1920,
+                                max_short: 1080,
+                            },
+                        };
+                        tornect_proto::write_msg(&mut host, &ok).await.unwrap();
+                    }
+                    host
+                });
+                Box::pin(std::future::ready(Ok(stream)))
+            }
+        }
+
+        /// The onion services stream: it answers a `Bind` with `Welcome`
+        /// (chat only).
+        fn services(&self) -> DuplexStream {
+            self.stream(|mut host| async move {
+                if tornect_proto::services::read_bind(&mut host).await.is_ok() {
+                    let welcome = tornect_proto::services::SvcMsg::Welcome(Welcome {
+                        caps: tornect_proto::services::caps::CHAT,
+                        clip_max: 0,
+                        file_max: 0,
+                        session_quota: 0,
+                        session_files: 0,
+                        chat_max: 500,
+                        bulk_window: 256 << 10,
+                        inbox: String::new(),
+                    });
+                    tornect_proto::services::write_msg(&mut host, &welcome)
+                        .await
+                        .unwrap();
+                }
+                host
+            })
+        }
+    }
+
+    /// Design `direct` §6.7 and §12.1 "onion stream count": on the Tor
+    /// route with services, after a path phase long enough (a host that
+    /// never answers, a 10 s punch window) that the media pre-open is
+    /// replaced past [`ONION_PREOPEN_MAX`], the session's circuit never
+    /// carries more than `MAX_STREAMS_PER_CIRCUIT` streams at once: the
+    /// signaling stream, the pre-open until it is replaced, the fresh media
+    /// stream, then the services stream opened after the bind (as
+    /// `watch_bound` opens it).
+    #[tokio::test(start_paused = true)]
+    async fn the_tor_route_with_services_stays_within_the_circuits_streams() {
+        let (mut session, _frozen, _host) =
+            raw_direct(&[feats::DIR1, feats::SVC1], messages::transport::ANY).await;
+        let mut cfg = Config::default();
+        cfg.network.punch_timeout_ms = 10_000;
+        let (viewer_net, _) = lan_pair(15);
+        let ctx = viewer_ctx(&cfg, Arc::new(viewer_net), 0x22, false);
+        let circuit = Circuit::new();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let bound = bind_media(&mut session, &ctx, &binding, circuit.media(), &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        let MediaPath::Onion(_viewer) = bound.media else {
+            panic!("not on Tor");
+        };
+        assert!(bound.elapsed > ONION_PREOPEN_MAX, "{:?}", bound.elapsed);
+        assert!(bound.onion_services && bound.direct_services.is_none());
+        assert_eq!(
+            circuit.opens.load(Ordering::SeqCst),
+            2,
+            "the pre-open, replaced, and a fresh one"
+        );
+
+        let (start, news, _ops) = kept_services(session.session_token());
+        let (stop, stopping) = oneshot::channel::<()>();
+        let services = circuit.services();
+        let serving = services_over(async { Ok(services) }, start, async {
+            let _ = stopping.await;
+        });
+        let watching = async {
+            while !news
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| matches!(n, ServicesNews::Opened(_)))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Signaling, media and services.
+            assert_eq!(circuit.open.load(Ordering::SeqCst), 3);
+            stop.send(()).unwrap();
+        };
+        tokio::join!(serving, watching);
+        let peak = circuit.peak.load(Ordering::SeqCst);
+        let most = usize::try_from(tornect_signal::tor::MAX_STREAMS_PER_CIRCUIT).unwrap();
+        assert!((3..=most).contains(&peak), "{peak} streams at once");
+        assert_eq!(circuit.opens.load(Ordering::SeqCst), 3);
     }
 
     /// Decision M1-79's one exception through the caller: a link whose key is

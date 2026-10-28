@@ -29,9 +29,10 @@ use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
 use tornect_core::unattended::schedule::FixedOffset;
 use tornect_core::{Config, HostIdentity, Paths};
 use tornect_platform::ipc::{Endpoint, IpcError};
+use tornect_session::services::ServicesHost;
 use tornect_session::{
     CaptureChanged, CaptureStarted, DirectHost, MediaEnd, MediaHost, MediaObserver, MediaOutcome,
-    MediaReport,
+    MediaReport, QuicStream, SecondStream,
 };
 use tornect_signal::dispatch::{FIRST_FRAME_DEADLINE, FirstFrame, first_frame};
 use tornect_signal::envelope::codes;
@@ -614,6 +615,46 @@ pub struct HostWiring {
     /// polkit's remembered approvals, revoked while a Control session is
     /// live (§B.2.1; Linux). The window's own session sink uses it too.
     pub polkit: Arc<PolkitRevocation>,
+    /// What serves each direct connection's services stream: set it to the
+    /// host's services ([`ServicesSlot::set`]) before the onion service is
+    /// published.
+    pub services: Arc<ServicesSlot>,
+}
+
+/// The services host each session's direct connection serves its second
+/// stream with (design `direct` §6.7), set once the window or the terminal
+/// host has built it: the services host is built after the wiring, whose
+/// `sessions.log` its observer writes to. A second stream that comes while
+/// it is unset is dropped at once (the viewer's services do not open; its
+/// media goes on).
+#[derive(Default)]
+pub struct ServicesSlot(std::sync::OnceLock<Arc<dyn SecondStream>>);
+
+impl ServicesSlot {
+    /// Serve every direct connection's services stream with `services`
+    /// from now on; only the first call counts.
+    pub fn set(&self, services: &Arc<ServicesHost>) {
+        let _ = self.0.set(services.second_stream());
+    }
+}
+
+impl SecondStream for ServicesSlot {
+    fn serve(
+        &self,
+        stream: QuicStream,
+        expected_session: String,
+        peer: tornect_core::DeviceId,
+        ekm: zeroize::Zeroizing<[u8; 32]>,
+        route: TransportKind,
+    ) -> tornect_net::BoxFuture<'static, ()> {
+        match self.0.get() {
+            Some(services) => services.serve(stream, expected_session, peer, ekm, route),
+            None => {
+                drop((stream, ekm));
+                Box::pin(std::future::ready(()))
+            }
+        }
+    }
 }
 
 /// Wire the host FSM for `paths`: `consent` answers the popups, `identity`
@@ -710,15 +751,16 @@ pub fn wire_window(
     );
     deps.activity = live.clone();
     deps.kill = kill.clone();
+    let services = Arc::new(ServicesSlot::default());
     // The sessions' direct paths (design `direct` §8.6): one link at most
     // per session, opened only once the viewer's candidates come, and
     // closed by the host-wide kill like everything else. A direct media
     // stream that never got as far as sharing says so as an onion one does.
+    // Its connection's second stream is the session's services stream
+    // (§6.7).
     deps.paths = Arc::new(DirectHost::new(
         media,
-        // The services stream stays on the onion circuit until it serves a
-        // direct connection's second stream (design `direct` step B10).
-        None,
+        Some(Arc::clone(&services) as Arc<dyn SecondStream>),
         Arc::clone(&direct.device),
         direct.knobs.direct.clone(),
         Arc::clone(&direct.net),
@@ -808,6 +850,7 @@ pub fn wire_window(
         audit,
         pins,
         polkit,
+        services,
     })
 }
 
