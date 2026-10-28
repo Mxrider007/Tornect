@@ -152,23 +152,30 @@ and the crates below ring check here).
   SHUTDOWN_RELEASE_WAIT)` at exit, and the link holding the `Mapping` with `keep_renewed` beside
   the session. Left as NEEDS-DEVICE: the `FakePcp` tests on Windows (Wine cannot run them) and on
   macOS (`lo0` aliases), and real routers (design §13 row 4, after B12).
-- B6/B7 (done 2026-10-27, `b9b55f1b`, `9236a7bc`, `515cf9d5`; ledger rows "Step B6", "Step B7" and
-  "Steps B6 and B7", decision M1-81's step note): `gather::plan` (`GatherConfig` in `DirectParams`,
-  from `DirectOptions::gather(role)`: this role's part of the STUN list, `enable_stun`, the router
+- B6/B7 (done 2026-10-27, `b9b55f1b`, `9236a7bc`, `515cf9d5`; review fixes 2026-10-28, `0d993c85`,
+  `5a315cd6`, `15a69006`; ledger rows "Step B6", "Step B7" and "Steps B6 and B7", "Review of steps
+  B6 and B7", decision M1-81's notes): `gather::plan` (`GatherConfig` in `DirectParams`, from
+  `DirectOptions::gather(role)`: this role's part of the STUN list, `enable_stun`, the router
   switches) and the gathering task (`gather::Gatherer`): router from the bind, STUN after the 250 ms
   head start (skipped on a global mapping inside it, at once when the router answers without one),
   one batch per gathered candidate, `Done` at both ends or 1500 ms; the task holds and renews the
-  `Mapping` until `LinkInner::shut` aborts it. A side with no host candidate still gathers;
-  `NoAddresses` only with nothing to gather. The driver feeds `Checklist::set_local_public` (global
-  hosts, then each gathered address), so the §7.6 ranks apply; a proptest pins them. The app builds
-  one `RealNet` per process (`direct::real_net(paths)`, ledger plus `RouterPortLog`), sweeps at GUI,
-  `host` and `connect` start and waits up to 1 s for releases at exit (`router_lifecycle`,
-  `wait_router_releases`). Deviations (commit bodies, M1-81): the mapping lives in the gathering task,
-  not `LinkInner`; `plan`'s signature; events through the app's mapper, not a `DirectHost` field.
+  `Mapping` until `LinkInner::shut` aborts it, the shut first holding the mapper's release tracker
+  until the task is gone, so a release counts from the link's end. A side with no host candidate
+  still gathers; `NoAddresses` only with nothing to gather. The driver feeds
+  `Checklist::set_local_public` (global hosts, then each gathered address), so the §7.6 ranks apply;
+  a proptest pins them. The app builds one `RouterPorts` per process (`RealNet` with the ledger, the
+  `RouterPortLog` sink, the sweep): the host's wiring hands the sink its one keyed handle on
+  `sessions.log` and then starts the sweep; `connect` and a window without its host role start it
+  themselves and key their lines from the keystore (`ua_client::append_keyed`, one lock for every
+  own append); `on_event` only queues (64, then drop and count) for a writer thread; the exit
+  (`router_lifecycle`, `RouterPorts::wind_down`) waits up to 1 s for releases and up to 1 s for the
+  lines. Deviations (commit bodies, M1-81): the mapping lives in the gathering task, not
+  `LinkInner`; `plan`'s signature; events through the app's mapper, not a `DirectHost` field.
   Residuals: a viewer with no host candidate and nothing gathered sends only `CANDIDATES_DONE` and
-  falls back at its punch timeout (OPEN row, for B9/B12); a link closed in the last instant before
-  exit may count its release after the exit wait looked (the next start's sweep removes it). Left
-  as NEEDS-DEVICE: the real router run of the sweep and the release (after B12).
+  falls back at its punch timeout (OPEN row, for B9/B12); two processes on one `TORNECT_HOME` write
+  `sessions.log` through two handles with no lock between them (OPEN row; the unattended connect
+  lines already did). Left as NEEDS-DEVICE: the real router run of the sweep and the release, on a
+  home with unattended access on (after B12).
 - B8: `NatBox`, `MemStun`, `MemMapper` in `MemNet`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
 - B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
