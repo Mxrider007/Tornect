@@ -511,7 +511,16 @@ impl Task {
                 }
                 Woke::Frame(Some(frame)) => self.on_frame(frame).await,
                 Woke::Frame(None) => {
-                    self.session_over().await;
+                    // The FSM lets go of its port on a kill too. A kill that
+                    // came after this select polled its first branch, with
+                    // the port gone by its second, is seen here first: it
+                    // is still a kill, and gets the kill's goodbye.
+                    if self.kill_fired().await {
+                        self.media_goodbye().await;
+                        self.close_link().await;
+                    } else {
+                        self.session_over().await;
+                    }
                     return;
                 }
                 Woke::Claim(true) => {
@@ -782,6 +791,16 @@ impl Task {
             open.second = Some(Box::pin(async move {
                 let _ = task.await;
             }));
+        }
+    }
+
+    /// Whether the kill guard fired (the switch, or an end of the viewer's
+    /// device), without waiting: its first poll reads the switch's state.
+    async fn kill_fired(&mut self) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.kill.killed() => true,
+            () = std::future::ready(()) => false,
         }
     }
 
