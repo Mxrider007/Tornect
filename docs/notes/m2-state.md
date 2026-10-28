@@ -5,8 +5,8 @@ with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-contai
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-is under way: B1 to B7 are done (2026-10-27), B8, B9 and B10 too (2026-10-28; "OPEN, owned by
-Phase B steps" below); B11 is next, and `INTERNET_DIRECT` is still `false`.
+is under way: B1 to B7 are done (2026-10-27), B8 to B11 too (2026-10-28; "OPEN, owned by
+Phase B steps" below); B12 is next, and `INTERNET_DIRECT` is still `false`.
 
 ## What Phase A does
 
@@ -126,7 +126,8 @@ and the crates below ring check here).
   part, `stun_base` combined with the scope, `enable_stun` and the mapping's head start, the
   `DirectParams`/`DirectOptions` STUN fields, and the second ULA design gap. Left for B11/B12: the
   app's `RealNet::prefetch` call, with a list that is empty whenever STUN may not run (design
-  §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged).
+  §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged); B11 wired it (`856e101a`,
+  `RouterPorts::follow_stun`), B12 turns the list on.
 - B2/B3 review fixes (2026-10-27, `d59f0c15`, `25e4161f`, `f8e7bea3`, `d7fa045c`; ledger rows
   "Review of steps B2 and B3", decision M1-81's review note): `RealNet::resolve` looks a name up
   at session time only while `StunDns::refreshed()` is false (no round since the cache was made or
@@ -137,9 +138,10 @@ and the crates below ring check here).
   `tunnel: vpn.then_some(base)`; B11 restarts `prefetch` on every settings save and every change of
   the bridge state (a cleared cache stays cold, and a newly listed name is answered only after the
   next round), words `STUN_LINE` with "when both computers use the same list" (and may add a doctor
-  note when the list is not the default); C1 puts the same-list condition into M1-81's final text
-  and the plan's threat model, and §13 rows 10/11 (B13) include the split-tunnel case whose recipe
-  is in the ledger.
+  note when the list is not the default) — all three done at B11 (`856e101a`; the refresh restarts
+  when its names change, which a save or a bootstrap may do); C1 puts the same-list condition into
+  M1-81's final text and the plan's threat model, and §13 rows 10/11 (B13) include the
+  split-tunnel case whose recipe is in the ledger.
 - B4/B5 (done 2026-10-27, `48626004`, `5209419a`, `798fb61a`; ledger rows "Step B4", "Step B5" and
   "Steps B4 and B5", decision M1-81's step note): `RealMapper` (PCP with our own nonce and NAT-PMP
   through crab_nat, UPnP-IGD through igd-next with the unicast search first and the gateway check),
@@ -230,7 +232,27 @@ and the crates below ring check here).
   (`5fc38220`); the second stream's credit is given per connection, after the claim, by a host with
   services (`929f0e6d`); a kill seen as the port closes still takes the kill's goodbye (`6d76c23c`);
   a viewer whose write fails after the host's end ends as the host's `Close` says (`42b7dfb8`).
-- B11: the Phase B copy and settings (STUN, router mapping).
+- B11 (done 2026-10-28, `f20c9b17`, `856e101a`, `acf4730c`; ledger rows "Step B11"; decisions
+  M1-81 and M1-84's notes): every Phase B word is written and drawn, picked by `Settings::internet`
+  (the constant outside tests) or an `internet` argument, so this build still shows Phase A's and
+  B12's flip changes no test. Settings, Connection: the Phase B switch, `DIRECT_HOW_INTERNET`,
+  `DIRECT_EXPOSES`, the STUN switch (`SettingsChange::Stun`) and the router switch
+  (`SettingsChange::RouterMapping`, all three protocols) with their lines and `PUBLIC_ANYWAY`.
+  `Settings::reveals` drives the Privacy line (`NETWORK_LINE_LAN`/`NETWORK_LINE_INTERNET`), the
+  consent sheet and the CLI note ("internet address" only for policy `Any` in an internet build;
+  `lan_only` stays "local address"); the grant help line, Home's opening note and the viewer's
+  no-path reason follow the build. The one-time notice: `general.direct_notice_seen`,
+  `Settings::direct_notice_due` read once at the window's start into `Model::direct_notice`, a card
+  above the page with the switch and OK (`DirectNoticeSeen`). `host` prints `NOTICE direct
+  connections are on: …` after the bootstrap while an accept reveals the IP address; `doctor` has
+  the STUN, router and leftover-ports lines (off unless a session would ask; a note when the STUN
+  list is not the default). The STUN names' refresh: `RouterPorts::follow_stun` at the start of
+  the window, `host` and `connect`, after each bootstrap and each save, restarted only when
+  `direct::stun_names` changed (empty in this build, so nothing is looked up). `STUN_LINE` and
+  `NETWORK_LINE_INTERNET` carry the same-list condition (a deviation from the design's words; C1
+  puts it in M1-81's final text). The two tests the B10 review left (`lan_only` services on the
+  link; a second stream while `ServicesSlot` is unset) are written. Left as NEEDS-DEVICE: the
+  window's Phase B page, notice and consent line on a desktop after B12 (ledger row).
 - B12: `INTERNET_DIRECT = true`.
 - B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11 (their recipes are
   written: ledger rows "Step B13 recipe: design §13 row 3" to "… row 11"), 15 and 16 (row 16,
