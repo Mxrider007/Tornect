@@ -1011,6 +1011,49 @@ async fn a_direct_viewer_binds_once_the_host_proves_itself() {
     ));
 }
 
+/// The final audit before the release: a direct binding asking for a
+/// preset (`Binding::direct(..).with_quality`) sends it in its `Bind`, and
+/// the host's `serve_direct` answers `BindOk` with that preset on the
+/// direct row of its table, as the onion `serve` does on the Tor row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_bind_asks_for_its_preset_and_the_host_applies_it() {
+    use crate::quality::{Route, settings};
+
+    let rig = direct_rig(TestBackend::default());
+    let caps = MediaLimits::default().caps;
+    for (seed, preset, code) in [
+        (
+            82,
+            QualityPreset::BestPerformance,
+            quality::BEST_PERFORMANCE,
+        ),
+        (83, QualityPreset::BestQuality, quality::BEST_QUALITY),
+    ] {
+        let viewer = start_direct(&rig.host, seed, TransportPolicy::Any);
+        let binding = direct_binding(&viewer, &EKM).with_quality(preset);
+        assert!(binding.is_direct());
+        assert!(
+            matches!(binding.msg(), Msg::Bind { quality, .. } if quality == code),
+            "{preset:?}"
+        );
+        let conn = connect_direct(&rig.host, &viewer, EKM, TransportKind::Lan);
+        let bound = MediaViewer::bind(conn.client, &binding, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(bound.bound().quality.preset, code, "{preset:?}");
+        assert_eq!(
+            bound.bound().quality,
+            settings(preset, Route::Direct, &caps).info(),
+            "{preset:?}"
+        );
+        drop(bound);
+        assert!(matches!(
+            conn.served.await.unwrap(),
+            MediaOutcome::Served { .. }
+        ));
+    }
+}
+
 /// The direct design §6.6 (`HostProof` before `BindOk`): a host whose
 /// first frame is not the expected `BindProof` (one over another
 /// connection's `ekm` or another transcript, the viewer's own MAC

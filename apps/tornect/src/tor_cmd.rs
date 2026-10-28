@@ -1729,7 +1729,8 @@ fn into_path(choice: PathChoice) -> Result<PathChoice, End> {
 /// path chosen, each wait raced against `interrupted`:
 ///
 /// - direct: the onion stream is dropped and the `Bind` written on the
-///   direct stream, waiting up to [`MEDIA_BIND_WAIT`] (never the punch
+///   direct stream, asking for `onion`'s preset ([`Binding::quality`]),
+///   waiting up to [`MEDIA_BIND_WAIT`] (never the punch
 ///   window); a connection closed by a TLS alert before any host byte
 ///   ([`AfterBind::Fallback`]) sends `TOR_FALLBACK{QUIC}` and binds a
 ///   fresh onion stream, unless the session is `lan_only`, which ends it
@@ -1779,8 +1780,13 @@ where
         .beside(direct.viewer.choose_path(session, direct.mine, true, stop))
         .await;
     let (why, elapsed) = match into_path(choice)? {
-        PathChoice::Direct(media) => {
+        PathChoice::Direct(mut media) => {
             preopen = Preopen::None;
+            // The direct binding is built by the path phase, which knows
+            // nothing of quality: the session's preset (`--quality`,
+            // `[viewer] quality`, the window's settings) rides its `Bind`
+            // exactly as it rides the onion one.
+            media.binding = media.binding.with_quality(onion.quality());
             let (route, winner, elapsed) = (media.route, media.winner, media.elapsed);
             // The connection is up with the host's key pinned: the window
             // says so while the host opens its capture.
@@ -4791,6 +4797,48 @@ mod tests {
         assert_eq!(media.route(&sid), Some(TransportKind::Lan));
         assert_eq!(log.opens.load(Ordering::SeqCst), 1, "opened beside the try");
         assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
+    }
+
+    /// The final audit before the release: the session's preset (the
+    /// CLI's `--quality`, `[viewer] quality`, the window's settings) rides
+    /// the direct `Bind` as it rides the onion one. The path phase builds
+    /// the direct binding knowing nothing of quality, so without
+    /// [`bind_media`] carrying `onion`'s preset over, every direct session
+    /// ran Balanced whatever was asked. Each preset is asked on the host's
+    /// LAN and the host applies that one, on the direct row of its table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_direct_session_binds_with_the_preset_it_asked_for() {
+        use tornect_proto::quality;
+        for (seed, preset, code) in [
+            (
+                20,
+                QualityPreset::BestPerformance,
+                quality::BEST_PERFORMANCE,
+            ),
+            (21, QualityPreset::BestQuality, quality::BEST_QUALITY),
+            (22, QualityPreset::Balanced, quality::BALANCED),
+        ] {
+            let (viewer_net, host_net) = lan_pair(seed);
+            let media = test_card();
+            let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+            let session = &mut rig.session;
+            let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+            let log = OnionLog::default();
+            let binding = Binding::new(session.session_token(), &session.th()).with_quality(preset);
+            let (_stop, stopped) = watch::channel(false);
+            let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+                .await
+                .unwrap_or_else(|end| panic!("{preset:?}: not bound: {end:?}"));
+            assert_eq!(
+                crate::direct::route_line(&bound.end),
+                "ROUTE direct lan",
+                "{preset:?}"
+            );
+            let MediaPath::Direct(viewer) = &bound.media else {
+                panic!("{preset:?}: not direct");
+            };
+            assert_eq!(viewer.bound().quality.preset, code, "{preset:?}");
+        }
     }
 
     /// Design `direct` §6.7 through the caller, with the host wired as
