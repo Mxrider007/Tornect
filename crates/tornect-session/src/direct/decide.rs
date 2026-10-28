@@ -355,35 +355,40 @@ mod tests {
         Decision::Tor { reason, why }
     }
 
-    /// The policy table of the direct design §4, every cell, with and
-    /// without the internet scope: what is tried, what is said, what ends.
-    #[test]
-    fn the_policy_table_is_the_designs() {
+    /// The policy table of the direct design §4, every cell, in either
+    /// scope: what is tried, what is said, what ends.
+    fn table(internet: bool) -> [(TransportPolicy, TransportPolicy, Decision); 9] {
         let same_site = |lan_only| Decision::Try {
             scope: Scope::SameSite,
             lan_only,
         };
+        let any_any = Decision::Try {
+            scope: if internet {
+                Scope::Internet
+            } else {
+                Scope::SameSite
+            },
+            lan_only: false,
+        };
+        [
+            (ANY, ANY, any_any),
+            (ANY, TOR, tor(Some(fallback::OFF), TorWhy::HereOff)),
+            (ANY, LAN, same_site(true)),
+            (TOR, ANY, tor(Some(fallback::PEER_OFF), TorWhy::HostPolicy)),
+            (TOR, TOR, tor(Some(fallback::OFF), TorWhy::HostPolicy)),
+            (TOR, LAN, Decision::LanRefused),
+            (LAN, ANY, same_site(true)),
+            (LAN, TOR, Decision::LanRefused),
+            (LAN, LAN, same_site(true)),
+        ]
+    }
+
+    /// The policy table of the direct design §4, every cell, with and
+    /// without the internet scope.
+    #[test]
+    fn the_policy_table_is_the_designs() {
         for internet in [false, true] {
-            let any_any = Decision::Try {
-                scope: if internet {
-                    Scope::Internet
-                } else {
-                    Scope::SameSite
-                },
-                lan_only: false,
-            };
-            let table = [
-                (ANY, ANY, any_any),
-                (ANY, TOR, tor(Some(fallback::OFF), TorWhy::HereOff)),
-                (ANY, LAN, same_site(true)),
-                (TOR, ANY, tor(Some(fallback::PEER_OFF), TorWhy::HostPolicy)),
-                (TOR, TOR, tor(Some(fallback::OFF), TorWhy::HostPolicy)),
-                (TOR, LAN, Decision::LanRefused),
-                (LAN, ANY, same_site(true)),
-                (LAN, TOR, Decision::LanRefused),
-                (LAN, LAN, same_site(true)),
-            ];
-            for (p_h, mine, want) in table {
+            for (p_h, mine, want) in table(internet) {
                 assert_eq!(
                     decide_with(internet, p_h, Mine::of(mine), true, true, false),
                     want,
@@ -391,24 +396,19 @@ mod tests {
                 );
             }
         }
-        // The build's own scope (step B12 turned it on): `decide` is the
-        // table with `INTERNET_DIRECT`.
-        assert_eq!(
-            decide(ANY, Mine::of(ANY), true, true, false),
-            Decision::Try {
-                scope: Scope::Internet,
-                lan_only: false,
-            },
-            "Phase B: the internet scope"
-        );
-        for p_h in [ANY, TOR, LAN] {
-            for mine in [ANY, TOR, LAN] {
-                assert_eq!(
-                    decide(p_h, Mine::of(mine), true, true, false),
-                    decide_with(INTERNET_DIRECT, p_h, Mine::of(mine), true, true, false),
-                    "host {p_h:?}, viewer {mine:?}"
-                );
-            }
+    }
+
+    /// The build's own scope (step B12 turned it on): [`decide`] gives the
+    /// internet-scope table in every cell, so a build with
+    /// [`INTERNET_DIRECT`] off fails the `(Any, Any)` cell.
+    #[test]
+    fn this_build_decides_in_the_internet_scope() {
+        for (p_h, mine, want) in table(true) {
+            assert_eq!(
+                decide(p_h, Mine::of(mine), true, true, false),
+                want,
+                "host {p_h:?}, viewer {mine:?}"
+            );
         }
     }
 
