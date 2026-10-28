@@ -138,12 +138,13 @@ pub fn host(
         cfg.tor.bridges = mode;
     }
     // One machine for every session of this host; the router mappings an
-    // earlier run left are swept at start and this run's get their release
-    // wait at exit (design `direct` §8.6).
-    let net = crate::direct::real_net(paths);
-    let direct = DirectWiring::real(Arc::new(device), DirectKnobs::new(&cfg), Arc::clone(&net));
+    // earlier run left are swept once the host's wiring has its one handle
+    // on `sessions.log`, which their lines go through, and this run's get
+    // their release wait at exit (design `direct` §8.6).
+    let ports = crate::direct::RouterPorts::new(paths);
+    let direct = DirectWiring::real(Arc::new(device), DirectKnobs::new(&cfg), &ports);
     block_on(crate::direct::router_lifecycle(
-        &net,
+        &ports,
         run_host(paths, &cfg, Arc::new(identity), direct, once, source),
     ))
 }
@@ -1021,12 +1022,19 @@ pub fn connect(
         Some(ua) => Some(prepare_unattended(paths, id, &device, &pins, ua)?),
         None => None,
     };
-    let net = crate::direct::real_net(paths);
-    let direct = DirectWiring::real(device, DirectKnobs::new(&cfg), Arc::clone(&net));
-    block_on(crate::direct::router_lifecycle(
-        &net,
-        run_connect(paths, &cfg, id, &direct, &pins, opts, prepared),
-    ))
+    // No host runs here: the router mappings an earlier run left are swept
+    // at start, their lines keyed as this process's other lines are, and
+    // this run's get their release wait at exit (design `direct` §8.6).
+    let ports = crate::direct::RouterPorts::new(paths);
+    let direct = DirectWiring::real(device, DirectKnobs::new(&cfg), &ports);
+    block_on(async {
+        ports.not_hosting();
+        crate::direct::router_lifecycle(
+            &ports,
+            run_connect(paths, &cfg, id, &direct, &pins, opts, prepared),
+        )
+        .await
+    })
 }
 
 async fn run_connect(
@@ -4416,6 +4424,7 @@ mod tests {
             device: Arc::new(DeviceIdentity::from_seed(&[seed; 32])),
             knobs: DirectKnobs::new(cfg),
             net,
+            router: None,
         }
         .ctx(tor_only)
     }
@@ -4543,6 +4552,7 @@ mod tests {
             device: Arc::new(DeviceIdentity::from_seed(&[0x44; 32])),
             knobs: DirectKnobs::new(cfg),
             net,
+            router: None,
         };
         let wiring = crate::host::wire(
             &paths,

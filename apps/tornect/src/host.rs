@@ -791,6 +791,14 @@ pub fn wire_window(
     // `TOR_FALLBACK{}` at once, as to an older host. Offered whatever the
     // policy: the accept signs the policy, and the viewer reads it there.
     host_cfg.feats.push(messages::feats::DIR1.to_owned());
+    // This process's router mappings are told through the one handle on
+    // `sessions.log` (keyed by the store), and the sweep of an earlier run's
+    // leftovers, whose lines go there too, starts only now: a second handle
+    // would write untagged lines past the chain's start, or fork it
+    // (design `direct` §8.1, §B.8.13).
+    if let Some(router) = &direct.router {
+        router.hosting(audit.log());
+    }
 
     Ok(HostWiring {
         cfg: host_cfg,
@@ -3679,6 +3687,7 @@ mod tests {
                 device: host_device,
                 knobs: knobs.clone(),
                 net: host_net,
+                router: None,
             },
             Arc::new(ScriptedConsent::new()),
             Arc::clone(&media),
@@ -3705,6 +3714,7 @@ mod tests {
             device: Arc::new(identity),
             knobs,
             net: viewer_net,
+            router: None,
         }
         .ctx(false);
         let binding = tornect_session::Binding::new(session.session_token(), &session.th());
@@ -4078,6 +4088,82 @@ mod tests {
             .collect();
         assert_eq!(mine.len(), 3, "{text}");
         for line in mine {
+            let chain = tornect_core::session_log::parse_line_chain(line).unwrap();
+            assert!(chain.tag.is_some(), "{line}");
+        }
+    }
+
+    /// Review of steps B6 and B7 (§B.8.13, design `direct` §8.1): the
+    /// router mappings' lines keep `sessions.log` intact in a home whose host
+    /// has unattended access on. A `connect` (no host here) writes them keyed
+    /// with the home's `K_log`; a host's wiring hands its one handle to the
+    /// process's router lines, so they are tagged as the FSM's are, written
+    /// beside the FSM's lines at the same moment without forking the chain,
+    /// and the next start reads the log whole. They went through a second,
+    /// unkeyed handle, and every start after one read "log modified".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn router_lines_keep_the_log_intact() {
+        use crate::direct::RouterPorts;
+        use tornect_core::session_log::{ChainStatus, SessionEvent, SessionRecord};
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_net::{MapEvent, MapEvents as _, MapVia};
+
+        let written = Duration::from_secs(10);
+        let env = env();
+        grant_unattended(&env, &DeviceId::from_bytes([3; 32]), "quiet verdant otter");
+        let row = |wiring: &HostWiring| wiring.ctx.as_ref().unwrap().readiness.get().session_log;
+
+        // `tornect connect`: no host runs in this process.
+        let viewer = RouterPorts::new(&env.paths);
+        viewer.not_hosting();
+        viewer.log().on_event(MapEvent::Opened(MapVia::Pcp));
+        viewer.log().on_event(MapEvent::Closed(MapVia::Pcp));
+        assert!(viewer.wind_down().await);
+        drop(viewer);
+
+        // `tornect host`: the wiring gives its handle to the router lines.
+        let ports = RouterPorts::new(&env.paths);
+        let mut direct = DirectWiring::for_test(0x33);
+        direct.router = Some(ports.clone());
+        let wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            direct,
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        assert_eq!(row(&wiring), Probe::Ok);
+        let fsm = {
+            let log = Arc::clone(wiring.audit.log());
+            std::thread::spawn(move || {
+                for _ in 0..10 {
+                    log.append(&SessionRecord::now(SessionEvent::SessionEnded))
+                        .unwrap();
+                }
+            })
+        };
+        for _ in 0..10 {
+            ports.log().on_event(MapEvent::Opened(MapVia::Upnp));
+        }
+        fsm.join().unwrap();
+        assert!(ports.log().flush(written));
+        let store = wiring.ctx.as_ref().unwrap().guard.store().clone();
+        let report = store.verify_log().unwrap();
+        assert_eq!(report.status, ChainStatus::Valid, "{report:?}");
+        drop((store, wiring));
+
+        let wiring = start_host(&env);
+        assert_eq!(row(&wiring), Probe::Ok);
+        let text = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+        let router: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(r#""event":"router_port""#))
+            .collect();
+        assert_eq!(router.len(), 12, "{text}");
+        for line in router {
             let chain = tornect_core::session_log::parse_line_chain(line).unwrap();
             assert!(chain.tag.is_some(), "{line}");
         }

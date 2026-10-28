@@ -698,9 +698,7 @@ pub fn log_attempt_via(
     let record = attempt_record(known, logged);
     let written = match host {
         Some(store) => store.log_event(&record).map_err(|e| e.to_string()),
-        None => tornect_core::keystore::FileSecretStore::open(paths.keys_dir())
-            .map_err(|e| e.to_string())
-            .and_then(|secrets| append_own(paths, &secrets, &record)),
+        None => append_keyed(paths, &record),
     };
     if let Err(e) = written {
         tracing::warn!(error = %e, "the unattended connect was not logged");
@@ -740,6 +738,29 @@ fn attempt_record(known: &KnownHost, logged: &Logged<'_>) -> SessionRecord {
     }
 }
 
+/// One own append at a time in this process. Each handle [`append_own`] makes holds a
+/// chain lock of its own, so two of them appending at once could both link to the same
+/// tail and fork the chain (§B.8.13). Every line of a process that runs no host goes
+/// through here: its unattended attempts and its router mappings'
+/// (`crate::direct::RouterPortLog`).
+static OWN_APPENDS: Mutex<()> = Mutex::new(());
+
+/// Append `record` as [`append_own`] does, keyed from this home's keystore (`keys/`):
+/// the way a process that runs no host writes its lines, so that they verify as the
+/// host's own do.
+pub(crate) fn append_keyed(paths: &Paths, record: &SessionRecord) -> Result<(), String> {
+    tornect_core::keystore::FileSecretStore::open(paths.keys_dir())
+        .map_err(|e| e.to_string())
+        .and_then(|secrets| append_own(paths, &secrets, record))
+}
+
+/// Hold every own append of this process until the guard is dropped (a test's stalled
+/// disk).
+#[cfg(test)]
+pub(crate) fn hold_own_appends() -> MutexGuard<'static, ()> {
+    OWN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Append `record` to this home's `sessions.log` through a handle of its own, keyed
 /// with the `K_log` of `secrets` (the keystore the host's store reads, `keys/`), so
 /// that the line verifies as the host's own do: tagged where a `K_master` exists,
@@ -754,6 +775,7 @@ fn append_own(
 ) -> Result<(), String> {
     use tornect_core::unattended::codec::StoreLoadError;
     use tornect_core::unattended::store::GrantStore;
+    let _one = OWN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
     let key = match GrantStore::current_log_key(secrets) {
         Ok(key) => key,
         Err(StoreLoadError::KeystoreLocked(_)) => {

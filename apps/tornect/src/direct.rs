@@ -2,13 +2,16 @@
 //! read ([`DirectKnobs`]), the bridge rule after each Tor bootstrap
 //! (decision M1-86), the parts the host's and the viewer's halves are made
 //! of ([`DirectWiring`]), the machine they run on and its router mappings'
-//! lifecycle ([`real_net`], [`router_lifecycle`]), and the lines `doctor`
+//! lifecycle ([`RouterPorts`], [`router_lifecycle`]), and the lines `doctor`
 //! and the CLI print about the path. No line here ever names an address, a
 //! port or a key (decision M1-83).
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tornect_core::config::{self, BridgeMode, Network};
 use tornect_core::session_log::{SessionEvent, SessionLog, SessionRecord, TransportKind};
@@ -87,35 +90,186 @@ pub struct DirectWiring {
     pub knobs: DirectKnobs,
     /// The network the links run on ([`RealNet`] outside tests).
     pub net: Arc<dyn NetEnv>,
+    /// This process's router mappings, when `net` is their machine: the
+    /// host's wiring sends their lines through its one handle on
+    /// `sessions.log` ([`RouterPorts::hosting`]). `None` in tests.
+    pub router: Option<RouterPorts>,
 }
 
-/// This machine's network for direct links, built once per process (design
-/// `direct` §8.6, "RealNet lifecycle") and shared by every session of it.
-/// On Windows it reads each interface's IPv4 gateway with
-/// `tornect-platform`'s `GetBestRoute2` lookup, which sends nothing:
-/// netdev's own Windows gateway read may send ARP and is never compiled
-/// (design §7.1). Linux and macOS read it through netdev. Its router
-/// mappings (design §7.4) keep their ledger in `paths`'
-/// `router_ports_dir` and are told to `sessions.log` ([`RouterPortLog`]).
-#[must_use]
-pub fn real_net(paths: &Paths) -> Arc<RealNet> {
-    #[cfg(windows)]
-    let net = RealNet::new().with_gateway_lookup(tornect_platform::route::default_gateway_v4);
-    #[cfg(not(windows))]
-    let net = RealNet::new();
-    Arc::new(net.with_router(
-        paths.router_ports_dir(),
-        Arc::new(RouterPortLog::new(paths)),
-    ))
+/// This process's router mappings (design `direct` §7.4, §8.6): the machine
+/// its direct links run on, whose router mapper makes them, and the
+/// `sessions.log` lines that tell them ([`RouterPortLog`]). Built once per
+/// process ([`RouterPorts::new`]) and shared by every session of it; clones
+/// share everything.
+///
+/// The lines go through the host's one handle on `sessions.log` once the
+/// host's wiring has it ([`RouterPorts::hosting`]), and in a process that
+/// runs no host through the handle every line of such a process goes
+/// through ([`RouterPorts::not_hosting`]), keyed as the host's store keys its
+/// own: a second handle beside the host's would write untagged lines after
+/// the chain started, or fork the chain (§B.8.13). The sweep of an earlier
+/// run's leftovers, which writes lines, starts only then.
+#[derive(Clone)]
+pub struct RouterPorts {
+    net: Arc<RealNet>,
+    log: Arc<RouterPortLog>,
+    /// Whether the sweep was started.
+    swept: Arc<AtomicBool>,
 }
+
+impl RouterPorts {
+    /// This machine's network for direct links with its router ledger in
+    /// `paths`' `router_ports_dir` and its lines for `paths`'
+    /// `sessions.log`. On Windows it reads each interface's IPv4 gateway with
+    /// `tornect-platform`'s `GetBestRoute2` lookup, which sends nothing:
+    /// netdev's own Windows gateway read may send ARP and is never compiled
+    /// (design §7.1). Linux and macOS read it through netdev.
+    #[must_use]
+    pub fn new(paths: &Paths) -> Self {
+        #[cfg(windows)]
+        let net = RealNet::new().with_gateway_lookup(tornect_platform::route::default_gateway_v4);
+        #[cfg(not(windows))]
+        let net = RealNet::new();
+        let log = Arc::new(RouterPortLog::new(paths));
+        Self {
+            net: Arc::new(net.with_router(
+                paths.router_ports_dir(),
+                Arc::clone(&log) as Arc<dyn MapEvents>,
+            )),
+            log,
+            swept: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The machine.
+    #[must_use]
+    pub fn net(&self) -> &Arc<RealNet> {
+        &self.net
+    }
+
+    /// Where the mappings are told.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn log(&self) -> &Arc<RouterPortLog> {
+        &self.log
+    }
+
+    /// This process is the host, and `log` its one handle on `sessions.log`
+    /// (keyed by its store): every router line goes through it from now on,
+    /// and the sweep starts. The host's wiring calls it once it has the
+    /// handle, before any session.
+    pub fn hosting(&self, log: &SessionLog) {
+        self.log.attach(log.clone());
+        self.sweep();
+    }
+
+    /// This process runs no host (`connect`, a window without its host
+    /// role): the sweep starts, its lines written as the process's other
+    /// lines are ([`RouterPortLog`]). Nothing when the host's wiring already
+    /// started it.
+    pub fn not_hosting(&self) {
+        self.sweep();
+    }
+
+    /// The removal of the mappings an earlier run left begins in the
+    /// background on the current tokio runtime, bounded by
+    /// [`tornect_net::SWEEP_CAP`], whatever the direct-path policy (it only
+    /// removes exposure), and never delays the start. Its handle is not
+    /// kept: a process that exits first leaves the rest to its next start.
+    /// Once per process; whether this call started it.
+    fn sweep(&self) -> bool {
+        if self.swept.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        drop(self.net.sweep_leftovers());
+        true
+    }
+
+    /// The end of it: waits, at most [`SHUTDOWN_RELEASE_WAIT`], for the
+    /// releases of the mappings this process's links held, then, at most
+    /// [`PORT_LINES_WAIT`], for the lines still to write (a release's
+    /// `closed` among them); whether both finished. A link that ended before
+    /// this call counts its mapping's release from the moment it ended, so
+    /// the wait cannot miss it. A release unfinished by then lapses with the
+    /// router's lease, and its ledger entry is the next start's to sweep; so
+    /// does the mapping of a link still open at exit.
+    pub async fn wind_down(&self) -> bool {
+        let released = self.net.releases().wait(SHUTDOWN_RELEASE_WAIT).await;
+        let log = Arc::clone(&self.log);
+        let written = tokio::task::spawn_blocking(move || log.flush(PORT_LINES_WAIT))
+            .await
+            .unwrap_or(false);
+        released && written
+    }
+}
+
+impl std::fmt::Debug for RouterPorts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterPorts")
+            .field("log", &self.log)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `run`, then the end of the router mappings' lifecycle
+/// ([`RouterPorts::wind_down`]). The `host` and `connect` commands run in it;
+/// `connect` starts the sweep first ([`RouterPorts::not_hosting`]), the
+/// host's wiring once it has its handle on `sessions.log`.
+pub async fn router_lifecycle<T>(ports: &RouterPorts, run: impl Future<Output = T>) -> T {
+    let out = run.await;
+    if !ports.wind_down().await {
+        tracing::debug!("a router mapping's release or line was still running at exit");
+    }
+    out
+}
+
+/// How many `router_port` lines wait at most for their writer; one more is
+/// dropped and counted. A session makes a few, and they are written as fast
+/// as `sessions.log` takes them: only a stalled disk fills this.
+const PORT_LINES_QUEUE: usize = 64;
+
+/// How long the exit waits, after the releases, for the router lines still
+/// to write ([`RouterPorts::wind_down`]).
+pub const PORT_LINES_WAIT: Duration = Duration::from_secs(1);
 
 /// Where this process's router mappings are told (design `direct` §8.1):
 /// one `router_port` line in `sessions.log` for each mapping opened,
 /// released, failed to release, or left by an earlier run and removed. The
 /// line holds the change and the protocol, fixed words only, never an
 /// address or a port.
+///
+/// [`MapEvents::on_event`] runs on the mapper's tasks and in the drops of
+/// its mappings, where nothing may block: it stamps the line and queues it
+/// (at most [`PORT_LINES_QUEUE`], beyond that dropped and counted), and a
+/// thread of its own appends and syncs the lines in order, through the
+/// host's handle once [`attach`](Self::attach)ed and otherwise keyed as a
+/// process that runs no host keys its lines (`ua_client::append_keyed`). The
+/// thread ends when the queue is empty and the next line starts another.
 pub struct RouterPortLog {
-    log: SessionLog,
+    lines: Arc<PortLines>,
+}
+
+/// The queue of a [`RouterPortLog`] and what its writer needs.
+struct PortLines {
+    /// The home whose `sessions.log` and keystore a line without a host
+    /// handle goes through.
+    paths: Paths,
+    state: Mutex<PortState>,
+    /// Told whenever the writer finds the queue empty and ends.
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct PortState {
+    queue: VecDeque<SessionRecord>,
+    /// The host's one handle on `sessions.log`, once attached.
+    host: Option<SessionLog>,
+    /// Whether a writer runs (it has a line in hand or more queued).
+    writing: bool,
+    /// Lines dropped on a full queue, all told.
+    dropped: u64,
+    /// How many of them a warning has named.
+    reported: u64,
 }
 
 impl RouterPortLog {
@@ -123,68 +277,145 @@ impl RouterPortLog {
     #[must_use]
     pub fn new(paths: &Paths) -> Self {
         Self {
-            log: SessionLog::new(paths.sessions_log()),
+            lines: Arc::new(PortLines {
+                paths: paths.clone(),
+                state: Mutex::new(PortState::default()),
+                idle: Condvar::new(),
+            }),
+        }
+    }
+
+    /// From now on (the lines still queued included) every line goes
+    /// through `log`, the host's one handle on `sessions.log`.
+    pub fn attach(&self, log: SessionLog) {
+        self.lines.lock().host = Some(log);
+    }
+
+    /// Waits, at most `max`, until every line handed over so far is written
+    /// (or failed, which is logged); whether that happened. It blocks: an
+    /// async caller runs it on a blocking thread.
+    pub fn flush(&self, max: Duration) -> bool {
+        let deadline = std::time::Instant::now() + max;
+        let mut state = self.lines.lock();
+        while state.writing {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            state = self
+                .lines
+                .idle
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    /// Lines dropped on a full queue so far.
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        self.lines.lock().dropped
+    }
+}
+
+impl PortLines {
+    fn lock(&self) -> MutexGuard<'_, PortState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queue `record`, and start the writer unless one runs.
+    fn push(this: &Arc<Self>, record: SessionRecord) {
+        let mut state = this.lock();
+        if state.queue.len() >= PORT_LINES_QUEUE {
+            state.dropped = state.dropped.saturating_add(1);
+            return;
+        }
+        state.queue.push_back(record);
+        if state.writing {
+            return;
+        }
+        state.writing = true;
+        drop(state);
+        let lines = Arc::clone(this);
+        let started = std::thread::Builder::new()
+            .name("router-port-log".to_owned())
+            .spawn(move || lines.write_queued());
+        if let Err(e) = started {
+            tracing::warn!(error = %e, "could not start the writer of router_port lines");
+            let mut state = this.lock();
+            let lost = u64::try_from(state.queue.len()).unwrap_or(u64::MAX);
+            state.queue.clear();
+            state.dropped = state.dropped.saturating_add(lost);
+            state.writing = false;
+            this.idle.notify_all();
+        }
+    }
+
+    /// The writer: every queued line in order, until the queue is empty.
+    fn write_queued(&self) {
+        loop {
+            let (record, host) = {
+                let mut state = self.lock();
+                let Some(record) = state.queue.pop_front() else {
+                    state.writing = false;
+                    let unreported = state.dropped - state.reported;
+                    state.reported = state.dropped;
+                    self.idle.notify_all();
+                    drop(state);
+                    if unreported > 0 {
+                        tracing::warn!(
+                            dropped = unreported,
+                            "router_port lines were dropped: sessions.log was not written fast \
+                             enough"
+                        );
+                    }
+                    return;
+                };
+                (record, state.host.clone())
+            };
+            let written = match &host {
+                Some(log) => log.append(&record).map_err(|e| e.to_string()),
+                None => crate::ua_client::append_keyed(&self.paths, &record),
+            };
+            if let Err(e) = written {
+                tracing::warn!(error = %e, "could not append a router_port line to sessions.log");
+            }
         }
     }
 }
 
 impl MapEvents for RouterPortLog {
     fn on_event(&self, ev: MapEvent) {
-        // One short line and its fsync, a few times a session at most:
-        // written in place, as the signalling FSM's own sink writes its
-        // lines from its tasks.
-        let record = SessionRecord::now(SessionEvent::RouterPort).detail(ev.router_port().detail());
-        if let Err(e) = self.log.append(&record) {
-            tracing::warn!(error = %e, "could not append a router_port line to sessions.log");
-        }
+        PortLines::push(
+            &self.lines,
+            SessionRecord::now(SessionEvent::RouterPort).detail(ev.router_port().detail()),
+        );
     }
 }
 
 impl std::fmt::Debug for RouterPortLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RouterPortLog").finish_non_exhaustive()
+        let state = self.lines.lock();
+        f.debug_struct("RouterPortLog")
+            .field("attached", &state.host.is_some())
+            .field("queued", &state.queue.len())
+            .field("dropped", &state.dropped)
+            .finish_non_exhaustive()
     }
-}
-
-/// The start of the router mappings' lifecycle (design `direct` §7.4,
-/// §8.6), on the current tokio runtime: the removal of the mappings an
-/// earlier run left begins in the background, bounded by
-/// [`tornect_net::SWEEP_CAP`], whatever the direct-path policy (it only
-/// removes exposure), and never delays the start. Its handle is not kept:
-/// a process that exits first leaves the rest to its next start.
-pub fn sweep_router_leftovers(net: &RealNet) {
-    drop(net.sweep_leftovers());
-}
-
-/// The end of it: waits, at most [`SHUTDOWN_RELEASE_WAIT`], for the
-/// releases of the mappings this process's links held; whether none still
-/// runs. A link that ended before this call counts its mapping's release
-/// from the moment it ended, before its aborted gathering has dropped the
-/// mapping, so the wait cannot miss it. A release unfinished by then
-/// lapses with the router's lease, and its ledger entry is the next start's
-/// to sweep; so does the mapping of a link still open at exit.
-pub async fn wait_router_releases(net: &RealNet) -> bool {
-    net.releases().wait(SHUTDOWN_RELEASE_WAIT).await
-}
-
-/// `run` inside the router mappings' lifecycle: the sweep starts before it
-/// ([`sweep_router_leftovers`]) and the releases get their wait after it
-/// ([`wait_router_releases`]). The `host` and `connect` commands run in it.
-pub async fn router_lifecycle<T>(net: &RealNet, run: impl Future<Output = T>) -> T {
-    sweep_router_leftovers(net);
-    let out = run.await;
-    if !wait_router_releases(net).await {
-        tracing::debug!("a router mapping's release was still running at exit");
-    }
-    out
 }
 
 impl DirectWiring {
-    /// The parts for `device` on this process's machine ([`real_net`]),
+    /// The parts for `device` on this process's machine ([`RouterPorts`]),
     /// with `knobs`.
     #[must_use]
-    pub fn real(device: Arc<DeviceIdentity>, knobs: DirectKnobs, net: Arc<RealNet>) -> Self {
-        Self { device, knobs, net }
+    pub fn real(device: Arc<DeviceIdentity>, knobs: DirectKnobs, ports: &RouterPorts) -> Self {
+        Self {
+            device,
+            knobs,
+            net: Arc::clone(ports.net()) as Arc<dyn NetEnv>,
+            router: Some(ports.clone()),
+        }
     }
 
     /// The device key's public half.
@@ -227,6 +458,7 @@ impl DirectWiring {
             device: Arc::new(DeviceIdentity::from_seed(&[seed; 32])),
             knobs: DirectKnobs::new(&Config::default()),
             net: no_network(),
+            router: None,
         }
     }
 }
@@ -316,7 +548,7 @@ pub fn route_line(end: &PathEnd) -> String {
 /// candidate that won (`-` on Tor) and the time from the accept to the open
 /// direct stream or to `TOR_FALLBACK`, in whole milliseconds.
 #[must_use]
-pub fn path_line(winner: Option<CandidateKind>, elapsed: std::time::Duration) -> String {
+pub fn path_line(winner: Option<CandidateKind>, elapsed: Duration) -> String {
     format!(
         "PATH {} {} ms",
         winner.map_or("-", CandidateKind::name),
@@ -718,20 +950,26 @@ mod tests {
         );
     }
 
+    /// How long a test waits for the router lines' writer.
+    const WRITTEN: Duration = Duration::from_secs(10);
+
     /// Design `direct` §8.1: each router mapping event is one
     /// `router_port` line holding the change and the protocol, fixed words
-    /// only, with no session, peer, address or port.
+    /// only, with no session, peer, address or port, in the order the
+    /// events came.
     #[test]
     fn router_mapping_events_are_router_port_lines_of_fixed_words() {
         use tornect_net::MapVia;
 
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
         let sink = RouterPortLog::new(&paths);
         sink.on_event(MapEvent::Opened(MapVia::Pcp));
         sink.on_event(MapEvent::Closed(MapVia::Pcp));
         sink.on_event(MapEvent::CloseFailed(MapVia::NatPmp));
         sink.on_event(MapEvent::LeftoverRemoved(MapVia::Upnp));
+        assert!(sink.flush(WRITTEN));
         let records = SessionLog::new(paths.sessions_log()).read_all().unwrap();
         let details: Vec<_> = records
             .iter()
@@ -754,28 +992,219 @@ mod tests {
         assert!(!format!("{sink:?}").contains(&*tmp.path().to_string_lossy()));
     }
 
-    /// Design `direct` §8.6: the process's machine has the router ledger
-    /// (only a machine with one starts a sweep), and the lifecycle a command
-    /// runs in returns what the command returned only once the releases
-    /// running at its end are done.
-    #[tokio::test]
-    async fn the_router_lifecycle_sweeps_at_start_and_waits_for_releases_at_exit() {
+    /// Review of steps B6 and B7 (§B.8.13): on a host whose store keys
+    /// `sessions.log`, the router lines go through the host's one handle,
+    /// so each carries the `K_log` tag the verifier asks of every line past
+    /// the key's epoch, and they and the lines the FSM writes at the same
+    /// moment through that handle stay one chain. A second, unkeyed handle
+    /// wrote them untagged (a false tamper badge at every start), and two
+    /// handles appending at once could link to the same tail.
+    #[test]
+    fn router_lines_go_through_the_hosts_keyed_handle_and_keep_its_chain() {
+        use tornect_core::session_log::{ChainStatus, line_tag, parse_line_chain};
+        use tornect_core::unattended::codec::MasterKey;
+        use tornect_net::MapVia;
+
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
-        let net = real_net(&paths);
-        let sweep = net.sweep_leftovers().expect("a router ledger");
+        paths.ensure().unwrap();
+        // The host's handle: a line from before the key, then the key (the
+        // store's bootstrap) and a first tagged line, the stored head.
+        let host = SessionLog::new(paths.sessions_log());
+        host.append(&SessionRecord::now(SessionEvent::PairAccepted))
+            .unwrap();
+        let epoch = host.tail_hash().unwrap();
+        let master = MasterKey::generate().unwrap();
+        host.set_log_key(Some(master.k_log()));
+        let head = host
+            .append_chained(&SessionRecord::now(SessionEvent::SessionStarted))
+            .unwrap();
+
+        let sink = RouterPortLog::new(&paths);
+        sink.attach(host.clone());
+        let fsm = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    host.append(&SessionRecord::now(SessionEvent::SessionEnded))
+                        .unwrap();
+                }
+            })
+        };
+        for _ in 0..10 {
+            sink.on_event(MapEvent::Opened(MapVia::Pcp));
+            sink.on_event(MapEvent::Closed(MapVia::Pcp));
+        }
+        fsm.join().unwrap();
+        assert!(sink.flush(WRITTEN));
+        assert_eq!(sink.dropped(), 0);
+
+        let report = host.verify_chain(Some(&head), epoch.as_ref()).unwrap();
+        assert_eq!(report.status, ChainStatus::Valid, "{report:?}");
+        assert_eq!(report.tagged_beyond_head, 40, "{report:?}");
+        let lines = host.read_lines().unwrap();
+        let router: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains(r#""event":"router_port""#))
+            .collect();
+        assert_eq!(router.len(), 20);
+        for line in router {
+            let chain = parse_line_chain(line).unwrap();
+            assert_eq!(
+                chain.tag,
+                Some(line_tag(&master.k_log(), &chain.without_tag)),
+                "{line}"
+            );
+        }
+    }
+
+    /// Review of steps B6 and B7: in a process that runs no host
+    /// (`connect`), the router lines are keyed as the host's store keys its
+    /// own, from the home's keystore, and they and the process's unattended
+    /// connect lines written at the same moment stay one chain (every own
+    /// append of the process takes one lock).
+    #[test]
+    fn router_lines_without_a_host_are_keyed_and_share_the_own_writer() {
+        use tornect_core::keystore::{FileSecretStore, SecretStore as _};
+        use tornect_core::session_log::{ChainStatus, line_tag, parse_line_chain};
+        use tornect_core::trusted::KnownHost;
+        use tornect_core::unattended::codec::{MASTER_KEY_ENTRY, MasterKey};
+        use tornect_net::MapVia;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let master = MasterKey::generate().unwrap();
+        FileSecretStore::open(paths.keys_dir())
+            .unwrap()
+            .put(MASTER_KEY_ENTRY, &master.to_entry())
+            .unwrap();
+
+        let sink = RouterPortLog::new(&paths);
+        let connects = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let known = KnownHost {
+                    label: "Desk".to_owned(),
+                    host_device_pk: [7; 32],
+                    paired_at: 1,
+                    last_seen: 1,
+                };
+                for _ in 0..10 {
+                    crate::ua_client::log_attempt(
+                        &paths,
+                        &known,
+                        &crate::ua_client::Logged::Ended("unreachable"),
+                    );
+                }
+            })
+        };
+        for _ in 0..10 {
+            sink.on_event(MapEvent::Opened(MapVia::Upnp));
+        }
+        connects.join().unwrap();
+        assert!(sink.flush(WRITTEN));
+
+        let log = SessionLog::new(paths.sessions_log());
+        log.set_log_key(Some(master.k_log()));
+        let report = log.verify_chain(None, None).unwrap();
+        // Every link and tag holds; only the head is the host's to store.
+        assert_eq!(report.status, ChainStatus::MissingHead, "{report:?}");
+        assert_eq!(report.lines, 20);
+        for line in log.read_lines().unwrap() {
+            let chain = parse_line_chain(&line).unwrap();
+            assert_eq!(
+                chain.tag,
+                Some(line_tag(&master.k_log(), &chain.without_tag)),
+                "{line}"
+            );
+        }
+    }
+
+    /// The mapper's tasks and its mappings' drops hand the line over and
+    /// return, whatever the disk does (`MapEvents` must not block): with
+    /// the writer stalled, a burst of events returns at once, the queue
+    /// keeps [`PORT_LINES_QUEUE`] lines and counts the rest as dropped, and
+    /// a flush says the lines are not written yet; once the writer moves,
+    /// the kept lines are written in order.
+    #[test]
+    fn events_never_wait_for_the_disk_and_the_queue_is_bounded() {
+        use tornect_net::MapVia;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let sink = Arc::new(RouterPortLog::new(&paths));
+        let stalled = crate::ua_client::hold_own_appends();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    sink.on_event(MapEvent::Opened(MapVia::Pcp));
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        done.recv_timeout(WRITTEN)
+            .expect("the events returned while the writer was stalled");
+        assert!(
+            !sink.flush(Duration::from_millis(50)),
+            "nothing written yet"
+        );
+        drop(stalled);
+        assert!(sink.flush(WRITTEN));
+        let written = SessionLog::new(paths.sessions_log()).read_all().unwrap();
+        // The writer may have taken the first line in hand before the queue
+        // filled.
+        assert!(
+            (PORT_LINES_QUEUE..=PORT_LINES_QUEUE + 1).contains(&written.len()),
+            "{}",
+            written.len()
+        );
+        assert_eq!(u64::try_from(written.len()).unwrap() + sink.dropped(), 100);
+        assert!(written.iter().all(|r| r.event == SessionEvent::RouterPort));
+    }
+
+    /// Design `direct` §8.6, review of steps B6 and B7: the host's handle,
+    /// once given, carries every router line from then on, and the sweep
+    /// starts with it; the sweep starts once per process, so a window whose
+    /// host role was wired does not start a second one. The machine has the
+    /// router ledger (only a machine with one starts a sweep), and the
+    /// lifecycle a command runs in returns what the command returned only
+    /// once the releases running at its end are done and their lines are
+    /// on disk.
+    #[tokio::test]
+    async fn the_router_lifecycle_sweeps_once_and_waits_for_releases_and_lines_at_exit() {
+        use tornect_net::MapVia;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let ports = RouterPorts::new(&paths);
+        let sweep = ports.net().sweep_leftovers().expect("a router ledger");
         assert_eq!(sweep.await.unwrap(), tornect_net::SweepReport::default());
         assert!(
             RealNet::new().sweep_leftovers().is_none(),
             "no ledger, no sweep"
         );
+        let host = SessionLog::new(paths.sessions_log());
+        ports.hosting(&host);
+        assert!(format!("{:?}", ports.log()).contains("attached: true"));
+        assert!(!ports.sweep(), "one sweep per process");
+        ports.not_hosting();
+        assert!(!ports.sweep());
 
-        let releases = net.releases();
+        let releases = ports.net().releases();
         let started = std::time::Instant::now();
-        let out = router_lifecycle(&net, async {
+        let log = Arc::clone(ports.log());
+        let out = router_lifecycle(&ports, async {
             releases.spawn(
                 &tokio::runtime::Handle::current(),
-                Box::pin(tokio::time::sleep(Duration::from_millis(150))),
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    log.on_event(MapEvent::Closed(MapVia::Pcp));
+                }),
             );
             7
         })
@@ -783,9 +1212,12 @@ mod tests {
         assert_eq!(out, 7);
         assert_eq!(releases.running(), 0, "the release ended before the exit");
         assert!(started.elapsed() >= Duration::from_millis(150));
-        // Nothing to release: the wait returns at once.
+        let lines = host.read_all().unwrap();
+        assert_eq!(lines.len(), 1, "the release's line is on disk");
+        assert_eq!(lines[0].detail.as_deref(), Some("closed pcp"));
+        // Nothing to release or write: the end returns at once.
         let started = std::time::Instant::now();
-        assert!(wait_router_releases(&net).await);
+        assert!(ports.wind_down().await);
         assert!(started.elapsed() < SHUTDOWN_RELEASE_WAIT);
     }
 }

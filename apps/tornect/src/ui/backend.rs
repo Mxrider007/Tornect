@@ -524,6 +524,11 @@ pub struct Backend {
     pub knobs: crate::direct::DirectKnobs,
     /// The network the direct links run on ([`tornect_net::RealNet`]).
     pub net: Arc<dyn tornect_net::NetEnv>,
+    /// This process's router mappings, whose `net` is their machine: the
+    /// host role's wiring sends their lines through its one handle on
+    /// `sessions.log` and starts their sweep, which a window without a host
+    /// role starts itself. `None` in tests.
+    pub router: Option<crate::direct::RouterPorts>,
     /// The device words and the look-alike alarm of this home (§B.6.1).
     pub words: Arc<super::recognize::Recognizer>,
     /// Started in background mode (`tornect --background`, §B.1.1): the
@@ -546,6 +551,7 @@ impl Backend {
             device: Arc::clone(&self.device),
             knobs: self.knobs.clone(),
             net: Arc::clone(&self.net),
+            router: self.router.clone(),
         }
     }
 
@@ -2906,6 +2912,12 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
         });
     }
     let hosted = take_host_role(&b, early).await;
+    // The sweep of the router mappings an earlier run left: a host role's
+    // wiring started it once it had its handle on `sessions.log`; without
+    // one it starts now (design `direct` §8.6).
+    if let Some(router) = &b.router {
+        router.not_hosting();
+    }
     // Not the host here: another Tornect process may be, and may share this
     // screen, which this window cannot see. While one holds the host lock,
     // the window hides what it hides while sharing.
@@ -6034,6 +6046,7 @@ mod tests {
             device: Arc::new(device),
             knobs: crate::direct::DirectKnobs::new(&Config::default()),
             net: crate::direct::no_network(),
+            router: None,
             words,
             background: Some(shown.clone()),
             hosted_store: std::sync::OnceLock::new(),
@@ -6112,6 +6125,7 @@ mod tests {
             device: Arc::new(device),
             knobs: crate::direct::DirectKnobs::new(&Config::default()),
             net: crate::direct::no_network(),
+            router: None,
             words,
             background: None,
             hosted_store: std::sync::OnceLock::new(),
@@ -7238,6 +7252,7 @@ mod tests {
             device: Arc::new(device),
             knobs: crate::direct::DirectKnobs::new(&Config::default()),
             net: crate::direct::no_network(),
+            router: None,
             words,
             background: None,
             hosted_store: std::sync::OnceLock::new(),

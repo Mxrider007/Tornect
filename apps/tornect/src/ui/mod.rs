@@ -301,13 +301,11 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
     // (design `direct` §8.6); the bridge state follows each bootstrap.
     let knobs = crate::direct::DirectKnobs::new(&real.cfg);
     // One machine for both roles; the router mappings an earlier run left
-    // are swept now, in the background, and this run's get their release
+    // are swept in the background once the host role is settled (its
+    // wiring has its one handle on `sessions.log`, which their lines go
+    // through, or there is no host role), and this run's get their release
     // wait once the window has closed (design `direct` §8.6).
-    let net = crate::direct::real_net(paths);
-    {
-        let _runtime = runtime.enter();
-        crate::direct::sweep_router_leftovers(&net);
-    }
+    let ports = crate::direct::RouterPorts::new(paths);
     runtime.spawn(backend::run(
         Backend {
             paths: paths.clone(),
@@ -321,7 +319,8 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
             knobs,
-            net: Arc::clone(&net) as Arc<dyn tornect_net::NetEnv>,
+            net: Arc::clone(ports.net()) as Arc<dyn tornect_net::NetEnv>,
+            router: Some(ports.clone()),
             background: gate_fact,
             hosted_store: std::sync::OnceLock::new(),
         },
@@ -330,7 +329,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
 
     let mut app = real_window(App::new(shared, popups, link, commands), &opts, probe_fact);
     let ran = event_loop.run_app(&mut app);
-    runtime.block_on(crate::direct::wait_router_releases(&net));
+    runtime.block_on(ports.wind_down());
     // Arti's final state flush happens as its runtime shuts down.
     shutdown_runtime(runtime);
     ran.context("the window's event loop failed")?;
