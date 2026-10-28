@@ -15,6 +15,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::Arc;
 
 use netdev::ipnet::{IpNet, Ipv6Net};
 
@@ -284,8 +285,64 @@ pub enum Refusal {
     /// same-site scope, a private address outside our on-link prefixes).
     Scope,
     /// A global address of a family the VPN rule keeps off the physical
-    /// interface (design §7.2).
+    /// interface (design §7.2), or, in VPN mode, one whose own route
+    /// leaves outside the tunnel ([`TunnelRoute`]).
     Vpn,
+}
+
+/// The route lookup of the environment: the source address the OS picks
+/// toward an address, with no packet sent (`NetEnv::route_source_to`).
+pub type RouteLookup = Arc<dyn Fn(SocketAddr) -> Option<IpAddr> + Send + Sync>;
+
+/// VPN mode's rule for each global remote (design §7.2, decision M1-80):
+/// the route toward it must leave from the tunnel's route source of its
+/// family. A split tunnel routes some prefixes outside the tunnel; without
+/// this check a peer whose address lies in one would get the probes and
+/// QUIC from the physical interface, and learn this computer's own public
+/// address while the VPN is up. `global_families` decides by family; this
+/// decides per address, the way the STUN client checks each server
+/// (`gather::StunAsk::tunnel`).
+#[derive(Clone)]
+pub struct TunnelRoute {
+    /// The tunnel's IPv4 route source, when global IPv4 remotes are
+    /// allowed at all.
+    pub v4: Option<Ipv4Addr>,
+    /// The tunnel's IPv6 route source, likewise.
+    pub v6: Option<Ipv6Addr>,
+    /// The environment's route lookup.
+    pub lookup: RouteLookup,
+}
+
+impl TunnelRoute {
+    /// Whether a datagram to `addr` (canonical) would leave from the
+    /// tunnel's route source of its family. No route, or no tunnel source
+    /// of that family, is a no.
+    #[must_use]
+    pub fn through_tunnel(&self, addr: SocketAddr) -> bool {
+        let tunnel = match addr.ip() {
+            IpAddr::V4(_) => self.v4.map(IpAddr::V4),
+            IpAddr::V6(_) => self.v6.map(IpAddr::V6),
+        };
+        tunnel.is_some_and(|tunnel| (self.lookup)(addr).map(canon_ip) == Some(tunnel))
+    }
+}
+
+/// Equal tunnel sources and the same lookup.
+impl PartialEq for TunnelRoute {
+    fn eq(&self, other: &Self) -> bool {
+        self.v4 == other.v4 && self.v6 == other.v6 && Arc::ptr_eq(&self.lookup, &other.lookup)
+    }
+}
+
+impl Eq for TunnelRoute {}
+
+impl fmt::Debug for TunnelRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelRoute")
+            .field("v4", &self.v4.map(|ip| RedactedIp(IpAddr::V4(ip))))
+            .field("v6", &self.v6.map(|ip| RedactedIp(IpAddr::V6(ip))))
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a peer-supplied address must pass before any datagram goes to it
@@ -316,6 +373,9 @@ pub struct RemoteFilter {
     /// The families (IPv4, IPv6) whose global remotes the VPN rule allows
     /// (`local::global_families`).
     pub global_families: (bool, bool),
+    /// VPN mode only: each global remote's own route must leave by the
+    /// tunnel (`local::tunnel_route`). `None` outside VPN mode.
+    pub tunnel_route: Option<TunnelRoute>,
     /// Every address of this computer.
     pub own: Vec<IpAddr>,
     /// Test environments only: a loopback remote passes on the port and
@@ -335,7 +395,8 @@ impl RemoteFilter {
     /// # Errors
     ///
     /// The first rule `addr` breaks, in the order port, family, own address,
-    /// network or broadcast, class, scope, VPN.
+    /// network or broadcast, class, scope, VPN (the family, then in VPN
+    /// mode the address's own route).
     pub fn check(&self, addr: SocketAddr) -> Result<(), Refusal> {
         let addr = canon(addr);
         let ip = addr.ip();
@@ -373,7 +434,7 @@ impl RemoteFilter {
             },
             (AddrClass::Global, _) if self.scope == Scope::SameSite => Err(Refusal::Scope),
             (AddrClass::Global, IpAddr::V4(_)) => {
-                if self.global_families.0 {
+                if self.global_families.0 && self.through_tunnel(addr) {
                     Ok(())
                 } else {
                     Err(Refusal::Vpn)
@@ -382,7 +443,7 @@ impl RemoteFilter {
             (AddrClass::Global, IpAddr::V6(_)) => {
                 if !self.have_v6 {
                     Err(Refusal::Family)
-                } else if !self.global_families.1 {
+                } else if !(self.global_families.1 && self.through_tunnel(addr)) {
                     Err(Refusal::Vpn)
                 } else {
                     Ok(())
@@ -390,6 +451,14 @@ impl RemoteFilter {
             }
             _ => Err(Refusal::Class),
         }
+    }
+
+    /// Outside VPN mode, yes; in VPN mode, whether the route toward `addr`
+    /// leaves by the tunnel ([`TunnelRoute::through_tunnel`]).
+    fn through_tunnel(&self, addr: SocketAddr) -> bool {
+        self.tunnel_route
+            .as_ref()
+            .is_none_or(|route| route.through_tunnel(addr))
     }
 
     /// Whether `ip` is a private IPv4 address inside one of our on-link
@@ -436,6 +505,7 @@ impl fmt::Debug for RemoteFilter {
             .field("have_v6", &self.have_v6)
             .field("dual_stack", &self.dual_stack)
             .field("global_families", &self.global_families)
+            .field("tunnel_route", &self.tunnel_route)
             .field("own", &Count(self.own.len(), "addresses"))
             .field("admit_loopback", &self.admit_loopback)
             .finish()

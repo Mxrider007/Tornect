@@ -49,6 +49,7 @@ fn lan_filter(dual_stack: bool) -> RemoteFilter {
         have_v6: false,
         dual_stack,
         global_families: (false, false),
+        tunnel_route: None,
         own: Vec::new(),
         admit_loopback: false,
     }
@@ -74,6 +75,7 @@ fn loopback_filter(dual_stack: bool) -> RemoteFilter {
         have_v6: false,
         dual_stack,
         global_families: (false, false),
+        tunnel_route: None,
         own: Vec::new(),
         admit_loopback: true,
     }

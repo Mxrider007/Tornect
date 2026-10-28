@@ -130,6 +130,7 @@ fn filter(scope: Scope) -> RemoteFilter {
         have_v6: scope == Scope::Internet,
         dual_stack: true,
         global_families: (true, true),
+        tunnel_route: None,
         own: vec![ip(OWN_V4), ip(OWN_ULA), ip(OWN_GLOBAL_V6)],
         admit_loopback: false,
     }

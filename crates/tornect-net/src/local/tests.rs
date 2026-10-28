@@ -381,6 +381,51 @@ fn global_families_keep_public_traffic_on_the_tunnel() {
     assert_eq!(global_families(&addrs, &lost, true), (false, false));
 }
 
+/// The filter of a VPN-mode side carries the tunnel's route source of each
+/// family `global_families` admits, with the environment's lookup; outside
+/// VPN mode it carries none (design §7.2, decision M1-80).
+#[test]
+fn a_vpn_filter_checks_each_global_remote_route() {
+    use IfaceKind::*;
+    let addrs = [
+        a("192.168.77.203", 24, 2, Physical),
+        a("2001:470:1:2:a1b2:c3d4:e5f6:7788", 64, 2, Physical),
+        a("10.66.0.2", 32, 7, Tunnel),
+    ];
+    let split = sources(Some("10.66.0.2"), Some("2001:470:1:2:a1b2:c3d4:e5f6:7788"));
+    assert!(vpn_mode(&addrs, &split));
+    let excluded: IpAddr = "64.0.0.9".parse().unwrap();
+    let lookup: RouteLookup = Arc::new(move |to: SocketAddr| {
+        Some(if to.ip() == excluded {
+            "192.168.77.203".parse().unwrap()
+        } else {
+            "10.66.0.2".parse().unwrap()
+        })
+    });
+    let offered = select_host_candidates(&addrs, &split, 50417, Scope::Internet, true);
+    let f = remote_filter(
+        Scope::Internet,
+        &addrs,
+        &split,
+        &offered,
+        true,
+        Some(lookup),
+        false,
+    );
+    assert_eq!(f.global_families, (true, false));
+    let route = f.tunnel_route.as_ref().expect("VPN mode");
+    assert_eq!(route.v4, Some("10.66.0.2".parse().unwrap()));
+    assert_eq!(route.v6, None);
+    assert!(f.admit("64.0.0.10:50417".parse().unwrap()));
+    assert_eq!(
+        f.check("64.0.0.9:50417".parse().unwrap()),
+        Err(crate::Refusal::Vpn)
+    );
+    let plain = remote_filter(Scope::Internet, &addrs, &split, &offered, true, None, false);
+    assert!(plain.tunnel_route.is_none());
+    assert!(plain.admit("64.0.0.9:50417".parse().unwrap()));
+}
+
 /// A home computer: Wi-Fi with a private IPv4, a temporary and a stable
 /// global IPv6, an EUI-64 one and a ULA; Ethernet with another private
 /// IPv4 and ULA; a docker bridge, a WireGuard tunnel and loopback.
@@ -668,7 +713,7 @@ fn the_remote_filter_is_built_from_what_was_offered() {
         Some("2001:470:1:2:5555:6666:7777:8888"),
     );
     let offered = select_host_candidates(&home(), &src, 50417, Scope::SameSite, false);
-    let f = remote_filter(Scope::SameSite, &home(), &src, &offered, true, false, false);
+    let f = remote_filter(Scope::SameSite, &home(), &src, &offered, true, None, false);
     assert_eq!(f.scope, Scope::SameSite);
     assert_eq!(f.on_link.len(), 4);
     assert_eq!(
@@ -686,31 +731,23 @@ fn the_remote_filter_is_built_from_what_was_offered() {
     assert!(!f.admit("172.17.0.2:50417".parse().unwrap()));
     assert!(!f.admit("192.168.77.203:50417".parse().unwrap()));
     assert!(f.admit("[fd12:3456:789a:ee::1]:50417".parse().unwrap()));
-    let wide = remote_filter(Scope::Internet, &home(), &src, &offered, true, false, false);
+    let wide = remote_filter(Scope::Internet, &home(), &src, &offered, true, None, false);
     assert_eq!(
         wide.check("172.17.255.255:50417".parse().unwrap()),
         Err(crate::Refusal::NetworkOrBroadcast)
     );
     assert!(wide.admit("172.17.0.2:50417".parse().unwrap()));
     // Without a dual-stack socket no IPv6 at all.
-    let v4_only = remote_filter(
-        Scope::SameSite,
-        &home(),
-        &src,
-        &offered,
-        false,
-        false,
-        false,
-    );
+    let v4_only = remote_filter(Scope::SameSite, &home(), &src, &offered, false, None, false);
     assert!(v4_only.own_ula48.is_none());
     assert!(!v4_only.admit("[fd12:3456:789a:ee::1]:50417".parse().unwrap()));
     // An offered global IPv6 is what lets a global IPv6 remote in.
     let globals = select_host_candidates(&home(), &src, 50417, Scope::Internet, false);
-    let wide = remote_filter(Scope::Internet, &home(), &src, &globals, true, false, false);
+    let wide = remote_filter(Scope::Internet, &home(), &src, &globals, true, None, false);
     assert!(wide.have_v6);
     assert!(wide.admit("[2606:4700:4700::1111]:50417".parse().unwrap()));
     // Nothing offered, same-site: no family to send from.
-    let none = remote_filter(Scope::SameSite, &home(), &src, &[], true, false, false);
+    let none = remote_filter(Scope::SameSite, &home(), &src, &[], true, None, false);
     assert!(!none.have_v4 && none.on_link.is_empty() && none.own_ula48.is_none());
     assert!(!none.admit("192.168.77.20:50417".parse().unwrap()));
 }

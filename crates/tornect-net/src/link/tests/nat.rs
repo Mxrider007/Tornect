@@ -12,8 +12,8 @@ use tokio::time::Instant;
 use crate::gather::GatherConfig;
 use crate::mapping::{MAP_LEASE, MapProtocols};
 use crate::mem::{
-    Fate, LinkSpec, MachineSpec, MapperMode, MemNet, NatBox, NatFiltering, NatMapping, RouterSeen,
-    WireKind,
+    Fate, LinkSpec, MachineSpec, MapperMode, MemAddr, MemHost, MemNet, NatBox, NatFiltering,
+    NatMapping, RouterSeen, WireKind,
 };
 
 /// The public address of the viewer's router.
@@ -303,6 +303,162 @@ async fn two_links_on_one_machine_meet_only_through_a_hairpinning_router() {
             assert_eq!(stats.punch.candidates_refused, 1, "{stats:?}");
             assert_eq!(stats.established, hairpin, "{stats:?}");
         }
+        viewer.close().await;
+        host.close().await;
+    }
+}
+
+/// A machine on a split tunnel: its default route is the tunnel, but the
+/// route toward `excluded` leaves from `physical`, as toward a VPN's
+/// excluded prefix. Every other call is the machine's.
+struct Excluding {
+    inner: MemHost,
+    excluded: IpAddr,
+    physical: IpAddr,
+}
+
+impl NetEnv for Excluding {
+    fn interfaces(&self) -> BoxFuture<'static, Result<Vec<IfaceAddr>, NetError>> {
+        self.inner.interfaces()
+    }
+
+    fn route_sources(&self) -> RouteSources {
+        self.inner.route_sources()
+    }
+
+    fn route_source_to(&self, to: SocketAddr) -> Option<IpAddr> {
+        if to.ip() == self.excluded {
+            Some(self.physical)
+        } else {
+            self.inner.route_source_to(to)
+        }
+    }
+
+    fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp> {
+        self.inner.bind(port)
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        self.inner.resolve(host, port)
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        self.inner.mapper()
+    }
+}
+
+/// Design §7.2 and decision M1-80, per address (the feature's final
+/// review): a viewer in VPN mode (its IPv4 default route on a WireGuard
+/// tunnel) on a split tunnel whose excluded prefix holds the host's public
+/// address. The host's global candidate is refused for the VPN rule: not
+/// one datagram goes toward it, so the peer never sees the viewer's
+/// physical address, and both sides end with no path (the onion stream
+/// stays). With the host's address routed through the tunnel, the same
+/// viewer admits it, its probes leave from the tunnel's address, and the
+/// link connects.
+#[tokio::test(start_paused = true)]
+async fn a_split_tunnel_never_sends_to_a_peer_routed_outside_it() {
+    for excluded in [true, false] {
+        let net = MemNet::new(3);
+        let home = net.segment(LinkSpec::LAN);
+        let wide = net.segment(LinkSpec {
+            latency: Duration::from_millis(10),
+            loss: 0.0,
+        });
+        let tunnel = net.segment(LinkSpec::LAN);
+        net.link(
+            tunnel,
+            wide,
+            LinkSpec {
+                latency: Duration::from_millis(20),
+                loss: 0.0,
+            },
+        );
+        let tunnel_ip: IpAddr = "10.8.0.2".parse().unwrap();
+        let physical_ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let host_ip: IpAddr = "82.2.3.4".parse().unwrap();
+        let viewer_machine = net.machine(MachineSpec {
+            addrs: vec![
+                MemAddr::new(home, "192.168.1.10/24"),
+                MemAddr {
+                    kind: IfaceKind::Tunnel,
+                    ..MemAddr::new(tunnel, "10.8.0.2/24")
+                },
+            ],
+            sources: Some(RouteSources {
+                v4: Some("10.8.0.2".parse().unwrap()),
+                v6: None,
+            }),
+            ..MachineSpec::default()
+        });
+        let host_machine = net.machine(MachineSpec::on(wide, "82.2.3.4/24"));
+        let viewer_env = Arc::new(Excluding {
+            inner: viewer_machine,
+            excluded: if excluded {
+                host_ip
+            } else {
+                "203.0.113.1".parse().unwrap()
+            },
+            physical: physical_ip,
+        });
+
+        let (mut viewer, from_viewer) = DirectLink::start(
+            internet(TornectRole::Viewer, 1, 2, MapProtocols::NONE),
+            viewer_env,
+        )
+        .await
+        .expect("the viewer's link");
+        let (mut host, from_host) = DirectLink::start(
+            internet(TornectRole::Host, 2, 1, MapProtocols::NONE),
+            Arc::new(host_machine),
+        )
+        .await
+        .expect("the host's link");
+        let from_viewer = gathered(&mut viewer, from_viewer).await;
+        let from_host = gathered(&mut host, from_host).await;
+        assert!(
+            from_viewer.iter().all(|c| c.addr.ip() == physical_ip),
+            "VPN mode offers no global address: {from_viewer:?}"
+        );
+        assert!(from_host.iter().any(|c| c.addr.ip() == host_ip));
+        host.add_remote(from_viewer, Scope::Internet);
+        host.remote_done();
+        viewer.add_remote(from_host, Scope::Internet);
+        viewer.remote_done();
+
+        if excluded {
+            let (v, h) = within(30, async {
+                tokio::join!(viewer.established(), host.established())
+            })
+            .await;
+            assert!(
+                matches!(v, Err(DirectFail::NoPath { .. })),
+                "the viewer: {:?}",
+                v.err()
+            );
+            assert!(
+                matches!(h, Err(DirectFail::NoPath { .. })),
+                "the host: {:?}",
+                h.err()
+            );
+            let wire = net.wire();
+            assert!(wire.iter().all(|w| w.to.ip() != host_ip), "{wire:?}");
+            let stats = viewer.stats();
+            assert_eq!(stats.punch.candidates_refused, 1, "{stats:?}");
+            assert_eq!(stats.punch.requests_sent, 0, "{stats:?}");
+        } else {
+            let (v, h) = tokio::join!(connected(&mut viewer), connected(&mut host));
+            assert_eq!(viewer.stats().punch.candidates_refused, 0);
+            let wire = net.wire();
+            let toward: Vec<_> = wire.iter().filter(|w| w.to.ip() == host_ip).collect();
+            assert!(!toward.is_empty());
+            assert!(
+                toward.iter().all(|w| w.from.ip() == tunnel_ip),
+                "{toward:?}"
+            );
+            drop((v, h));
+        }
+        assert!(net.wire().iter().all(|w| w.from.ip() != physical_ip));
         viewer.close().await;
         host.close().await;
     }

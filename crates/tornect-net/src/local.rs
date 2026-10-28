@@ -24,8 +24,8 @@ use tokio::sync::watch;
 
 use crate::NetError;
 use crate::addr::{
-    AddrClass, Candidate, CandidateKind, RedactedIp, RemoteFilter, Scope, StunFilter, canon_ip,
-    class, is_eui64,
+    AddrClass, Candidate, CandidateKind, RedactedIp, RemoteFilter, RouteLookup, Scope, StunFilter,
+    TunnelRoute, canon_ip, class, is_eui64,
 };
 
 /// How long [`read_interfaces`] waits for the OS's interface list.
@@ -653,8 +653,30 @@ pub fn select_host_candidates(
         .collect()
 }
 
+/// VPN mode's per-address rule (design §7.2): the tunnel's route source of
+/// each family [`global_families`] admits, and `lookup`, the environment's
+/// route toward one address.
+#[must_use]
+pub fn tunnel_route(
+    addrs: &[IfaceAddr],
+    sources: &RouteSources,
+    lookup: RouteLookup,
+) -> TunnelRoute {
+    let (v4, v6) = global_families(addrs, sources, true);
+    TunnelRoute {
+        v4: sources.v4.filter(|_| v4),
+        v6: sources.v6.filter(|_| v6),
+        lookup,
+    }
+}
+
 /// The [`RemoteFilter`] of a session (design §7.7), from this side's
-/// addresses, its route sources and the host candidates it offered.
+/// addresses, its route sources and the host candidates it offered. `vpn`
+/// is VPN mode ([`vpn_mode`]) with the environment's route lookup
+/// (`NetEnv::route_source_to`): in VPN mode a global remote passes only for
+/// a family whose route source lies on the tunnel, and only when its own
+/// route leaves from that source ([`tunnel_route`]); `None` outside VPN
+/// mode.
 #[must_use]
 pub fn remote_filter(
     scope: Scope,
@@ -662,7 +684,7 @@ pub fn remote_filter(
     sources: &RouteSources,
     offered: &[Candidate],
     dual_stack: bool,
-    vpn: bool,
+    vpn: Option<RouteLookup>,
     admit_loopback: bool,
 ) -> RemoteFilter {
     let offered_addrs: Vec<&IfaceAddr> = offered
@@ -701,7 +723,8 @@ pub fn remote_filter(
         have_v4: offers(false, false) || (scope == Scope::Internet && sources.v4.is_some()),
         have_v6: dual_stack && offers(true, true),
         dual_stack,
-        global_families: global_families(addrs, sources, vpn),
+        global_families: global_families(addrs, sources, vpn.is_some()),
+        tunnel_route: vpn.map(|lookup| tunnel_route(addrs, sources, lookup)),
         own,
         admit_loopback,
     }

@@ -55,6 +55,7 @@ fn filter_at(own: &str, scope: Scope) -> RemoteFilter {
         have_v6: scope == Scope::Internet,
         dual_stack: true,
         global_families: (true, true),
+        tunnel_route: None,
         own: vec![ip(own), ip(OWN_ULA), ip(OWN_GLOBAL_V6)],
         admit_loopback: false,
     }

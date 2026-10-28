@@ -100,7 +100,7 @@ fn machine_filter(scope: Scope, dual_stack: bool) -> (RemoteFilter, bool) {
         && offered
             .iter()
             .any(|c| c.addr.ip() == IpAddr::V6(OWN_GLOBAL_V6));
-    let filter = remote_filter(scope, &addrs, &sources, &offered, dual_stack, false, false);
+    let filter = remote_filter(scope, &addrs, &sources, &offered, dual_stack, None, false);
     (filter, global_v6)
 }
 

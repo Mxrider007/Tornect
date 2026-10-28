@@ -441,13 +441,14 @@ impl DirectLink {
             return Err(DirectFail::NoAddresses);
         }
         let admit_loopback = admit_early.unwrap_or_else(|| env.admit_loopback());
+        let lookup = Arc::clone(&env);
         let filter = local::remote_filter(
             params.scope,
             &addrs,
             &sources,
             &offered,
             dual_stack,
-            vpn,
+            vpn.then(|| -> crate::RouteLookup { Arc::new(move |to| lookup.route_source_to(to)) }),
             admit_loopback,
         );
         let v6 = v6_sources(&offered);

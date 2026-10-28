@@ -229,6 +229,7 @@ fn same_site() -> RemoteFilter {
         have_v6: false,
         dual_stack: true,
         global_families: (true, true),
+        tunnel_route: None,
         own: vec![
             v4("192.168.77.203"),
             v4("172.17.0.1"),
@@ -445,6 +446,81 @@ fn the_remote_filter_follows_families_and_the_vpn_rule() {
     };
     assert_eq!(no_v4.check(g4), Err(Refusal::Family));
     assert_eq!(no_v4.check(sa("192.168.77.20:50417")), Err(Refusal::Family));
+}
+
+/// A split tunnel (design §7.2, decision M1-80): the default routes leave
+/// by the tunnel, but the route toward one prefix leaves by the physical
+/// interface. In VPN mode a global remote passes only when its own route
+/// leaves from its family's tunnel source; one in the excluded prefix, one
+/// with no route, and one of a family whose route source is not on the
+/// tunnel are refused for the VPN rule. Private and ULA remotes are not
+/// looked up, and outside VPN mode nothing is.
+#[test]
+fn in_vpn_mode_a_global_remote_must_route_through_the_tunnel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tunnel_v4: Ipv4Addr = "10.8.0.2".parse().unwrap();
+    let tunnel_v6: Ipv6Addr = "fd00:8::2".parse().unwrap();
+    let looked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&looked);
+    let lookup: RouteLookup = Arc::new(move |to: SocketAddr| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        match to.ip() {
+            // The excluded prefixes: the physical interface's sources.
+            IpAddr::V4(ip) if ip.octets()[..2] == [8, 8] => Some(v4("192.168.77.203")),
+            IpAddr::V6(ip) if ip.segments()[0] == 0x2606 => Some(v6("2001:470:1:2::203")),
+            // No route at all.
+            IpAddr::V4(ip) if ip.octets()[0] == 9 => None,
+            IpAddr::V4(_) => Some(IpAddr::V4(tunnel_v4)),
+            IpAddr::V6(_) => Some(IpAddr::V6(tunnel_v6)),
+        }
+    });
+    let vpn = RemoteFilter {
+        tunnel_route: Some(TunnelRoute {
+            v4: Some(tunnel_v4),
+            v6: Some(tunnel_v6),
+            lookup: Arc::clone(&lookup),
+        }),
+        ..internet()
+    };
+    assert_eq!(vpn.check(sa("1.1.1.1:50417")), Ok(()));
+    assert_eq!(vpn.check(sa("8.8.8.8:50417")), Err(Refusal::Vpn));
+    assert_eq!(vpn.check(sa("[::ffff:8.8.4.4]:50417")), Err(Refusal::Vpn));
+    assert_eq!(vpn.check(sa("9.9.9.9:50417")), Err(Refusal::Vpn));
+    assert_eq!(vpn.check(sa("[2a00:1450::1]:50417")), Ok(()));
+    assert_eq!(
+        vpn.check(sa("[2606:4700:4700::1111]:50417")),
+        Err(Refusal::Vpn)
+    );
+    // The tunnel carries only IPv4: no global IPv6 remote, whatever its
+    // route.
+    let v4_only = RemoteFilter {
+        global_families: (true, false),
+        tunnel_route: Some(TunnelRoute {
+            v4: Some(tunnel_v4),
+            v6: None,
+            lookup: Arc::clone(&lookup),
+        }),
+        ..internet()
+    };
+    assert_eq!(v4_only.check(sa("1.1.1.1:50417")), Ok(()));
+    assert_eq!(v4_only.check(sa("[2a00:1450::1]:50417")), Err(Refusal::Vpn));
+    // Not global: no lookup, the scope rules alone.
+    let before = looked.load(Ordering::SeqCst);
+    assert_eq!(vpn.check(sa("10.0.0.7:50417")), Ok(()));
+    assert_eq!(vpn.check(sa("[fd99::20]:50417")), Ok(()));
+    assert_eq!(vpn.check(sa("192.168.77.20:50417")), Ok(()));
+    assert_eq!(looked.load(Ordering::SeqCst), before);
+    // Outside VPN mode no route is looked up and the excluded prefix is
+    // admitted.
+    assert_eq!(internet().check(sa("8.8.8.8:50417")), Ok(()));
+    assert_eq!(looked.load(Ordering::SeqCst), before);
+    // A filter's clone keeps its lookup; its `Debug` names no address.
+    assert_eq!(vpn.clone(), vpn);
+    let text = format!("{vpn:?}");
+    for piece in ["10.8", "fd00", "192.168", "2001"] {
+        assert!(!text.contains(piece), "{piece} in {text}");
+    }
+    assert!(text.contains("TunnelRoute"), "{text}");
 }
 
 /// `admit_loopback` (test environments only) lets a loopback remote pass on

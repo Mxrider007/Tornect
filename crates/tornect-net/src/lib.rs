@@ -35,8 +35,8 @@ pub mod stun;
 pub mod udp;
 
 pub use addr::{
-    AddrClass, Candidate, CandidateKind, Redacted, RedactedIp, Refusal, RemoteFilter, Scope,
-    StunFilter, canon, canon_ip, class, to_socket_family,
+    AddrClass, Candidate, CandidateKind, Redacted, RedactedIp, Refusal, RemoteFilter, RouteLookup,
+    Scope, StunFilter, TunnelRoute, canon, canon_ip, class, to_socket_family,
 };
 pub use checklist::{Action, Checklist, PunchRole, PunchStats, Rank};
 pub use env::{NetEnv, RealNet};
