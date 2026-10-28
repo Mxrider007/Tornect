@@ -1,12 +1,14 @@
-# M2 state: direct connections, Phase A (interim hand-off, 2026-10-27)
+# M2 state: direct connections, Phases A and B (interim hand-off, 2026-10-28)
 
 Phase A of design `direct` (revision 4, `/mnt/project-files/designs/direct.md`), LAN-direct sessions
 with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-container half of
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-is under way: B1 to B7 are done (2026-10-27), B8 to B11 too (2026-10-28; "OPEN, owned by
-Phase B steps" below); B12 is next, and `INTERNET_DIRECT` is still `false`.
+is implemented in this container: B1 to B7 (2026-10-27), B8 to B13 (2026-10-28; "OPEN, owned by
+Phase B steps" below). **`INTERNET_DIRECT` is `true` since step B12 (`c1ec5a15`).** No tag was
+made; what the dev VM and real networks still owe is listed under B12 and B13 below. C1 and C2
+are next.
 
 ## What Phase A does
 
@@ -266,10 +268,34 @@ and the crates below ring check here).
   `run_connect` and the window's Tor arm is by inspection (they need Tor); the gate holds
   whatever the call site. One flake seen once in the full app suite
   (`the_terminal_hosts_services_leave_the_session_without_them`, OPEN row).
-- B12: `INTERNET_DIRECT = true`.
-- B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11 (their recipes are
-  written: ledger rows "Step B13 recipe: design §13 row 3" to "… row 11"), 15 and 16 (row 16,
-  measured punch success, already reads the Phase A runs), tag `m2b`.
+- B12 (done 2026-10-28, `6ef9372e`, `ed5b6010`, `c1ec5a15`; ledger rows "Step B12"; decision
+  M1-78's note): `INTERNET_DIRECT = true`, flipped once the full MemNet suite and the redaction
+  e2e were green on the base `b6efd48a` (tornect-net 306 passed, tornect-session 388 passed, the
+  23 matrix rows and the e2e among them) and again after the flip (tornect-session 389 passed with
+  the new row `this_build_goes_direct_over_the_internet`, which runs the halves as the app builds
+  them; the app's tests 880 passed as `tester`). Two tests that pinned the Phase A scope through
+  the constant were adapted, keeping what they protect (the commit body). `direct_loopback_stats`
+  after the flip reads 29.8 fps, `BindOk` 118 ms after the accept. New: the ignored
+  `tornect-net` integration test `live_stun` (design §12.5 Phase B), run on the dev VM. The plan's
+  M2 text says Phase B is built (a minimal edit; C1 writes the final text). The leftover flake of
+  the B11 review is settled (`6ef9372e`: the count was read before the refused stream's task
+  ended; 100 runs in four parallel copies clean). Left as NEEDS-DEVICE (ledger rows, recipes):
+  the live STUN run, two instances on one VM, the bridge demo, the `host` `NOTICE` line after a
+  real bootstrap, the B11 review's strace and background-mode checks, the B11 desktop row. OPEN:
+  the owner's call on the Google and Nextcloud STUN terms (`nat-traversal.md` §2.7; the list is
+  unchanged).
+- B13 (done in this container 2026-10-28; ledger rows "Step B13"): the gnullvm cross-clippy of the
+  three crates the flip touched, `tornect-core` on msvc and darwin (ring still stops the crates
+  above it there), the licences and `dist` feature-check tests, the ten fuzz targets' clippy with
+  `fuzz/Cargo.lock` unchanged, 10-minute uninstrumented stable runs of `stun`, `candidates`,
+  `probe`, `framing` and `envelope` (no crash; no coverage feedback, so weak), and `doctor` from a
+  gnullvm build under Wine 9.0 with the internet lines (`direct connections: on (local network and
+  internet)`). Wine still reads "VPN mode", which with the internet half on would send every
+  internet session of a real Windows machine misread that way to Tor: a NEEDS-DEVICE(windows) row
+  checks it before design §13 rows 8 and 11. Design §13 rows 3 to 11, 15 and 16 are runnable (one
+  summary row points at each recipe). Left: the [VM] and [DEV] runs of those rows, the nightly
+  fuzz campaigns, `cargo xtask dist` (this container's proxy refuses archive.torproject.org, so
+  lyrebird cannot be fetched); no tag (the design tags `m2a` and `m2`; tags are the owner's).
 - C1: the final text of decision rows M1-77 to M1-86 (still placeholders with step notes) and of
   the plan: `docs/PLAN.md` describes Phase A since the Phase A close (Part C M2 amended, §B.2,
   §B.6, §B.8.6.4, §B.8.17 item 7, Parts E and G), in words C1 replaces with the final ones.
