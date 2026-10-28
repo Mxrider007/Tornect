@@ -231,6 +231,10 @@ impl TransportPolicy {
 /// network where Tor is hidden that Tornect is in use. `lan_only` is left
 /// alone (same-site traffic does not leave the network), and so is
 /// `tor_only`.
+///
+/// The unattended hold ([`TransportKnob::hold_unattended`]): while held, an
+/// unattended receipt whose policy would be `any` is signed `tor_only`;
+/// attended accepts are unchanged.
 #[derive(Clone, Default)]
 pub struct TransportKnob(std::sync::Arc<KnobInner>);
 
@@ -240,6 +244,7 @@ struct KnobInner {
     policy: AtomicU8,
     bridged: AtomicBool,
     direct_with_bridges: AtomicBool,
+    unattended_held: AtomicBool,
 }
 
 impl TransportKnob {
@@ -276,6 +281,27 @@ impl TransportKnob {
         self.0.bridged.store(bridged, Ordering::SeqCst);
     }
 
+    /// Hold the unattended path on Tor (`held`), or let it go: while held,
+    /// an unattended receipt whose effective policy is `any` is signed
+    /// `tor_only` ([`TransportKnob::host_transport`]). Attended accepts
+    /// ([`TransportKnob::get`]), whose question says what an accept
+    /// discloses, and `lan_only` and `tor_only` receipts are unchanged. The
+    /// window holds it while its one-time notice that direct connections
+    /// are on is unanswered (design `direct` §3.6, decision M1-84): a grant
+    /// made before they reached the internet was never told that a session
+    /// reveals this computer's IP address, and no question comes before an
+    /// unattended session.
+    pub fn hold_unattended(&self, held: bool) {
+        self.0.unattended_held.store(held, Ordering::SeqCst);
+    }
+
+    /// Whether the unattended path is held on Tor
+    /// ([`TransportKnob::hold_unattended`]).
+    #[must_use]
+    pub fn unattended_held(&self) -> bool {
+        self.0.unattended_held.load(Ordering::SeqCst)
+    }
+
     /// The configured policy, before the bridge rule; an unknown code (none
     /// is ever stored) reads as `tor_only`.
     fn configured(&self) -> TransportPolicy {
@@ -306,12 +332,14 @@ impl TransportKnob {
 
     /// The effective policy as the unattended path takes it (§B.8.11):
     /// `tor_only` is the host's paranoid mode, `lan_only` its LAN-only mode,
-    /// so the bridge rule reaches a grant's receipt too.
+    /// so the bridge rule reaches a grant's receipt too; while the
+    /// unattended path is held ([`TransportKnob::hold_unattended`]) `any`
+    /// is the paranoid mode as well.
     #[must_use]
     pub fn host_transport(&self) -> HostTransport {
         match self.get() {
-            TransportPolicy::Any => HostTransport::default(),
-            TransportPolicy::TorOnly => HostTransport {
+            TransportPolicy::Any if !self.unattended_held() => HostTransport::default(),
+            TransportPolicy::Any | TransportPolicy::TorOnly => HostTransport {
                 paranoid: true,
                 lan_only: false,
             },
@@ -332,6 +360,7 @@ impl core::fmt::Debug for TransportKnob {
                 "direct_with_bridges",
                 &self.0.direct_with_bridges.load(Ordering::SeqCst),
             )
+            .field("unattended_held", &self.unattended_held())
             .field("effective", &self.get())
             .finish()
     }
@@ -1182,6 +1211,46 @@ mod tests {
                 lan_only: false
             }
         );
+    }
+
+    /// The review of step B11 (design `direct` §3.6, decision M1-84): a held
+    /// knob gives the unattended path the paranoid host transport where it
+    /// would give `any`, and only there; attended accepts still read the
+    /// policy as it is; a clone sees the hold, a save keeps it, and letting
+    /// it go gives `any` back.
+    #[test]
+    fn the_unattended_hold_turns_any_into_tor_only_for_receipts_alone() {
+        let paranoid = HostTransport {
+            paranoid: true,
+            lan_only: false,
+        };
+        let knob = TransportKnob::new(&network(false, false, false));
+        assert!(!knob.unattended_held(), "not held by default");
+        let clone = knob.clone();
+        knob.hold_unattended(true);
+        assert!(clone.unattended_held());
+        assert_eq!(clone.host_transport(), paranoid);
+        assert_eq!(clone.get(), TransportPolicy::Any, "attended accepts");
+        assert!(!clone.off_by_bridge());
+        knob.set_from(&network(false, false, false));
+        assert_eq!(knob.host_transport(), paranoid, "a save keeps the hold");
+        knob.hold_unattended(false);
+        assert_eq!(clone.host_transport(), HostTransport::default());
+
+        let lan = TransportKnob::new(&network(false, true, false));
+        lan.hold_unattended(true);
+        assert_eq!(
+            lan.host_transport(),
+            HostTransport {
+                paranoid: false,
+                lan_only: true
+            },
+            "lan_only reveals no internet address"
+        );
+        let tor = TransportKnob::new(&network(true, false, false));
+        tor.hold_unattended(true);
+        assert_eq!(tor.host_transport(), paranoid);
+        assert!(format!("{tor:?}").contains("unattended_held: true"));
     }
 
     /// Design `direct` §8.2: `set_from` takes the switches and the override
