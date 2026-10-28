@@ -979,8 +979,10 @@ async fn a_permanent_only_router_gets_no_lease_zero_request() {
 /// `host`). The viewer connects before the host's `CANDIDATES` arrive
 /// (its peer-reflexive host address, its own srflx known, the host's not
 /// yet), so its label is `internet`: the same-NAT rule needs the peer's
-/// public address, never the class alone. An open residual of the design's
-/// row, pinned here.
+/// public address, never the class alone. The design's row as the code
+/// reads it (decision M1-82): the viewer's label errs toward internet and
+/// is not relabelled; in internet scope each side offers its public address,
+/// so what the label says the other computer learns stays true.
 #[tokio::test(start_paused = true)]
 async fn one_nat_with_two_subnets_goes_direct_over_private_addresses() {
     for (viewer, host) in orders() {
@@ -1122,8 +1124,9 @@ async fn ipv6_firewalls_go_direct_from_the_temporary_address() {
 /// comes first. What holds on every seed: a direct path opens before the
 /// punch timeout, or the viewer falls back at it (plus at most
 /// `CLOSE_WAIT`, decision M1-79) with a named reason, and the host's
-/// summary agrees. Measured: 4 of 8 seeds direct (2.4–2.8 s); the row stays
-/// open in the ledger.
+/// summary agrees. Measured: 4 of 8 seeds direct (2.4–2.8 s), the rest
+/// `Quic` by `T0` + 4.2 s or `NoPath` at 4.0 s. Decision M1-82 states the
+/// row as a rate; the device runs of step B13 measure the real one.
 #[tokio::test(start_paused = true)]
 async fn twenty_percent_loss_between_homes() {
     let lossy = LinkSpec {
