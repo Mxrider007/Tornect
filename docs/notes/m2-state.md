@@ -5,7 +5,8 @@ with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-contai
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-is under way: B1 to B7 are done (2026-10-27; "OPEN, owned by Phase B steps" below).
+is under way: B1 to B7 are done (2026-10-27), B8 and B9 too (2026-10-28; "OPEN, owned by Phase B
+steps" below).
 
 ## What Phase A does
 
@@ -172,12 +173,34 @@ and the crates below ring check here).
   lines. Deviations (commit bodies, M1-81): the mapping lives in the gathering task, not
   `LinkInner`; `plan`'s signature; events through the app's mapper, not a `DirectHost` field.
   Residuals: a viewer with no host candidate and nothing gathered sends only `CANDIDATES_DONE` and
-  falls back at its punch timeout (OPEN row, for B9/B12); two processes on one `TORNECT_HOME` write
+  falls back at its punch timeout (settled at B9 by decision M1-87, below); two processes on one `TORNECT_HOME` write
   `sessions.log` through two handles with no lock between them (OPEN row; the unattended connect
   lines already did). Left as NEEDS-DEVICE: the real router run of the sweep and the release, on a
   home with unattended access on (after B12).
-- B8: `NatBox`, `MemStun`, `MemMapper` in `MemNet`.
-- B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
+- B8 (done 2026-10-28, `015554ce`; ledger rows "Step B8"): `NatBox` in `MemNet` (EIM/ADM/APDM
+  mapping, EIF/ADF/APDF filtering, port preservation, hairpin, forwards, the 30 s timeout,
+  `translate: false` firewalls, boxes in a row, the fates `NoMapping`/`NatFiltered`/`NoHairpin`,
+  `WireRecord.seen_from`, `MemUdp::spoof_as`), `MemStun` (honest, lying, silent), `MemNet::name`,
+  `MemMapper` (`Ok`, `Grant(d)`, `Lie(ip)`, `Refuse`, `PermanentOnly`, off; `router_log()`,
+  `forwards()`) and `MachineSpec::gateway`; all test-only (`cfg(test)` or `test-support`).
+- B9 (done 2026-10-28, `46893628`, `01419e3d`, `1f2ab1c6`, `45e97b30`, `c0cab646`; ledger rows "Step
+  B9", decisions M1-82, M1-83 and M1-87): `ViewerDirect::with_internet` and
+  `DirectHost::with_internet` (`cfg(test)`; release builds keep `INTERNET_DIRECT`); the design §12.4
+  matrix in `tornect-session` `tests::direct_nat` (23 tests: both FSMs, a 500 ms `LaggedDuplex`,
+  both key orders, each row asserting the route or Tor reason, the time from `T0`, the host's
+  `PathSummary` and both `CountingEnv` counts), the amplification, spoofed-Initial and
+  policy-source rows among them; the decision cells of `direct_path` in both scopes; the
+  ten-minute `Grant(120 s)` row at the link (`tornect-net` `link::tests::nat`); the redaction e2e
+  through the real mapper against `FakePcp` and `FakeIgd`; and the step B6 residual settled
+  (M1-87: a viewer that offered nothing falls back `NO_ADDRESSES` at the gathering budget, and the
+  host's network is never touched). Deviations (commit bodies, ledger): the ten minutes at the
+  link, not a ten-minute session; the e2e's mapping beside its session, not in its gathering;
+  the 1.5 s row's viewer-dials order falls back `Quic` by `T0` + 4.2 s, not `HostSilent` at
+  exactly 4.0 s; the `lan_only` viewer's winner is `Prflx`. Left OPEN (ledger rows): one NAT with
+  two subnets (the viewer labels the route internet, the host same-site); 20 % loss (4 of 8 seeds
+  direct, the design says direct); a `BYE` in the same instant as `TOR_FALLBACK` can end the
+  host's session before it records the reason. Left as NEEDS-DEVICE: the matrix between real
+  networks (design §13 rows 3 to 11, at B13).
 - B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
   `direct_loopback_stats` shows 15 fps), the `SecondStream` hook (services on a direct session
   still go over the onion service) and the onion stream-count test.
@@ -206,3 +229,13 @@ and the crates below ring check here).
   sends to port 5351); under Wine they fail (shared loopback port, answers from `127.0.0.1`).
 - The app's tests still run as `tester` (copy the binary from `cargo test -p tornect --no-run` to
   `/home/tester`, run with `runuser`, delete it afterwards).
+- The QUIC transport lets the viewer open one bidi stream at a time (`HOST_STREAMS` is 1): a test
+  that opens a second stream while the first is open waits forever, and in paused time that shows
+  as a hang with growing memory, not a timeout. Keep one stream and write on it.
+- A dual-stack `MemUdp` refuses a plain IPv4 destination (`InvalidInput`, as the OS does), forged
+  sends through `spoof_as` included: give it the v4-mapped form (`direct_nat::forge`).
+- The redaction e2e's fake routers sit on `127.0.0.171` (PCP) and `127.0.0.172` (UPnP-IGD), beside
+  the loopback session's `127.0.0.20` to `.41` and the mapping tests' `.40` up; macOS needs `lo0`
+  aliases for them too.
+- `pkill -f <pattern>` with a pattern from the running command line also kills the shell that runs
+  it: stop a hung test binary by its PID.
