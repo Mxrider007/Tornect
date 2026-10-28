@@ -10,16 +10,21 @@
 use std::fmt::Write as _;
 use std::future::pending;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tokio::time::Instant;
 use tornect_core::session_log::TransportKind;
 use tornect_core::telemetry::{IDENTIFIERS_ENV, LogOptions};
+use tornect_net::mapping::fake::{FakeIgd, FakePcp, IgdConfig, IgdHeard, PcpHeard, PcpMode};
 use tornect_net::mem::LoopbackNet;
 use tornect_net::udp::BoundUdp;
-use tornect_net::{BoxFuture, IfaceAddr, NetEnv, NetError, PortMapper, Route, RouteSources};
+use tornect_net::{
+    BoxFuture, IfaceAddr, MAP_LEASE, MapEvent, MapEvents, MapProtocols, MapRequest, MapVia,
+    MappingLedger, NetEnv, NetError, PortMapper, RealMapper, ReleaseTracker, Route, RouteSources,
+};
 use tornect_signal::HandshakeError;
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::fsm::client::ClientSession;
@@ -394,10 +399,126 @@ fn force_a_sendmsg_warning() {
     state.send((&sock).into(), &transmit).unwrap();
 }
 
+/// Where the redaction e2e's mapper reports: one line of ours per event,
+/// with the session log's fixed words.
+struct LoggedEvents;
+
+impl MapEvents for LoggedEvents {
+    fn on_event(&self, ev: MapEvent) {
+        let detail = ev.router_port().detail();
+        tracing::info!(target: "tornect_session::e2e", "e2e: router port {detail}");
+    }
+}
+
+/// The fake UPnP-IGD router's address in the redaction e2e: igd-next
+/// names it in its own `DEBUG` lines.
+const IGD_GATEWAY: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 172);
+
+/// The routers of the redaction e2e (step B9): [`FakePcp`] and [`FakeIgd`]
+/// on loopback addresses of their own, and the real mapper pointed at
+/// them. PCP (crab_nat) and then UPnP-IGD (igd-next: the SSDP search, the
+/// description, the control requests) each grant a mapping that is renewed
+/// once and released. Returns what the log must not name: both routers'
+/// addresses, the SSDP port, the external addresses and ports, and the
+/// internal port.
+async fn map_through_fake_routers(dir: &Path) -> Vec<(&'static str, String)> {
+    const INTERNAL: u16 = 50_123;
+    let pcp_gateway = Ipv4Addr::new(127, 0, 0, 171);
+    let igd_gateway = IGD_GATEWAY;
+    let pcp_external = Ipv4Addr::new(81, 2, 3, 4);
+    let igd_external = Ipv4Addr::new(82, 5, 6, 7);
+    let pcp = FakePcp::start(
+        pcp_gateway,
+        PcpMode::Pcp {
+            external: pcp_external,
+            max_lifetime: 3600,
+        },
+    )
+    .await
+    .expect("a fake PCP router");
+    let igd = FakeIgd::start(igd_gateway, IgdConfig::granting(igd_external))
+        .await
+        .expect("a fake UPnP-IGD router");
+    let mapper = RealMapper::new(
+        MappingLedger::new(dir.join("router-ports")),
+        Arc::new(LoggedEvents),
+        ReleaseTracker::new(),
+    )
+    .on_loopback(igd.ssdp_port(), igd.ssdp(), vec![IpAddr::V4(igd_gateway)]);
+    let ask = |gateway: Ipv4Addr, protocols: MapProtocols| MapRequest {
+        gateway,
+        client: Ipv4Addr::LOCALHOST,
+        internal_port: NonZeroU16::new(INTERNAL).expect("a port"),
+        lease: MAP_LEASE,
+        protocols,
+        deadline: (Instant::now() + Duration::from_secs(3)).into_std(),
+    };
+    let mut secrets = vec![
+        ("ip", pcp_gateway.to_string()),
+        ("ip", igd_gateway.to_string()),
+        ("ip", pcp_external.to_string()),
+        ("ip", igd_external.to_string()),
+        ("port", INTERNAL.to_string()),
+        ("port", igd.ssdp_port().to_string()),
+    ];
+    for (gateway, protocols, via) in [
+        (
+            pcp_gateway,
+            MapProtocols {
+                upnp: false,
+                ..MapProtocols::ALL
+            },
+            MapVia::Pcp,
+        ),
+        (
+            igd_gateway,
+            MapProtocols {
+                upnp: true,
+                ..MapProtocols::NONE
+            },
+            MapVia::Upnp,
+        ),
+    ] {
+        let mut mapping = mapper
+            .map(ask(gateway, protocols))
+            .await
+            .expect("a mapping");
+        assert_eq!(mapping.via, via);
+        secrets.push(("port", mapping.external.port().to_string()));
+        mapping.renew().await.expect("a renewal");
+        mapping.release().await;
+    }
+    let pcp_lifetimes: Vec<u32> = pcp
+        .heard()
+        .iter()
+        .filter_map(|h| match h {
+            PcpHeard::Map { lifetime, .. } => Some(*lifetime),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pcp_lifetimes, [600, 600, 0], "map, renew, delete");
+    let igd_heard = igd.heard();
+    assert!(
+        igd_heard
+            .iter()
+            .any(|h| matches!(h, IgdHeard::AddPort { .. })),
+        "{igd_heard:?}"
+    );
+    assert!(
+        igd_heard
+            .iter()
+            .any(|h| matches!(h, IgdHeard::DeletePort { .. })),
+        "{igd_heard:?}"
+    );
+    assert!(mapper.ledger().entries().is_empty());
+    secrets
+}
+
 /// The redaction e2e's child: in a process of its own, the real log
 /// layers at `trace` with identifiers as the parent set them, a forced
-/// quinn-udp warning, then a whole direct session on loopback sockets (the
-/// QUIC handshake, so rustls and quinn log). It writes what the log must
+/// quinn-udp warning, a whole direct session on loopback sockets (the
+/// QUIC handshake, so rustls and quinn log), then the real mapper against
+/// a fake PCP router and a fake UPnP-IGD one. It writes what the log must
 /// not name to `secrets` in its directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "the redaction e2e runs it in a process of its own"]
@@ -416,7 +537,12 @@ async fn redaction_child() {
     force_a_sendmsg_warning();
     let (_, ended) = on_loopback(20, 21).await.run(3, Duration::ZERO).await;
     tracing::info!(target: "tornect_session::e2e", "e2e: the direct session is over");
+    let mapped = map_through_fake_routers(&dir).await;
+    tracing::info!(target: "tornect_session::e2e", "e2e: the routers' ports are closed");
     let mut secrets = String::new();
+    for (kind, value) in mapped {
+        writeln!(secrets, "{kind} {value}").unwrap();
+    }
     for addr in ended.viewer_bound.iter().chain(&ended.host_bound) {
         writeln!(secrets, "ip {}", addr.ip()).unwrap();
         writeln!(secrets, "port {}", addr.port()).unwrap();
@@ -559,8 +685,14 @@ fn named<'a>(log: &str, secrets: &'a [(String, String)]) -> Option<&'a (String, 
 /// decimal byte list, while Tornect's own lines get through (the viewer's
 /// `direct path open` with the link's counters among them). With
 /// identifiers opted in, the same run's stderr does name them: the capture
-/// would see a leak. The file log never does. FakeIgd and FakePcp (igd-next
-/// and crab_nat) are Phase B's (step B9).
+/// would see a leak. The file log never does. Phase B's half (step B9):
+/// after the session the same child maps a port through the real mapper
+/// with a fake PCP router (crab_nat) and a fake UPnP-IGD one (igd-next's
+/// SSDP search, description and control requests), renews and releases
+/// both, and neither log names either router's address, the SSDP port, an
+/// external address or port, or the internal port, while the mapper's
+/// `router port` lines of ours get through; opted in, igd-next's own lines
+/// name the UPnP router's address.
 #[test]
 fn a_direct_session_logs_no_address_port_or_key() {
     for (json, identifiers) in [(false, false), (true, false), (false, true)] {
@@ -571,6 +703,11 @@ fn a_direct_session_logs_no_address_port_or_key() {
         for said in [
             "e2e: a trace line of ours",
             "e2e: the direct session is over",
+            "e2e: router port opened pcp",
+            "e2e: router port closed pcp",
+            "e2e: router port opened upnp",
+            "e2e: router port closed upnp",
+            "e2e: the routers' ports are closed",
         ] {
             assert!(run.stderr.contains(said), "{case}: {said:?} missing");
         }
@@ -592,7 +729,15 @@ fn a_direct_session_logs_no_address_port_or_key() {
             panic!("{case}: the file log names {secret:?}");
         }
         if identifiers {
-            for said in ["sendmsg error", "2001:db8::77", "rustls::", "quinn_proto"] {
+            let igd = IGD_GATEWAY.to_string();
+            for said in [
+                "sendmsg error",
+                "2001:db8::77",
+                "rustls::",
+                "quinn_proto",
+                "igd_next::",
+                igd.as_str(),
+            ] {
                 assert!(
                     run.stderr.contains(said),
                     "{case}: the opted-in capture lacks {said:?}: the e2e would miss a leak"
@@ -614,7 +759,7 @@ fn a_direct_session_logs_no_address_port_or_key() {
                     &run.stderr[start..end]
                 );
             }
-            for quiet in ["sendmsg", "quinn_udp", "quinn_proto", "rustls"] {
+            for quiet in ["sendmsg", "quinn_udp", "quinn_proto", "rustls", "igd_next"] {
                 assert!(!run.stderr.contains(quiet), "{case}: {quiet:?} on stderr");
             }
         }
