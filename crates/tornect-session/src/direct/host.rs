@@ -26,7 +26,9 @@
 //!   [`DIRECT_DRAIN`]); a link closed under it ends it through its I/O, and
 //!   it still runs its own end (the services design §6.3 step 5);
 //! - a `TOR_FALLBACK` after a direct claim is ignored (counted);
-//! - a `lan_only` session with no direct path left ends `BYE{NO_LAN_PATH}`;
+//! - a `lan_only` session with no direct path left ends `BYE{NO_LAN_PATH}`,
+//!   but one without media (`TOR_FALLBACK{NO_MEDIA}`) asked for no path and
+//!   goes on;
 //! - the session's `sessions.log` end line says how its path went
 //!   ([`PathSummary`]): words, a kind and a time, never an address.
 
@@ -576,7 +578,12 @@ impl Task {
                     return;
                 }
                 self.close_link().await;
-                if self.lan_only {
+                // A session without media asked for no path, so `lan_only`
+                // has nothing to refuse: it goes on for its signaling. The
+                // plan's path phase ends only an old host, this same device
+                // and a Tor-only side with `BYE{NO_LAN_PATH}` (decision
+                // M1-85), and the viewer's `decide` puts no media first.
+                if self.lan_only && reason != Some(fallback::NO_MEDIA) {
                     self.end(bye::NO_LAN_PATH);
                 }
             }

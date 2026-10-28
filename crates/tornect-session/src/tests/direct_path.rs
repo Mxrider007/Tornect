@@ -914,6 +914,25 @@ async fn each_decision_cell_writes_its_frame_and_touches_no_network() {
                 PathEnd::NoMedia,
                 off(fallback::NO_MEDIA),
             ),
+            // A session without media asks for no path, so a `lan_only` side
+            // has nothing to refuse: the host keeps it for its signaling
+            // (the plan's path phase names only an old host, this same
+            // device and a Tor-only side for `BYE{NO_LAN_PATH}`).
+            (
+                cell(LAN, Mine::of(ANY), false, false, false),
+                PathEnd::NoMedia,
+                off(fallback::NO_MEDIA),
+            ),
+            (
+                cell(LAN, Mine::of(LAN), false, false, false),
+                PathEnd::NoMedia,
+                off(fallback::NO_MEDIA),
+            ),
+            (
+                cell(ANY, Mine::of(LAN), false, false, false),
+                PathEnd::NoMedia,
+                off(fallback::NO_MEDIA),
+            ),
             (
                 cell(ANY, Mine::of(ANY), true, true, false),
                 PathEnd::Tor(TorWhy::SameDevice),
