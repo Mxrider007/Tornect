@@ -122,10 +122,11 @@ pub const INCOMING_BUFFER: u64 = 64 << 10;
 /// ignored while they run; none is ever dropped for a newer one.
 pub const MAX_PENDING_HANDSHAKES: usize = 4;
 
-/// The bidirectional streams a viewer may open to the host: the media
-/// stream. Design §6.5 gives 2 (media and services) once the services
-/// stream rides the direct connection (design §6.7, step B10).
-pub const HOST_STREAMS: u32 = 1;
+/// The bidirectional streams a viewer may open to the host at once (design
+/// §6.5): the media stream and the services stream (§6.7). The host
+/// accepts the second only once the media was claimed on the connection; a
+/// stream past those it never accepts holds at most the stream window.
+pub const HOST_STREAMS: u32 = 2;
 
 /// The application close code of a connection that failed [`check_peer`];
 /// its peer is not the device this side pinned, so no Tornect reason

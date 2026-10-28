@@ -61,12 +61,12 @@ use tornect_signal::messages::{bye, fallback, feats};
 use zeroize::Zeroizing;
 
 use super::decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide_with};
-use super::{AfterBind, DirectSettings, INTERNET_DIRECT, after_bind_close, from_wire, to_wire};
+use super::{
+    AfterBind, DirectSettings, INTERNET_DIRECT, MEDIA_PRIORITY, SERVICES_PRIORITY,
+    after_bind_close, from_wire, to_wire,
+};
+use crate::services::ServicesBinding;
 use crate::{Binding, MediaViewer, ViewerError};
-
-/// The quinn priority of the media stream (the direct design §6.7: media
-/// 1, services 0).
-const MEDIA_PRIORITY: i32 = 1;
 
 /// The viewer's half of the direct path (the direct design §8.5), shared by
 /// every session the viewer opens: [`ViewerDirect::choose_path`] runs one
@@ -205,7 +205,8 @@ impl PathChoice {
 }
 
 /// A session's open direct media stream, ready for the `Bind` (the direct
-/// design §8.5 `DirectMedia`; the services stream joins at step B10).
+/// design §8.5 `DirectMedia`), and what opens its services stream beside it
+/// ([`Self::services`]).
 pub struct DirectMedia {
     /// The media stream, opened at priority 1. The host sees it once the
     /// `Bind` is written.
@@ -222,6 +223,9 @@ pub struct DirectMedia {
     pub elapsed: Duration,
     /// The connection: [`after_bind_close`] reads it when the bind fails.
     pub link: Established,
+    /// The direct services binding, when the host's `HELLO_ACK` offers
+    /// services (`svc1`).
+    services: Option<ServicesBinding>,
 }
 
 impl fmt::Debug for DirectMedia {
@@ -248,6 +252,18 @@ pub struct DirectBindFailed {
 }
 
 impl DirectMedia {
+    /// What opens the session's services stream on this connection (the
+    /// direct design §6.7), to be opened once [`Self::bind`] succeeded;
+    /// `None` when the host offers no services. The onion services port is
+    /// never used while the media is direct.
+    #[must_use]
+    pub fn services(&self) -> Option<DirectServices> {
+        self.services.clone().map(|binding| DirectServices {
+            link: self.link.clone(),
+            binding,
+        })
+    }
+
     /// Write the `Bind` and wait up to `wait` for the host's `BindProof`
     /// and `BindOk` ([`MediaViewer::bind`]; the caller's bind wait, never
     /// the punch window). On failure the connection is dropped, and
@@ -271,6 +287,46 @@ impl DirectMedia {
                 after: after_bind_close(&link),
             }),
         }
+    }
+}
+
+/// A session's services stream on its direct connection (the direct design
+/// §6.7): the connection's second bidirectional stream, at the services
+/// priority, bound with the direct services MAC over this connection's
+/// exporter output ([`ServicesBinding::direct`]). Its `Debug` never prints
+/// the MAC.
+#[derive(Clone)]
+pub struct DirectServices {
+    link: Established,
+    binding: ServicesBinding,
+}
+
+impl DirectServices {
+    /// The stream's binding, for `ServicesViewer::bind`.
+    #[must_use]
+    pub fn binding(&self) -> &ServicesBinding {
+        &self.binding
+    }
+
+    /// Opens the stream. Call it only after the media stream's `BindOk`:
+    /// the host accepts it only once the media was claimed on this
+    /// connection. The host sees it once the `Bind` is written. A host
+    /// whose transport parameters allow one stream only never lets it open,
+    /// so the caller bounds the wait.
+    ///
+    /// # Errors
+    ///
+    /// [`DirectFail::Closed`] if the connection is gone.
+    pub async fn open(&self) -> Result<QuicStream, DirectFail> {
+        self.link.open_stream(SERVICES_PRIORITY).await
+    }
+}
+
+impl fmt::Debug for DirectServices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectServices")
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
     }
 }
 
@@ -649,6 +705,9 @@ where
                 return Step::GiveUp(TorWhy::Fallback(FallbackWhy::Quic));
             };
             let binding = Binding::direct(&at.token, &session.th(), &ekm);
+            let services = session
+                .host_has(feats::SVC1)
+                .then(|| ServicesBinding::direct(&at.token, &session.th(), &ekm));
             let elapsed = at.accepted.elapsed();
             // Counts only (decision M1-83): the device rows of the direct
             // design §13 read `dual_stack` and the send counters here.
@@ -666,6 +725,7 @@ where
                 winner: established.winner(),
                 elapsed,
                 link: established,
+                services,
             }))
         }
         LinkNews::Connection(Err(fail)) => {

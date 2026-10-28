@@ -15,6 +15,7 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tornect_core::session_log::TransportKind;
 use tornect_core::telemetry::{IDENTIFIERS_ENV, LogOptions};
@@ -32,6 +33,11 @@ use tornect_signal::messages::feats;
 
 use super::direct_host::{Ends, key, keys_by_order, until};
 use super::*;
+use crate::services::{
+    DIRECT_BULK_WINDOW, HostEvent, ServicesEnv, ServicesHost, ServicesLimits, ServicesObserver,
+    ServicesPolicy, ServicesViewer, ViewerEvent, ViewerLocal, ViewerOp, ViewerServicesEnd,
+    sanitize_peer_text,
+};
 
 /// The app's bind wait for the media stream (`MEDIA_BIND_WAIT`).
 const BIND_WAIT: Duration = Duration::from_secs(30);
@@ -100,12 +106,56 @@ struct Lx {
     /// When the viewer read the `SESSION_ACCEPT` (the start of the path
     /// phase's clock, decision M1-82).
     accepted: Instant,
+    /// The host's services, when it offers them.
+    services: Option<LxServices>,
     _tmp: tempfile::TempDir,
+}
+
+/// A loopback host's services (the direct design §6.7): the second stream
+/// of its direct connections, and what it heard.
+struct LxServices {
+    host: Arc<ServicesHost>,
+    heard: mpsc::UnboundedReceiver<(String, HostEvent)>,
+    _policy: watch::Sender<ServicesPolicy>,
+}
+
+/// Passes the services host's events on, with their session.
+struct Heard(mpsc::UnboundedSender<(String, HostEvent)>);
+
+impl ServicesObserver for Heard {
+    fn event(&self, session_id: &str, event: HostEvent) {
+        let _ = self.0.send((session_id.to_owned(), event));
+    }
+}
+
+/// The FSM's sessions to the services host, then the media host, as the
+/// app's session sink orders them.
+struct Both {
+    services: Arc<ServicesHost>,
+    media: Arc<MediaHost>,
+}
+
+impl SessionSink for Both {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        self.services.on_start(session);
+        self.media.on_start(session);
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        self.media.on_end(session_id, end);
+        self.services.on_end(session_id);
+    }
 }
 
 /// The session between the viewer on `127.0.0.{viewer_x}` and the host on
 /// `127.0.0.{host_x}`, accepted and about to choose its path.
 async fn on_loopback(viewer_x: u8, host_x: u8) -> Lx {
+    on_loopback_with(viewer_x, host_x, false).await
+}
+
+/// [`on_loopback`]; with `services`, the host offers services (`svc1`) and
+/// serves each direct connection's second stream with them.
+async fn on_loopback_with(viewer_x: u8, host_x: u8, services: bool) -> Lx {
     let [viewer_seed, _, host_seed] = keys_by_order();
     let tmp = tempfile::tempdir().unwrap();
     let onion = Arc::new(HostIdentity::from_seed(&[0x53; 32]));
@@ -122,6 +172,26 @@ async fn on_loopback(viewer_x: u8, host_x: u8) -> Lx {
     deps.sessions = rig.host.clone();
     let ends = Arc::new(Ends::default());
     deps.audit = ends.clone();
+    let services = services.then(|| {
+        let (tx, heard) = mpsc::unbounded_channel();
+        let (policy, policy_rx) = watch::channel(ServicesPolicy::default());
+        let host = Arc::new(ServicesHost::new(
+            rig.host.clone(),
+            Arc::new(Heard(tx)),
+            policy_rx,
+            ServicesEnv::default(),
+            ServicesLimits::default(),
+        ));
+        deps.sessions = Arc::new(Both {
+            services: Arc::clone(&host),
+            media: rig.host.clone(),
+        });
+        LxServices {
+            host,
+            heard,
+            _policy: policy,
+        }
+    });
 
     let viewer_env = Noting::new(viewer_x);
     let host_env = Noting::new(host_x);
@@ -129,7 +199,9 @@ async fn on_loopback(viewer_x: u8, host_x: u8) -> Lx {
     let host_key = host_identity.verifying_key().to_bytes();
     deps.paths = Arc::new(DirectHost::new(
         rig.host.clone(),
-        None,
+        services
+            .as_ref()
+            .map(|services| services.host.second_stream()),
         Arc::clone(&host_identity),
         DirectSettings::default(),
         host_env.clone(),
@@ -139,6 +211,9 @@ async fn on_loopback(viewer_x: u8, host_x: u8) -> Lx {
     let mut cfg = HostConfig::new("Desk", host_key);
     cfg.transport = TransportKnob::fixed(TransportPolicy::Any);
     cfg.feats.push(feats::DIR1.to_owned());
+    if services.is_some() {
+        cfg.feats.push(feats::SVC1.to_owned());
+    }
     let (client_end, host_end) = duplex(64 * 1024);
     let fsm = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await.map(|_| ()) });
 
@@ -180,6 +255,7 @@ async fn on_loopback(viewer_x: u8, host_x: u8) -> Lx {
         viewer_key,
         host_key,
         accepted,
+        services,
         _tmp: tmp,
     }
 }
@@ -332,6 +408,144 @@ async fn a_whole_session_goes_direct_on_loopback_sockets() {
     assert!(measured.to_stream < Duration::from_secs(4), "{measured:?}");
     assert_eq!(ended.host_bound[0].ip().to_string(), "127.0.0.31");
     assert_eq!(ended.viewer_bound[0].ip().to_string(), "127.0.0.30");
+}
+
+/// A sink that counts the pictures where a test can read them.
+struct Tally(Arc<AtomicUsize>);
+
+impl FrameSink for Tally {
+    fn picture(&mut self, _seq: u32, _frame: &DecodedFrame) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The host's next chat line from session `id`, skipping its other events.
+async fn chat_heard(heard: &mut mpsc::UnboundedReceiver<(String, HostEvent)>, id: &str) -> String {
+    loop {
+        let (sid, event) = tokio::time::timeout(WAIT, heard.recv())
+            .await
+            .expect("an event in time")
+            .expect("the host is there");
+        if let (true, HostEvent::Chat(text)) = (sid == id, event) {
+            return text.as_str().to_owned();
+        }
+    }
+}
+
+/// Step B10 (the direct design §6.7, §12.1 "services direct") over real
+/// sockets: the viewer opens the services stream as the second stream of
+/// the session's QUIC connection once its media is bound, `DirectHost`
+/// hands it to the services host, which binds it under the direct services
+/// MAC and grants the direct bulk window; chat goes both ways over it while
+/// pictures keep arriving on the media stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_session_carries_its_services_beside_the_media() {
+    let mut lx = on_loopback_with(34, 35, true).await;
+    let mut services = lx.services.take().expect("the host offers services");
+    let choice = lx
+        .viewer
+        .choose_path(
+            &mut lx.session,
+            Mine::of(TransportPolicy::Any),
+            true,
+            pending(),
+        )
+        .await;
+    let PathChoice::Direct(media) = choice else {
+        panic!("not direct: {choice:?}");
+    };
+    let direct = media
+        .services()
+        .expect("svc1 offered: a direct services stream");
+    assert_eq!(direct.binding().session_id(), lx.session_id);
+    let viewer_media = media.bind(BIND_WAIT).await.expect("bound");
+    assert_eq!(lx.rig.host.route(&lx.session_id), Some(TransportKind::Lan));
+
+    let stream = tokio::time::timeout(WAIT, direct.open())
+        .await
+        .expect("the second stream opens at once")
+        .expect("the connection is up");
+    let (svc, welcome) = ServicesViewer::bind(stream, direct.binding(), WAIT)
+        .await
+        .expect("Welcome on the direct connection");
+    assert_eq!(welcome.bulk_window, DIRECT_BULK_WINDOW);
+    assert_ne!(welcome.caps & tornect_proto::services::caps::CHAT, 0);
+    assert_eq!(services.host.open_streams(), 1);
+    // The host's transport parameters allow two bidirectional streams
+    // (`tornect_net::quic::HOST_STREAMS`): a third waits for credit.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), direct.open())
+            .await
+            .is_err(),
+        "a third stream opened"
+    );
+
+    let pictures = Arc::new(AtomicUsize::new(0));
+    let (stop_media, media_stopped) = oneshot::channel::<()>();
+    let media_task = {
+        let pictures = Arc::clone(&pictures);
+        tokio::spawn(async move {
+            let mut sink = Tally(pictures);
+            let mut stats = ViewerStats::default();
+            viewer_media
+                .run(&mut sink, &mut stats, async {
+                    let _ = media_stopped.await;
+                })
+                .await
+        })
+    };
+    let (ops, ops_rx) = mpsc::channel(8);
+    let (events_tx, mut events) = mpsc::channel(8);
+    let (stop_svc, svc_stopped) = oneshot::channel::<()>();
+    let svc_task = tokio::spawn(svc.run(ops_rx, events_tx, ViewerLocal::default(), async {
+        let _ = svc_stopped.await;
+    }));
+    until("a first picture", || pictures.load(Ordering::SeqCst) > 0).await;
+
+    ops.send(ViewerOp::Chat(sanitize_peer_text("over QUIC").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        chat_heard(&mut services.heard, &lx.session_id).await,
+        "over QUIC"
+    );
+    assert!(
+        services
+            .host
+            .send_chat(&lx.session_id, sanitize_peer_text("and back").unwrap())
+    );
+    loop {
+        match tokio::time::timeout(WAIT, events.recv()).await.unwrap() {
+            Some(ViewerEvent::Chat(text)) => {
+                assert_eq!(text.as_str(), "and back");
+                break;
+            }
+            Some(_) => {}
+            None => panic!("the services stream ended"),
+        }
+    }
+    let after_chat = pictures.load(Ordering::SeqCst);
+    until("pictures after the chat", || {
+        pictures.load(Ordering::SeqCst) >= after_chat + 2
+    })
+    .await;
+
+    stop_svc.send(()).unwrap();
+    assert_eq!(svc_task.await.unwrap(), ViewerServicesEnd::Stopped);
+    until("the host's services stream over", || {
+        services.host.open_streams() == 0
+    })
+    .await;
+    stop_media.send(()).unwrap();
+    assert_eq!(
+        media_task.await.unwrap().expect("the media ran"),
+        ViewerEnd::Stopped
+    );
+    lx.session.bye(bye::USER).await.unwrap();
+    let (transport, path) = lx.ends.line().await;
+    assert_eq!(transport, Some(TransportKind::Lan));
+    assert_eq!(path.expect("a path summary").outcome, "direct");
+    lx.fsm.await.unwrap().unwrap();
 }
 
 /// Decision M1-82's stand-in for `tornect demo --loopback

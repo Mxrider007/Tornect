@@ -625,7 +625,7 @@ enum Lookup {
 enum Proof<'a> {
     /// An onion stream's: its kind's MAC over `th_final`.
     Onion { mac: &'a [u8; 32] },
-    /// A direct connection's media stream: the client MAC over `th_final ‖
+    /// A direct connection's stream: its kind's client MAC over `th_final ‖
     /// ekm`, from the QUIC peer `peer` (the key its TLS proved), on `path`
     /// (`Lan` or `Direct`).
     Direct {
@@ -1092,7 +1092,17 @@ impl MediaHost {
         // verified, so a peer that knows a session id but not its token
         // reads `BAD_BIND` whatever the session's policy and learns nothing
         // of it.
-        let allowed = proof.allowed_by(session.transport);
+        // The direct design §6.7: a session's services ride its media's
+        // path, so while the media is direct the onion services port binds
+        // nothing for it (its viewer never opens that stream then).
+        let media_direct = matches!(
+            *session.claimed.borrow(),
+            Some(TransportKind::Lan | TransportKind::Direct)
+        );
+        let allowed = proof.allowed_by(session.transport)
+            && !(kind == StreamKind::Services
+                && matches!(proof, Proof::Onion { .. })
+                && media_direct);
         if !allowed && matches!(proof, Proof::Direct { .. }) {
             return Lookup::Refused(reason::TRANSPORT);
         }
@@ -1120,8 +1130,25 @@ impl MediaHost {
                         mac,
                     )
             }
-            // A direct services stream is bound by its own host (§6.7).
-            (Proof::Direct { .. }, StreamKind::Services) => false,
+            // The direct design §6.7: the same pinned peer, and the media of
+            // this session claimed on this path (the link carries one
+            // session, and the MAC covers its exporter output), under the
+            // services stream's own label.
+            (
+                Proof::Direct {
+                    mac,
+                    ekm,
+                    peer,
+                    path,
+                },
+                StreamKind::Services,
+            ) => {
+                *peer == session.device
+                    && *session.claimed.borrow() == Some(path)
+                    && tornect_proto::services::services_bind_mac_direct_ok(
+                        token, th_final, ekm, mac,
+                    )
+            }
         };
         if !verified {
             return Lookup::Refused(reason::BAD_BIND);
@@ -1129,14 +1156,13 @@ impl MediaHost {
         if !allowed {
             return Lookup::Refused(reason::TRANSPORT);
         }
-        let proof_mac = match proof {
-            Proof::Direct { ekm, .. } => Some(Zeroizing::new(tornect_proto::bind_mac_direct(
-                token,
-                th_final,
-                ekm,
-                BindSide::Server,
-            ))),
-            Proof::Onion { .. } => None,
+        // Only a direct media stream proves the host; the services stream
+        // on the same connection needs no proof of its own (§6.7).
+        let proof_mac = match (proof, kind) {
+            (Proof::Direct { ekm, .. }, StreamKind::Media) => Some(Zeroizing::new(
+                tornect_proto::bind_mac_direct(token, th_final, ekm, BindSide::Server),
+            )),
+            _ => None,
         };
         match kind {
             StreamKind::Media => {
@@ -1157,12 +1183,47 @@ impl MediaHost {
 
     /// Bind a services stream to `session_id` with `mac` (the services
     /// design §3.3, §6.2): only a session registered and not ended, whose
-    /// services stream is not bound yet, under the services MAC. Nothing
+    /// services stream is not bound yet and whose media is not claimed on a
+    /// direct path (the direct design §6.7), under the services MAC. Nothing
     /// waits: the viewer opens its services stream only after its media
     /// stream's `BindOk`, so an unknown session is refused at once. A wrong
     /// MAC leaves the session's services unbound.
     pub(crate) fn claim_services(&self, session_id: &str, mac: &[u8; 32]) -> Option<ServicesClaim> {
         match self.try_claim(session_id, Proof::Onion { mac }, StreamKind::Services) {
+            Lookup::Bound(claimed) => Some(ServicesClaim {
+                mode: claimed.mode,
+                label: claimed.label,
+                end: claimed.end,
+                capture: claimed.capture.subscribe(),
+            }),
+            Lookup::Refused(_) | Lookup::Unknown => None,
+        }
+    }
+
+    /// Bind the services stream of `session_id`'s direct connection (the
+    /// direct design §6.7) with `mac`: the session's media claimed on `path`
+    /// (`Lan` or `Direct`, the connection's), `peer` its viewer's device, and
+    /// `mac` the direct services MAC over the connection's exporter output
+    /// `ekm`; otherwise as [`Self::claim_services`]. Any refusal leaves the
+    /// session's services unbound.
+    pub(crate) fn claim_services_direct(
+        &self,
+        session_id: &str,
+        mac: &[u8; 32],
+        ekm: &[u8; 32],
+        peer: &DeviceId,
+        path: TransportKind,
+    ) -> Option<ServicesClaim> {
+        if !matches!(path, TransportKind::Lan | TransportKind::Direct) {
+            return None;
+        }
+        let proof = Proof::Direct {
+            mac,
+            ekm,
+            peer,
+            path,
+        };
+        match self.try_claim(session_id, proof, StreamKind::Services) {
             Lookup::Bound(claimed) => Some(ServicesClaim {
                 mode: claimed.mode,
                 label: claimed.label,

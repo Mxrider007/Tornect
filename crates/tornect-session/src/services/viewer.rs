@@ -40,7 +40,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tornect_proto::services::{
     Bind, CHUNK, Chat, Side, SvcError, SvcMsg, Welcome, caps, read_body_max, read_header, reason,
-    services_bind_mac, ty, write_msg,
+    services_bind_mac, services_bind_mac_direct, ty, write_msg,
 };
 use tornect_signal::consent::SessionToken;
 
@@ -136,6 +136,19 @@ impl ServicesBinding {
         Self {
             session_id: token.session_id(),
             mac: services_bind_mac(token.bytes(), th_final),
+        }
+    }
+
+    /// The binding of the same session's services stream on its direct
+    /// connection (the direct design §6.7), whose TLS exporter output is
+    /// `ekm` (`tornect_net::Established::binding_secret`): the MAC covers
+    /// the connection too, so it binds no other connection, and neither the
+    /// onion services MAC nor the direct media MAC binds this stream.
+    #[must_use]
+    pub fn direct(token: &SessionToken, th_final: &[u8; 32], ekm: &[u8; 32]) -> Self {
+        Self {
+            session_id: token.session_id(),
+            mac: services_bind_mac_direct(token.bytes(), th_final, ekm),
         }
     }
 

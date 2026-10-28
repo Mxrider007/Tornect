@@ -34,6 +34,8 @@ use tornect_signal::consent::SessionToken;
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionSink as _};
 use tornect_signal::messages::bye;
 
+mod direct;
+
 use super::listing::{LIST_BURST, ListHook};
 use super::store::{FinishHook, Finishing};
 use super::*;

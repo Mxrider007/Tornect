@@ -71,15 +71,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::sync::{Notify, mpsc, watch};
+use tornect_core::DeviceId;
+use tornect_core::session_log::TransportKind;
 use tornect_input::clipboard::ClipboardLink;
+use tornect_net::{BoxFuture, QuicStream};
 use tornect_proto::services::{
     CHUNK, CLIP_CHUNK_HEAD, Caps, Chat, ClipSwitch, MAX_BULK_WINDOW, MAX_CHAT_BYTES, MAX_CLIP,
     MAX_FILE, MAX_INBOX_CHARS, Side, SvcError, SvcMsg, Welcome, caps, read_bind, reason, ty,
     write_msg,
 };
 use tornect_signal::fsm::host::LiveSession;
+use zeroize::Zeroizing;
 
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
 use super::clip::{ClipInflow, ClipSender, HostClip, Started, text_of};
@@ -95,6 +99,7 @@ use super::{
     HostEvent, NoServicesObserver, ServicesEnv, ServicesLimits, ServicesObserver, ServicesPolicy,
     ServicesSummary, eligible, granted,
 };
+use crate::SecondStream;
 use crate::flow::LineBudget;
 use crate::host::{CaptureState, MediaHost, ServicesClaim};
 
@@ -150,7 +155,8 @@ enum HostOp {
 /// Call [`Self::on_start`] when a session goes live (before the media
 /// layer's own `on_start`) and [`Self::on_end`] when it ends, and hand it
 /// every stream accepted on `tornect_signal::SERVICES_PORT`
-/// ([`Self::serve`]).
+/// ([`Self::serve`]), and the second stream of every session's direct
+/// connection ([`Self::second_stream`], [`Self::serve_direct`]).
 pub struct ServicesHost {
     media: Arc<MediaHost>,
     observer: Arc<dyn ServicesObserver>,
@@ -183,6 +189,42 @@ impl std::fmt::Debug for ServicesHost {
             .field("open", &self.open_streams())
             .field("limits", &self.limits)
             .finish_non_exhaustive()
+    }
+}
+
+/// A [`ServicesHost`] as a direct connection's second stream
+/// ([`ServicesHost::second_stream`]).
+struct DirectServicesStream(Arc<ServicesHost>);
+
+impl SecondStream for DirectServicesStream {
+    fn serve(
+        &self,
+        stream: QuicStream,
+        expected_session: String,
+        peer: DeviceId,
+        ekm: Zeroizing<[u8; 32]>,
+        route: TransportKind,
+    ) -> BoxFuture<'static, ()> {
+        let host = Arc::clone(&self.0);
+        Box::pin(async move {
+            let outcome = host
+                .serve_direct(stream, &expected_session, peer, ekm, route)
+                .await;
+            tracing::debug!(
+                session = %expected_session,
+                outcome = outcome_word(&outcome),
+                "direct services stream over"
+            );
+        })
+    }
+}
+
+/// How a services stream ended, in one word for a debug line.
+fn outcome_word(outcome: &ServicesOutcome) -> &'static str {
+    match outcome {
+        ServicesOutcome::NotBound => "not-bound",
+        ServicesOutcome::Refused { .. } => "refused",
+        ServicesOutcome::Served { .. } => "served",
     }
 }
 
@@ -379,14 +421,102 @@ impl ServicesHost {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut rd, mut wr) = tokio::io::split(stream);
-        let bind = match tokio::time::timeout(self.media.bind_deadline(), read_bind(&mut rd)).await
-        {
-            Ok(Ok(bind)) => bind,
+        let Some((session_id, mac)) = self.read_bind_of(&mut rd, &mut wr).await else {
+            return ServicesOutcome::NotBound;
+        };
+        let Some(claim) = self.media.claim_services(&session_id, &mac) else {
+            if let Some(left_out) = self.line() {
+                tracing::info!(session = %session_id, left_out, "services bind refused");
+            }
+            refuse_with(&mut wr, reason::BAD_BIND).await;
+            return ServicesOutcome::NotBound;
+        };
+        self.serve_claimed(session_id, claim, rd, wr, &self.limits)
+            .await
+    }
+
+    /// Serve the services stream of a session's direct connection (the
+    /// direct design §6.7), from its `Bind` to its end. `expected_session`
+    /// is the session the connection was made for, `peer` the device its
+    /// TLS proved, `ekm` its exporter output and `route` its path
+    /// ([`TransportKind::Lan`] or [`TransportKind::Direct`]), each said by
+    /// the link, never by the viewer.
+    ///
+    /// The `Bind` is read as on the onion port, then bound only when its
+    /// session is the link's, that session's media was claimed on this
+    /// path, `peer` is its viewer's device and the MAC is the direct
+    /// services MAC over `ekm` (its own label: neither the onion services
+    /// MAC nor the direct media MAC binds it); any refusal is
+    /// `Refused{BAD_BIND}`, and the media goes on. There is no proof of the
+    /// host: the media stream's `BindProof` on the same connection gave it.
+    /// The stream then runs as an onion one does, with the direct bulk
+    /// window ([`ServicesLimits::direct`]).
+    ///
+    /// [`ServicesLimits::direct`]: super::ServicesLimits::direct
+    pub async fn serve_direct<S>(
+        &self,
+        stream: S,
+        expected_session: &str,
+        peer: DeviceId,
+        ekm: Zeroizing<[u8; 32]>,
+        route: TransportKind,
+    ) -> ServicesOutcome
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let Some((session_id, mac)) = self.read_bind_of(&mut rd, &mut wr).await else {
+            return ServicesOutcome::NotBound;
+        };
+        // The link's own session first: a stream of this connection binds
+        // no other.
+        let claim = if session_id == expected_session {
+            self.media
+                .claim_services_direct(&session_id, &mac, &ekm, &peer, route)
+        } else {
+            None
+        };
+        drop(ekm);
+        let Some(claim) = claim else {
+            if let Some(left_out) = self.line() {
+                tracing::info!(
+                    session = %expected_session,
+                    left_out,
+                    "direct services bind refused"
+                );
+            }
+            refuse_with(&mut wr, reason::BAD_BIND).await;
+            return ServicesOutcome::NotBound;
+        };
+        let limits = self.limits.direct();
+        self.serve_claimed(session_id, claim, rd, wr, &limits).await
+    }
+
+    /// This host as the second stream of every session's direct connection
+    /// (the direct design §6.7): `DirectHost` hands it the connection's
+    /// second stream once the session's media was claimed on it, and it is
+    /// served with [`Self::serve_direct`].
+    #[must_use]
+    pub fn second_stream(self: &Arc<Self>) -> Arc<dyn SecondStream> {
+        Arc::new(DirectServicesStream(Arc::clone(self)))
+    }
+
+    /// Step 1's read: the first frame, a `Bind`, within the media stream's
+    /// bind deadline: its session id and MAC. `None` when there is none in
+    /// time (nothing is written), or the first frame is something else
+    /// (`Refused{PROTOCOL}` is written).
+    async fn read_bind_of<R, W>(&self, rd: &mut R, wr: &mut W) -> Option<(String, [u8; 32])>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        match tokio::time::timeout(self.media.bind_deadline(), read_bind(rd)).await {
+            Ok(Ok(bind)) => Some((bind.session_id, bind.mac)),
             Ok(Err(SvcError::Io(_))) | Err(_) => {
                 if let Some(left_out) = self.line() {
                     tracing::debug!(left_out, "services stream sent no bind");
                 }
-                return ServicesOutcome::NotBound;
+                None
             }
             Ok(Err(e)) => {
                 if let Some(left_out) = self.line() {
@@ -396,20 +526,27 @@ impl ServicesHost {
                         "services stream opened with something other than a bind"
                     );
                 }
-                refuse_with(&mut wr, reason::PROTOCOL).await;
-                return ServicesOutcome::NotBound;
+                refuse_with(wr, reason::PROTOCOL).await;
+                None
             }
-        };
-        let session_id = bind.session_id;
-        let Some(claim) = self.media.claim_services(&session_id, &bind.mac) else {
-            if let Some(left_out) = self.line() {
-                tracing::info!(session = %session_id, left_out, "services bind refused");
-            }
-            refuse_with(&mut wr, reason::BAD_BIND).await;
-            return ServicesOutcome::NotBound;
-        };
+        }
+    }
+
+    /// Steps 2 to 5 for a stream whose `Bind` claimed `session_id`'s
+    /// services, under `limits`.
+    async fn serve_claimed<S>(
+        &self,
+        session_id: String,
+        claim: ServicesClaim,
+        rd: ReadHalf<S>,
+        mut wr: WriteHalf<S>,
+        limits: &ServicesLimits,
+    ) -> ServicesOutcome
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let _open = OpenStream::new(&self.open);
-        match self.open_services(&session_id, claim).await {
+        match self.open_services(&session_id, claim, limits).await {
             Err(code) => {
                 tracing::info!(session = %session_id, reason = code, "services refused");
                 refuse_with(&mut wr, code).await;
@@ -424,7 +561,12 @@ impl ServicesHost {
 
     /// Steps 2 and 3: wait for capture, then fix the caps; `Err` with the
     /// `Refused` reason.
-    async fn open_services(&self, session_id: &str, claim: ServicesClaim) -> Result<Opened, u16> {
+    async fn open_services(
+        &self,
+        session_id: &str,
+        claim: ServicesClaim,
+        limits: &ServicesLimits,
+    ) -> Result<Opened, u16> {
         let ServicesClaim {
             mode,
             label: _,
@@ -535,7 +677,7 @@ impl ServicesHost {
         if caps == 0 {
             return Err(reason::NOT_OFFERED);
         }
-        let welcome = self.welcome(caps, &policy);
+        let welcome = self.welcome(caps, &policy, limits.bulk_window);
         let inbox = match &self.env.inbox {
             Some(dir) if caps & caps::UPLOAD != 0 => Some(Inbox::new(
                 dir.clone(),
@@ -610,9 +752,9 @@ impl ServicesHost {
         }
     }
 
-    /// `Welcome` for `caps` under `policy`, every number within the wire's
-    /// bounds.
-    fn welcome(&self, caps: u16, policy: &ServicesPolicy) -> Welcome {
+    /// `Welcome` for `caps` under `policy` with the transport's
+    /// `bulk_window`, every number within the wire's bounds.
+    fn welcome(&self, caps: u16, policy: &ServicesPolicy, bulk_window: u32) -> Welcome {
         let inbox = if caps & caps::UPLOAD != 0 {
             self.env.inbox_words.chars().take(MAX_INBOX_CHARS).collect()
         } else {
@@ -625,9 +767,7 @@ impl ServicesHost {
             session_quota: policy.session_quota,
             session_files: self.limits.session_files,
             chat_max: u16::try_from(MAX_CHAT_BYTES).unwrap_or(u16::MAX),
-            bulk_window: self
-                .limits
-                .bulk_window
+            bulk_window: bulk_window
                 .clamp(u32::try_from(CHUNK).unwrap_or(u32::MAX), MAX_BULK_WINDOW),
             inbox,
         }

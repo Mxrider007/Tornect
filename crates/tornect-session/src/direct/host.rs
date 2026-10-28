@@ -43,7 +43,10 @@ use tornect_signal::fsm::{PATH_INBOX, PathExchange, PathFrame, PathPort, PathRec
 use tornect_signal::messages::{self, bye, fallback};
 use zeroize::Zeroizing;
 
-use super::{DIRECT_DRAIN, DirectSettings, HOST_DIRECT_LINGER, INTERNET_DIRECT, SecondStream};
+use super::{
+    DIRECT_DRAIN, DirectSettings, HOST_DIRECT_LINGER, INTERNET_DIRECT, MEDIA_PRIORITY,
+    SERVICES_PRIORITY, SecondStream,
+};
 use super::{from_wire, to_wire};
 use crate::{MediaHost, MediaOutcome};
 
@@ -200,6 +203,15 @@ impl Record {
     }
 }
 
+/// The path `conn` runs on, as the session's claim on it is published.
+fn path_of(conn: &Established) -> TransportKind {
+    if conn.route().same_site {
+        TransportKind::Lan
+    } else {
+        TransportKind::Direct
+    }
+}
+
 /// Milliseconds since `t0`, saturating.
 fn ms_since(t0: Instant) -> u32 {
     u32::try_from(t0.elapsed().as_millis()).unwrap_or(u32::MAX)
@@ -211,8 +223,8 @@ impl DirectHost {
     /// is recognised), `settings` the `[network]` options, `env` the
     /// network, `kill` the host-wide kill switch, `on_media` what hears each
     /// direct media stream's end. `second` serves the connection's second
-    /// stream ([`SecondStream`]); `None` until the services layer
-    /// implements it.
+    /// stream ([`SecondStream`]): the services stream; `None` accepts no
+    /// second stream.
     #[must_use]
     pub fn new(
         media: Arc<MediaHost>,
@@ -667,14 +679,14 @@ impl Task {
         let token = self.token.clone();
         Box::pin(async move {
             let stream = conn.accept_stream().await.ok()?;
+            stream.set_priority(MEDIA_PRIORITY);
             let ekm = conn.binding_secret(&token).ok()?;
             let peer = DeviceId::from_bytes(conn.peer_key());
-            let route = if conn.route().same_site {
-                TransportKind::Lan
-            } else {
-                TransportKind::Direct
-            };
-            Some(media.serve_direct(stream, &id, peer, ekm, route).await)
+            Some(
+                media
+                    .serve_direct(stream, &id, peer, ekm, path_of(&conn))
+                    .await,
+            )
         })
     }
 
@@ -742,10 +754,12 @@ impl Task {
                 let Ok(stream) = conn.accept_stream().await else {
                     return;
                 };
+                stream.set_priority(SERVICES_PRIORITY);
                 let Ok(ekm) = conn.binding_secret(&token) else {
                     return;
                 };
-                second.serve(stream, id, ekm).await;
+                let peer = DeviceId::from_bytes(conn.peer_key());
+                second.serve(stream, id, peer, ekm, path_of(&conn)).await;
             }));
         }
     }

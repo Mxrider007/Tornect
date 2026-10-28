@@ -65,9 +65,9 @@ pub mod viewer;
 pub use backend::{DesktopBackend, Source, SystemBackend, TEST_SCREENS};
 pub use direct::{
     AfterBind, DIRECT_DRAIN, Decision, DirectBindFailed, DirectHost, DirectHostStats, DirectMedia,
-    DirectOptions, DirectSettings, DirectStream, FallbackWhy, HOST_DIRECT_LINGER, INTERNET_DIRECT,
-    Mine, OnMedia, PathChoice, PathEnd, SecondStream, TorWhy, ViewerDirect, ViewerDirectStats,
-    after_bind_close, decide, from_wire, to_wire,
+    DirectOptions, DirectServices, DirectSettings, DirectStream, FallbackWhy, HOST_DIRECT_LINGER,
+    INTERNET_DIRECT, Mine, OnMedia, PathChoice, PathEnd, SecondStream, TorWhy, ViewerDirect,
+    ViewerDirectStats, after_bind_close, decide, from_wire, to_wire,
 };
 pub use host::{
     CaptureChanged, CaptureStarted, CaptureState, MediaBackend, MediaEnd, MediaHost, MediaLimits,

@@ -15,7 +15,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tornect_core::DeviceId;
 use tornect_core::config::Network;
+use tornect_core::session_log::TransportKind;
 use tornect_net::{BoxFuture, Established, GatherConfig, MapProtocols, QuicStream, TornectRole};
 use zeroize::Zeroizing;
 
@@ -26,7 +28,9 @@ mod wire;
 
 pub use decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide};
 pub use host::{DirectHost, DirectHostStats, OnMedia};
-pub use viewer::{DirectBindFailed, DirectMedia, PathChoice, ViewerDirect, ViewerDirectStats};
+pub use viewer::{
+    DirectBindFailed, DirectMedia, DirectServices, PathChoice, ViewerDirect, ViewerDirectStats,
+};
 pub use wire::{from_wire, to_wire};
 
 /// Whether a session may reach beyond the same site (the direct design
@@ -35,6 +39,15 @@ pub use wire::{from_wire, to_wire};
 /// [`Scope::SameSite`](tornect_net::Scope::SameSite); Phase B
 /// turns it on once its gathering and its tests land.
 pub const INTERNET_DIRECT: bool = false;
+
+/// The quinn send priority of a direct connection's media stream, on both
+/// ends (the direct design §6.7): higher is sent first, so the viewer's
+/// input and acks and the host's pictures go before a file's bytes.
+pub(crate) const MEDIA_PRIORITY: i32 = 1;
+
+/// The quinn send priority of a direct connection's services stream, on
+/// both ends (the direct design §6.7).
+pub(crate) const SERVICES_PRIORITY: i32 = 0;
 
 /// How long the host keeps a session's direct link open from its bind
 /// without a direct claim (the direct design §4): the largest
@@ -183,20 +196,27 @@ impl DirectSettings {
 }
 
 /// The host's hook for the second stream of a session's direct connection
-/// (the direct design §6.7): the services stream, once the services layer
-/// implements it. [`DirectHost`] accepts that stream only after the
-/// session's media was claimed on this connection, and serves it beside the
-/// media stream, neither waiting on the other; a kill, the linger or the
-/// session's end drop it with the link. `None` until then: the connection
-/// takes one stream ([`tornect_net::quic::HOST_STREAMS`]).
+/// (the direct design §6.7): the services stream, which
+/// [`ServicesHost::second_stream`](crate::services::ServicesHost::second_stream)
+/// serves. [`DirectHost`] accepts that stream only after the session's
+/// media was claimed on this connection, at [`SERVICES_PRIORITY`], and
+/// serves it beside the media stream, neither waiting on the other; a kill,
+/// the linger or the session's end drop it with the link. A host without
+/// one never accepts a second stream: the viewer's waits unread, within the
+/// stream window ([`tornect_net::quic::HOST_STREAMS`]).
 pub trait SecondStream: Send + Sync {
-    /// Serve `stream` for session `expected_session`, whose connection's
-    /// exporter output is `ekm` (what its own `Bind` MAC covers).
+    /// Serve `stream` for session `expected_session`, on a connection whose
+    /// TLS proved the device `peer`, whose exporter output is `ekm` (what
+    /// the stream's own `Bind` MAC covers) and whose path is `route`
+    /// ([`TransportKind::Lan`] or [`TransportKind::Direct`], as the media
+    /// stream's claim on it says).
     fn serve(
         &self,
         stream: QuicStream,
         expected_session: String,
+        peer: DeviceId,
         ekm: Zeroizing<[u8; 32]>,
+        route: TransportKind,
     ) -> BoxFuture<'static, ()>;
 }
 

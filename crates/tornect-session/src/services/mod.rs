@@ -179,8 +179,15 @@ impl Default for ServicesPolicy {
     }
 }
 
+/// The bulk window of a services stream on a session's direct connection
+/// (the direct design §6.7; provisional until step B12 measures it): 4 MiB,
+/// where Tor's is 256 KiB. It matches the connection's stream window, so
+/// one stream's credit never waits on QUIC's.
+pub const DIRECT_BULK_WINDOW: u32 = 4 << 20;
+
 /// The host's bounds on a services stream (§3.4, §6.1). Only
-/// [`ServicesLimits::bulk_window`] differs per transport.
+/// [`ServicesLimits::bulk_window`] differs per transport
+/// ([`ServicesLimits::direct`]).
 #[derive(Debug, Clone, Copy)]
 pub struct ServicesLimits {
     /// Bytes of file data and clipboard text a sender keeps in flight beyond
@@ -221,6 +228,19 @@ pub struct ServicesLimits {
     /// what it wrote, or puts a file it had verified in place) before
     /// `serve` returns.
     pub workers_wait: Duration,
+}
+
+impl ServicesLimits {
+    /// These bounds for a stream on a session's direct connection (the
+    /// direct design §6.7): the bulk window is [`DIRECT_BULK_WINDOW`], every
+    /// other bound is kept.
+    #[must_use]
+    pub const fn direct(self) -> Self {
+        Self {
+            bulk_window: DIRECT_BULK_WINDOW,
+            ..self
+        }
+    }
 }
 
 impl Default for ServicesLimits {
