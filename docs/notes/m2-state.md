@@ -253,6 +253,19 @@ and the crates below ring check here).
   puts it in M1-81's final text). The two tests the B10 review left (`lan_only` services on the
   link; a second stream while `ServicesSlot` is unset) are written. Left as NEEDS-DEVICE: the
   window's Phase B page, notice and consent line on a desktop after B12 (ledger row).
+  Review fixes (2026-10-28, `b425e7a9`, `5e21e924`, `9a827a91`, `2d3eaaac`, `3d742bba`; ledger
+  rows "Review of step B11"; decisions M1-81, M1-84 and M1-86's notes): the STUN names'
+  refresh no longer starts when a process starts (a config with `tor.bridges = "auto"` reads as
+  plain Tor before the bootstrap): `DirectKnobs::tor_known` is false until the first
+  `bootstrapped`, `stun_names` is empty and `follow_stun` starts nothing
+  until then, and the window (`tor_started`), `host` and `connect` start it through
+  `direct::tor_bootstrapped`; `STUN_LINE` says "once Tor is connected". Until the notice's OK the
+  window host signs unattended sessions `tor_only` (`TransportKnob::hold_unattended`, read by
+  `host_transport`), which covers background mode. The notice card keeps the page's widget ids
+  (it takes the prompt's id slot). The placement of the bootstrap calls in `run_host`,
+  `run_connect` and the window's Tor arm is by inspection (they need Tor); the gate holds
+  whatever the call site. One flake seen once in the full app suite
+  (`the_terminal_hosts_services_leave_the_session_without_them`, OPEN row).
 - B12: `INTERNET_DIRECT = true`.
 - B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11 (their recipes are
   written: ledger rows "Step B13 recipe: design §13 row 3" to "… row 11"), 15 and 16 (row 16,
