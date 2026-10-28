@@ -164,6 +164,17 @@ fn start_direct_for(
     transport: TransportPolicy,
     device: DeviceId,
 ) -> Viewer {
+    start_direct_as(host, seed, transport, device, SessionMode::Control)
+}
+
+/// [`start_direct_for`] with the `mode` the accept signed.
+fn start_direct_as(
+    host: &MediaHost,
+    seed: u8,
+    transport: TransportPolicy,
+    device: DeviceId,
+    mode: SessionMode,
+) -> Viewer {
     let token = SessionToken::new([seed; 32]);
     let th_final = [!seed; 32];
     let id = token.session_id();
@@ -173,7 +184,7 @@ fn start_direct_for(
         session_id: &id,
         token: &token,
         th_final,
-        mode: SessionMode::Control,
+        mode,
         elevation: Elevation::None,
         unattended: false,
         transport,
@@ -565,6 +576,80 @@ async fn a_wrong_direct_bind_is_refused_before_capture() {
     assert_eq!(rig.sources(), 1);
     drop(conn.client);
     conn.served.await.unwrap();
+}
+
+/// A view-only session bound on the direct path has no injector either
+/// (§B.6; the onion path's SLICE-A2 A2-3 case): on a direct-internet and a
+/// same-site link alike, `BindOk` says view-only and the session's input is
+/// dropped before anything decodes it. Bytes no decoder would accept end
+/// nothing, which is the proof that none was decoded. The direct path
+/// serves through the onion path's code, and this keeps it so (security
+/// review C2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_view_only_direct_session_never_decodes_or_injects_input() {
+    let rig = direct_rig(TestBackend::default());
+    let key = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    for (seed, route) in [(80, TransportKind::Direct), (81, TransportKind::Lan)] {
+        let viewer = start_direct_as(
+            &rig.host,
+            seed,
+            TransportPolicy::Any,
+            DeviceId::from_bytes([seed; 32]),
+            SessionMode::ViewOnly,
+        );
+        let mut conn = connect_direct(&rig.host, &viewer, EKM, route);
+        write_msg(&mut conn.client, &viewer.bind(&EKM))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_msg(&mut conn.client).await.unwrap(),
+            Some(viewer.proof(&EKM))
+        );
+        let Some(Msg::BindOk { mode, .. }) = read_msg(&mut conn.client).await.unwrap() else {
+            panic!("{route:?}: no BindOk");
+        };
+        assert_eq!(mode, 1, "{route:?}: BindOk says view-only");
+        for i in 0..40 {
+            let bytes = if i % 2 == 0 { key.encode() } else { [0xff; 16] };
+            write_msg(&mut conn.client, &Msg::Input(bytes))
+                .await
+                .unwrap();
+        }
+        write_msg(
+            &mut conn.client,
+            &Msg::Close {
+                reason: reason::ENDED_BY_VIEWER,
+            },
+        )
+        .await
+        .unwrap();
+        let MediaOutcome::Served { report, end, .. } = conn.served.await.unwrap() else {
+            panic!("{route:?}: not served");
+        };
+        assert_eq!(end, MediaEnd::ViewerLeft, "{route:?}: nothing was decoded");
+        assert_eq!(
+            (report.input_injected, report.input_dropped),
+            (0, 40),
+            "{route:?}"
+        );
+    }
+    assert_eq!(
+        rig.backend.injectors.load(Ordering::SeqCst),
+        0,
+        "no injector was opened"
+    );
+    assert!(rig.backend.recorder.events().is_empty());
+    assert!(
+        rig.backend.open_injector().is_none(),
+        "a view-only session's input handle was kept"
+    );
+    assert_eq!(
+        rig.routes.started(),
+        [TransportKind::Direct, TransportKind::Lan]
+    );
 }
 
 /// The signed policy decides the paths (the direct design §6.6 check 4,
