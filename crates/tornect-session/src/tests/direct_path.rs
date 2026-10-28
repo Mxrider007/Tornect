@@ -46,9 +46,9 @@ const PUNCH: Duration = Duration::from_secs(4);
 
 /// A path exchange that records the viewer's frames as the host FSM hands
 /// them on, then passes them to the host's own half (when it has an inbox).
-struct Tap {
-    inner: Arc<dyn PathExchange>,
-    frames: Arc<Mutex<Vec<PathFrame>>>,
+pub(super) struct Tap {
+    pub(super) inner: Arc<dyn PathExchange>,
+    pub(super) frames: Arc<Mutex<Vec<PathFrame>>>,
 }
 
 impl PathExchange for Tap {
@@ -103,6 +103,9 @@ struct Opts {
     machines: Machines,
     punch: Duration,
     backend: fn() -> TestBackend,
+    /// Both halves in internet scope ([`ViewerDirect::with_internet`],
+    /// [`DirectHost::with_internet`]).
+    internet: bool,
 }
 
 impl Opts {
@@ -119,6 +122,7 @@ impl Opts {
             machines: on_the_lan(MachineSpec::default()),
             punch: PUNCH,
             backend: TestBackend::default,
+            internet: false,
         }
     }
 }
@@ -254,15 +258,18 @@ async fn fixture(opts: &Opts) -> Fx {
     let host_env = CountingEnv::new(net.machine(host_spec));
     let host_key = key(opts.host);
     let direct = (opts.half == HostHalf::Direct).then(|| {
-        Arc::new(DirectHost::new(
-            rig.host.clone(),
-            None,
-            Arc::clone(&host_key),
-            DirectSettings::default(),
-            host_env.clone(),
-            deps.kill.clone(),
-            Arc::new(|_: &MediaOutcome| {}),
-        ))
+        Arc::new(
+            DirectHost::new(
+                rig.host.clone(),
+                None,
+                Arc::clone(&host_key),
+                DirectSettings::default(),
+                host_env.clone(),
+                deps.kill.clone(),
+                Arc::new(|_: &MediaOutcome| {}),
+            )
+            .with_internet(opts.internet),
+        )
     });
     let inner: Arc<dyn PathExchange> = match &direct {
         Some(direct) => direct.clone(),
@@ -313,7 +320,8 @@ async fn fixture(opts: &Opts) -> Fx {
         key(opts.link_key.unwrap_or(opts.viewer)),
         settings,
         viewer_env.clone(),
-    );
+    )
+    .with_internet(opts.internet);
     assert!(log.viewer.set(viewer.clone()).is_ok());
     Fx {
         session,
@@ -835,7 +843,10 @@ struct Cell {
 /// both FSMs with `DirectHost` (§5.2 rule 3, §12.3 "each decision-table
 /// cell with its exact frames and `CountingEnv` counts"): the one frame the
 /// viewer writes at the accept, or none, and not one network call on
-/// either side, then or 20 s later.
+/// either side, then or 20 s later. Each cell runs in same-site scope and
+/// again with both halves in internet scope (§12.4 "`tor_only` or bridged,
+/// either side → zero `NetEnv` calls on that side; the decision-table
+/// frames").
 #[tokio::test(start_paused = true)]
 async fn each_decision_cell_writes_its_frame_and_touches_no_network() {
     let [viewer, _, host] = keys_by_order();
@@ -851,125 +862,130 @@ async fn each_decision_cell_writes_its_frame_and_touches_no_network() {
         same_device,
         old_host,
     };
-    let cells = [
-        (
-            cell(ANY, Mine::of(TOR), true, false, false),
-            PathEnd::Tor(TorWhy::HereOff),
-            off(fallback::OFF),
-        ),
-        (
-            cell(ANY, bridged, true, false, false),
-            PathEnd::Tor(TorWhy::Bridge),
-            off(fallback::OFF),
-        ),
-        (
-            cell(TOR, Mine::of(ANY), true, false, false),
-            PathEnd::Tor(TorWhy::HostPolicy),
-            off(fallback::PEER_OFF),
-        ),
-        (
-            cell(TOR, Mine::of(TOR), true, false, false),
-            PathEnd::Tor(TorWhy::HostPolicy),
-            off(fallback::OFF),
-        ),
-        (
-            cell(TOR, Mine::of(LAN), true, false, false),
-            PathEnd::LanRefused,
-            vec![],
-        ),
-        (
-            cell(LAN, Mine::of(TOR), true, false, false),
-            PathEnd::LanRefused,
-            vec![],
-        ),
-        (
-            cell(ANY, Mine::of(ANY), false, false, false),
-            PathEnd::NoMedia,
-            off(fallback::NO_MEDIA),
-        ),
-        (
-            cell(TOR, Mine::of(LAN), false, false, false),
-            PathEnd::NoMedia,
-            off(fallback::NO_MEDIA),
-        ),
-        (
-            cell(ANY, Mine::of(ANY), true, true, false),
-            PathEnd::Tor(TorWhy::SameDevice),
-            off(fallback::OFF),
-        ),
-        (
-            cell(ANY, Mine::of(LAN), true, true, false),
-            PathEnd::LanRefused,
-            vec![],
-        ),
-        (
-            cell(ANY, Mine::of(ANY), true, false, true),
-            PathEnd::Tor(TorWhy::OldHost),
-            vec![PathFrame::TorFallback(None)],
-        ),
-        (
-            cell(ANY, Mine::of(LAN), true, false, true),
-            PathEnd::LanRefused,
-            vec![],
-        ),
-        // A host that signed `lan_only` refuses Tor media as a `lan_only`
-        // viewer does (decision M1-85): its old build or this same device
-        // ends the session with nothing written, not with an onion `Bind`
-        // the host would refuse.
-        (
-            cell(LAN, Mine::of(ANY), true, true, false),
-            PathEnd::LanRefused,
-            vec![],
-        ),
-        (
-            cell(LAN, Mine::of(ANY), true, false, true),
-            PathEnd::LanRefused,
-            vec![],
-        ),
-    ];
-    for (
-        Cell {
-            host_policy,
-            mine,
-            media,
-            same_device,
-            old_host,
-        },
-        want,
-        frames,
-    ) in cells
-    {
-        let cell =
-            format!("{host_policy:?} {mine:?} media {media} same {same_device} old {old_host}");
-        let mut opts = Opts::new(if same_device { host } else { viewer }, host);
-        opts.host_policy = host_policy;
-        opts.host_dir1 = !old_host;
-        let mut fx = fixture(&opts).await;
-        let choice = fx.choose(mine, media).await;
-        assert_eq!(choice.path_end(), Some(want), "{cell}");
-        if let PathChoice::Tor { elapsed, .. } = choice {
-            assert_eq!(elapsed, Duration::ZERO, "{cell}");
-        }
-        assert_eq!(fx.frames(frames.len()).await, frames, "{cell}");
-        fx.no_network_call(&cell);
-        // The caller ends a refused session at once; any other goes on, and
-        // its path still makes no call later.
-        let reason = if want == PathEnd::LanRefused {
-            bye::NO_LAN_PATH
-        } else {
-            tokio::time::sleep(HOST_DIRECT_LINGER).await;
-            assert_eq!(fx.frames(0).await, frames, "{cell}");
+    for internet in [false, true] {
+        let cells = [
+            (
+                cell(ANY, Mine::of(TOR), true, false, false),
+                PathEnd::Tor(TorWhy::HereOff),
+                off(fallback::OFF),
+            ),
+            (
+                cell(ANY, bridged, true, false, false),
+                PathEnd::Tor(TorWhy::Bridge),
+                off(fallback::OFF),
+            ),
+            (
+                cell(TOR, Mine::of(ANY), true, false, false),
+                PathEnd::Tor(TorWhy::HostPolicy),
+                off(fallback::PEER_OFF),
+            ),
+            (
+                cell(TOR, Mine::of(TOR), true, false, false),
+                PathEnd::Tor(TorWhy::HostPolicy),
+                off(fallback::OFF),
+            ),
+            (
+                cell(TOR, Mine::of(LAN), true, false, false),
+                PathEnd::LanRefused,
+                vec![],
+            ),
+            (
+                cell(LAN, Mine::of(TOR), true, false, false),
+                PathEnd::LanRefused,
+                vec![],
+            ),
+            (
+                cell(ANY, Mine::of(ANY), false, false, false),
+                PathEnd::NoMedia,
+                off(fallback::NO_MEDIA),
+            ),
+            (
+                cell(TOR, Mine::of(LAN), false, false, false),
+                PathEnd::NoMedia,
+                off(fallback::NO_MEDIA),
+            ),
+            (
+                cell(ANY, Mine::of(ANY), true, true, false),
+                PathEnd::Tor(TorWhy::SameDevice),
+                off(fallback::OFF),
+            ),
+            (
+                cell(ANY, Mine::of(LAN), true, true, false),
+                PathEnd::LanRefused,
+                vec![],
+            ),
+            (
+                cell(ANY, Mine::of(ANY), true, false, true),
+                PathEnd::Tor(TorWhy::OldHost),
+                vec![PathFrame::TorFallback(None)],
+            ),
+            (
+                cell(ANY, Mine::of(LAN), true, false, true),
+                PathEnd::LanRefused,
+                vec![],
+            ),
+            // A host that signed `lan_only` refuses Tor media as a `lan_only`
+            // viewer does (decision M1-85): its old build or this same device
+            // ends the session with nothing written, not with an onion `Bind`
+            // the host would refuse.
+            (
+                cell(LAN, Mine::of(ANY), true, true, false),
+                PathEnd::LanRefused,
+                vec![],
+            ),
+            (
+                cell(LAN, Mine::of(ANY), true, false, true),
+                PathEnd::LanRefused,
+                vec![],
+            ),
+        ];
+        for (
+            Cell {
+                host_policy,
+                mine,
+                media,
+                same_device,
+                old_host,
+            },
+            want,
+            frames,
+        ) in cells
+        {
+            let cell = format!(
+                "{host_policy:?} {mine:?} media {media} same {same_device} old {old_host} \
+             internet {internet}"
+            );
+            let mut opts = Opts::new(if same_device { host } else { viewer }, host);
+            opts.internet = internet;
+            opts.host_policy = host_policy;
+            opts.host_dir1 = !old_host;
+            let mut fx = fixture(&opts).await;
+            let choice = fx.choose(mine, media).await;
+            assert_eq!(choice.path_end(), Some(want), "{cell}");
+            if let PathChoice::Tor { elapsed, .. } = choice {
+                assert_eq!(elapsed, Duration::ZERO, "{cell}");
+            }
+            assert_eq!(fx.frames(frames.len()).await, frames, "{cell}");
             fx.no_network_call(&cell);
-            bye::USER
-        };
-        assert_eq!(fx.viewer.stats(), ViewerDirectStats::default(), "{cell}");
-        // A `lan_only` host ends its own device's session itself (step A16).
-        let (transport, _) = if host_policy == LAN && same_device {
-            fx.host_ended(bye::NO_LAN_PATH).await
-        } else {
-            fx.end(reason).await
-        };
-        assert_eq!(transport, None, "{cell}");
+            // The caller ends a refused session at once; any other goes on, and
+            // its path still makes no call later.
+            let reason = if want == PathEnd::LanRefused {
+                bye::NO_LAN_PATH
+            } else {
+                tokio::time::sleep(HOST_DIRECT_LINGER).await;
+                assert_eq!(fx.frames(0).await, frames, "{cell}");
+                fx.no_network_call(&cell);
+                bye::USER
+            };
+            assert_eq!(fx.viewer.stats(), ViewerDirectStats::default(), "{cell}");
+            // A `lan_only` host ends its own device's session itself (step A16).
+            let (transport, _) = if host_policy == LAN && same_device {
+                fx.host_ended(bye::NO_LAN_PATH).await
+            } else {
+                fx.end(reason).await
+            };
+            assert_eq!(transport, None, "{cell}");
+        }
     }
 }
 

@@ -69,6 +69,9 @@ pub struct DirectHost {
     kill: KillSwitch,
     on_media: OnMedia,
     shared: Arc<Shared>,
+    /// Internet scope may be offered: [`INTERNET_DIRECT`], or a test's
+    /// choice ([`DirectHost::with_internet`]).
+    internet: bool,
 }
 
 /// The direct host's counters: counts only, never an address.
@@ -229,7 +232,18 @@ impl DirectHost {
             kill,
             on_media,
             shared: Arc::default(),
+            internet: INTERNET_DIRECT,
         }
+    }
+
+    /// The same host with internet scope on or off, whatever
+    /// [`INTERNET_DIRECT`] says: the NAT matrix (the direct design §12.4)
+    /// runs in internet scope before step B12 turns it on.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_internet(mut self, on: bool) -> Self {
+        self.internet = on;
+        self
     }
 
     /// The counters.
@@ -328,6 +342,7 @@ impl PathExchange for DirectHost {
             token: Zeroizing::new(*session.token.bytes()),
             lan_only,
             policy: session.transport,
+            internet: self.internet,
             media: Arc::clone(&self.media),
             second: self.second.clone(),
             identity: Arc::clone(&self.identity),
@@ -395,6 +410,8 @@ struct Task {
     token: Zeroizing<[u8; 32]>,
     lan_only: bool,
     policy: TransportPolicy,
+    /// Internet scope may be offered (the direct host's `internet`).
+    internet: bool,
     media: Arc<MediaHost>,
     second: Option<Arc<dyn SecondStream>>,
     identity: Arc<DeviceIdentity>,
@@ -523,7 +540,7 @@ impl Task {
     async fn start(&mut self, first: &messages::Candidates) {
         self.may_bind = false;
         let (remote, viewer_scope) = from_wire(first);
-        let own = if INTERNET_DIRECT && self.policy == TransportPolicy::Any {
+        let own = if self.internet && self.policy == TransportPolicy::Any {
             Scope::Internet
         } else {
             Scope::SameSite

@@ -5,7 +5,7 @@
 //!
 //! The rules it keeps, each pinned by a test in `tests/direct_path.rs`:
 //!
-//! - the decision comes from the accept alone ([`decide`]): no media, an
+//! - the decision comes from the accept alone ([`decide`](super::decide::decide)): no media, an
 //!   old host, this same device and every `tor_only` cell send their
 //!   `TOR_FALLBACK` with no call to the network at all, and a `lan_only`
 //!   session that can have no same-site path ends with nothing revealed;
@@ -60,8 +60,8 @@ use tornect_signal::fsm::host::MAX_PATH_CANDIDATES;
 use tornect_signal::messages::{bye, fallback, feats};
 use zeroize::Zeroizing;
 
-use super::decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide};
-use super::{AfterBind, DirectSettings, after_bind_close, from_wire, to_wire};
+use super::decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide_with};
+use super::{AfterBind, DirectSettings, INTERNET_DIRECT, after_bind_close, from_wire, to_wire};
 use crate::{Binding, MediaViewer, ViewerError};
 
 /// The quinn priority of the media stream (the direct design §6.7: media
@@ -77,6 +77,9 @@ pub struct ViewerDirect {
     settings: DirectSettings,
     env: Arc<dyn NetEnv>,
     counters: Arc<Counters>,
+    /// Internet scope may be tried: [`INTERNET_DIRECT`], or a test's
+    /// choice ([`ViewerDirect::with_internet`]).
+    internet: bool,
 }
 
 /// The direct viewer's counters: counts only, never an address.
@@ -326,7 +329,18 @@ impl ViewerDirect {
             settings,
             env,
             counters: Arc::default(),
+            internet: INTERNET_DIRECT,
         }
+    }
+
+    /// The same viewer with internet scope on or off, whatever
+    /// [`INTERNET_DIRECT`] says: the NAT matrix (the direct design §12.4)
+    /// runs in internet scope before step B12 turns it on.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_internet(mut self, on: bool) -> Self {
+        self.internet = on;
+        self
     }
 
     /// The counters.
@@ -350,7 +364,7 @@ impl ViewerDirect {
     /// `mine` is this computer's effective policy ([`Mine::from_knob`], or
     /// `tor_only` for `--tor-only`), `media` whether the session carries
     /// media. The host's policy is the one its accept signed (verified by
-    /// `connect`, which refuses an unknown code). [`decide`] picks what to
+    /// `connect`, which refuses an unknown code). [`decide`](super::decide::decide) picks what to
     /// do; then:
     ///
     /// - a Tor decision writes its `TOR_FALLBACK` (`TOR_FALLBACK{}` to an
@@ -380,7 +394,8 @@ impl ViewerDirect {
         let accepted = Instant::now();
         let mut stop = std::pin::pin!(interrupted);
         let own_pk = self.identity.verifying_key().to_bytes();
-        let decision = decide(
+        let decision = decide_with(
+            self.internet,
             session.transport_policy(),
             mine,
             media,
