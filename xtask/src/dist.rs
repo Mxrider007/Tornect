@@ -1629,4 +1629,95 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             );
         }
     }
+
+    /// The text of `const NAME: &str = "…";` in Rust source: the literal
+    /// with its line continuations (a backslash, the line break and the
+    /// next line's leading white space) removed and `\"` read as `"`.
+    fn str_const(src: &str, name: &str) -> String {
+        let decl = format!("const {name}: &str = \"");
+        let start = src.find(&decl).unwrap_or_else(|| panic!("no `{name}`")) + decl.len();
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\";")
+            .unwrap_or_else(|| panic!("`{name}` never ends"))];
+        let mut text = String::new();
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            match (c, chars.next_if(|_| c == '\\')) {
+                ('\\', Some('\n')) => while chars.next_if(|c| c.is_whitespace()).is_some() {},
+                ('\\', Some(escaped)) => text.push(escaped),
+                (c, _) => text.push(c),
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn str_const_reads_a_continued_literal() {
+        let src = "pub(in x) const A: &str = \"one \\\n          two \\\"q\\\"\";\n";
+        assert_eq!(str_const(src, "A"), "one two \"q\"");
+    }
+
+    /// The release README's "Direct connections" names the switches this
+    /// build draws (design `direct` §3.3; the review of steps B12 and B13):
+    /// the words are read from the window's source and the scope from
+    /// `INTERNET_DIRECT`, so neither can change without the README.
+    #[test]
+    fn the_release_readme_names_this_builds_direct_switches() {
+        let root = crate::workspace_root().unwrap();
+        let readme = fs::read_to_string(root.join(README)).unwrap();
+        let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+        let direct = fs::read_to_string(root.join("crates/tornect-session/src/direct.rs")).unwrap();
+        let internet = if direct.contains("pub const INTERNET_DIRECT: bool = true;") {
+            true
+        } else {
+            assert!(
+                direct.contains("pub const INTERNET_DIRECT: bool = false;"),
+                "INTERNET_DIRECT's value is not found"
+            );
+            false
+        };
+        let page =
+            fs::read_to_string(root.join("apps/tornect/src/ui/pages/settings/connection.rs"))
+                .unwrap();
+        let (this, other) = if internet {
+            ("DIRECT_SWITCH_INTERNET", "DIRECT_SWITCH_LAN")
+        } else {
+            ("DIRECT_SWITCH_LAN", "DIRECT_SWITCH_INTERNET")
+        };
+        let mut needed = vec![str_const(&page, this)];
+        if internet {
+            needed.extend(["STUN_SWITCH", "ROUTER_SWITCH"].map(|name| str_const(&page, name)));
+            needed.extend(
+                [
+                    "ROUTE direct internet",
+                    "stun_servers",
+                    "direct_with_bridges",
+                    "--tor-only",
+                    "lan_only",
+                    "paranoid = true",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        for needle in &needed {
+            assert!(
+                readme.contains(needle.as_str()),
+                "README-release.md lacks `{needle}`"
+            );
+        }
+        // The other build's switch: its words before the parenthesis.
+        let other = str_const(&page, other);
+        let other = other.split(" (").next().unwrap_or(&other);
+        assert!(
+            !readme.contains(other),
+            "README-release.md names `{other}`, a switch this build does not draw"
+        );
+        if internet {
+            assert!(
+                !readme.contains("every session still goes over Tor"),
+                "README-release.md says internet sessions stay on Tor"
+            );
+        }
+    }
 }
