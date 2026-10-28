@@ -65,11 +65,13 @@ struct Cli {
     home: Option<PathBuf>,
 
     /// Log filter, e.g. `debug` or `tornect_signal=trace` (env: TORNECT_LOG).
-    /// Under every filter the fields of a log line that name a device, a
-    /// person or a computer read `<redacted>`; `--log-identifiers` writes
-    /// them. Message and error texts are written as they are: they can quote
-    /// a path, or a line of a file that holds a Tornect ID. With --json-logs,
-    /// warnings and errors are written in full.
+    /// Without one, a release build writes warnings and errors only; for a
+    /// bug report, run with `--log debug`. Under every filter the fields of
+    /// a log line that name a device, a person or a computer read
+    /// `<redacted>`; `--log-identifiers` writes them. Message and error
+    /// texts are written as they are: they can quote a path, or a line of a
+    /// file that holds a Tornect ID. With --json-logs, warnings and errors
+    /// are written in full.
     #[arg(long, global = true, value_name = "FILTER")]
     log: Option<String>,
 
@@ -1679,6 +1681,9 @@ mod tests {
              left out unless --log-identifiers is given; warnings and errors are written in full",
             "--log-identifiers",
             "TORNECT_LOG_IDENTIFIERS=1",
+            // The final audit before the release: a release build's default.
+            "Without one, a release build writes warnings and errors only; for a bug report, \
+             run with `--log debug`",
         ] {
             assert!(help.contains(said), "\"{said}\" missing:\n{help}");
         }

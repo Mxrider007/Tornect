@@ -12,13 +12,34 @@ use tracing_subscriber::{
 
 use crate::error::Result;
 
-/// Default filter when neither `TORNECT_LOG` nor `RUST_LOG` is set.
+/// The development filter: the default of a debug build when neither
+/// `TORNECT_LOG`, `RUST_LOG` nor `--log` names one ([`default_filter`]),
+/// and always the file layer's.
 ///
 /// `zbus::proxy=error`: zbus warns five times at every Wayland portal start
 /// that it could not cache the properties of the portal's request objects,
 /// which is harmless and lands on the host's consent terminal.
 pub const DEFAULT_FILTER: &str = "info,tornect=debug,tornect_core=debug,tornect_signal=debug,\
 tornect_net=debug,tornect_proto=debug,tornect_session=debug,arti=warn,tor=warn,zbus::proxy=error";
+
+/// The default of a release build: warnings and errors only, so the lines
+/// `tornect host`, `connect` and `tor-check` print, and the questions they
+/// ask on the same terminal, are not lost among timestamped debug lines.
+/// `--log debug` brings the development detail back for a bug report.
+/// `zbus::proxy=error` as in [`DEFAULT_FILTER`].
+pub const RELEASE_DEFAULT_FILTER: &str = "warn,zbus::proxy=error";
+
+/// The filter used when neither `TORNECT_LOG`, `RUST_LOG` nor `--log` names
+/// one: [`DEFAULT_FILTER`] in a debug build, [`RELEASE_DEFAULT_FILTER`] in a
+/// release build.
+#[must_use]
+pub fn default_filter() -> &'static str {
+    if cfg!(debug_assertions) {
+        DEFAULT_FILTER
+    } else {
+        RELEASE_DEFAULT_FILTER
+    }
+}
 
 /// The fields whose values name a person, a device or a computer: a peer's
 /// fingerprint or key, a pinned label or declared name, a Tornect ID or its
@@ -137,7 +158,8 @@ fn names_nobody(meta: &tracing::Metadata<'_>) -> bool {
 /// Logging options.
 #[derive(Debug, Clone, Default)]
 pub struct LogOptions {
-    /// Filter directive (same syntax as `RUST_LOG`); `None` = env or [`DEFAULT_FILTER`].
+    /// Filter directive (same syntax as `RUST_LOG`); `None` = env or
+    /// [`default_filter`].
     pub filter: Option<String>,
     /// If set, also write daily-rotated `tornect.log` files into this directory.
     pub file_dir: Option<PathBuf>,
@@ -172,7 +194,7 @@ pub fn init(opts: LogOptions) -> Result<LogGuard> {
 
 /// What [`init`] installs, its lines written through `stderr` and the
 /// environment read through `env`: the filter (`TORNECT_LOG`, else
-/// `RUST_LOG`, else [`LogOptions::filter`], else [`DEFAULT_FILTER`]; an
+/// `RUST_LOG`, else [`LogOptions::filter`], else [`default_filter`]; an
 /// invalid one counts as unset) decides which events are written, never
 /// whether they name anyone: that takes [`LogOptions::identifiers`] or
 /// [`IDENTIFIERS_ENV`] = `1` (U3-L3). Without it, every stderr layer also
@@ -192,7 +214,7 @@ where
         .or(opts.filter)
         .filter(|f| EnvFilter::try_new(f).is_ok());
     let redact = !(opts.identifiers || env(IDENTIFIERS_ENV).as_deref() == Some("1"));
-    let filter = chosen.map_or_else(|| EnvFilter::new(DEFAULT_FILTER), EnvFilter::new);
+    let filter = chosen.map_or_else(|| EnvFilter::new(default_filter()), EnvFilter::new);
 
     let text_layer = (!opts.json && !redact).then(|| {
         tracing_subscriber::fmt::layer()
@@ -269,8 +291,11 @@ mod tests {
     /// The Wayland portal's zbus proxies print "Failed to populate properties
     /// cache via GetAll" (zbus 5.19, `src/proxy/mod.rs`, the only `warn!` of
     /// target `zbus::proxy`) five times at every portal start, onto the host's
-    /// consent terminal. The default filter drops that target's warnings and
-    /// keeps every other zbus warning, and our own debug lines.
+    /// consent terminal. Both defaults drop that target's warnings and keep
+    /// every other zbus warning; the development filter also keeps our own
+    /// debug lines, the release one (final audit before the release) only
+    /// our warnings, so the CLI's own lines and questions are not lost among
+    /// log lines.
     #[test]
     fn the_default_filter_drops_only_the_zbus_proxy_cache_warning() {
         use std::sync::{Arc, Mutex};
@@ -288,18 +313,42 @@ mod tests {
             }
         }
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry()
-            .with(EnvFilter::new(DEFAULT_FILTER))
-            .with(Seen(Arc::clone(&seen)));
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(target: "zbus::proxy", "Failed to populate properties cache via GetAll");
-            tracing::warn!(target: "zbus::connection", "a connection warning");
-            tracing::debug!(target: "tornect_session::host", "ours");
-        });
+        for (filter, kept) in [
+            (
+                DEFAULT_FILTER,
+                &[
+                    "zbus::connection",
+                    "tornect_session::host",
+                    "tornect_signal::tor::node",
+                    "tornect_signal::tor::node",
+                ][..],
+            ),
+            (
+                RELEASE_DEFAULT_FILTER,
+                &["zbus::connection", "tornect_signal::tor::node"][..],
+            ),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new(filter))
+                .with(Seen(Arc::clone(&seen)));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(target: "zbus::proxy", "Failed to populate properties cache via GetAll");
+                tracing::warn!(target: "zbus::connection", "a connection warning");
+                tracing::debug!(target: "tornect_session::host", "ours");
+                tracing::info!(target: "tornect_signal::tor::node", "Tor client created");
+                tracing::warn!(target: "tornect_signal::tor::node", "a warning of ours");
+            });
+            assert_eq!(*seen.lock().unwrap(), kept, "{filter}");
+        }
+        // Tests build with debug assertions: the development filter.
         assert_eq!(
-            *seen.lock().unwrap(),
-            ["zbus::connection", "tornect_session::host"]
+            default_filter(),
+            if cfg!(debug_assertions) {
+                DEFAULT_FILTER
+            } else {
+                RELEASE_DEFAULT_FILTER
+            }
         );
     }
 
