@@ -13,8 +13,11 @@ words (the threat model included), C2 reviewed the whole feature's security and 
 defect (the C1 and C2 entries at the end of "OPEN, owned by Phase B steps"); the review of C1 and
 C2 corrected the live demos' expected lines for two instances on one VM, which never go direct on
 the site (decision M1-82 item 11). The feature's final review (security and correctness) found three
-minor defects, fixed in `0ac8dd03`, `625aabdc` and `03cbfc95` (the last entry of "OPEN, owned by
-Phase B steps"). What is left before `m2` is the owner's: the three blockers below, then the tag.
+minor defects, fixed in `0ac8dd03`, `625aabdc` and `03cbfc95` (the last entry but one of "OPEN,
+owned by Phase B steps"). The closing pass (the whole workspace's gates and a ledger audit against
+the design's acceptance items) fixed one more gap, the second unique-local address offered but never
+usable (`6b7d91e3`), and corrected eleven stale ledger statuses (the last entry). What is left
+before `m2` is the owner's: the three blockers below, then the tag.
 
 ## Blockers: no release zip to users, no `m2` tag
 
@@ -166,7 +169,9 @@ and the crates below ring check here).
   cache-first and `RealNet::prefetch`, fake STUN servers on loopback. Done at B6 (below): what was
   left for B6: the link's gathering task reading `tees.stun` and calling `ask_stun` with this role's
   part, `stun_base` combined with the scope, `enable_stun` and the mapping's head start, the
-  `DirectParams`/`DirectOptions` STUN fields, and the second ULA design gap. Left for B11/B12: the
+  `DirectParams`/`DirectOptions` STUN fields (the second ULA design gap was listed here as well,
+  but B6 did not take it up: settled at the feature's close, `6b7d91e3`, one ULA offered). Left
+  for B11/B12: the
   app's `RealNet::prefetch` call, with a list that is empty whenever STUN may not run (design
   §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged); B11 wired it (`856e101a`,
   `RouterPorts::follow_stun`), B12 turns the list on.
@@ -404,6 +409,18 @@ and the crates below ring check here).
   `local::remote_filter` takes `Option<RouteLookup>` in place of the `vpn` flag), so a split
   tunnel's excluded prefix gets nothing. The reviewers' alternative of recording residuals was
   not taken for any of the three.
+- The closing pass (2026-10-28; ledger section "Direct connections, closing the feature"): the
+  whole workspace's gates on `f7c52ef2` and again on the final code (`cargo xtask verify`, which
+  stops at the app's tests under root by design; `cargo test --workspace --no-fail-fast`; the
+  app's tests as `tester`, 880 passed; `cargo doc` with `-D warnings`; the Windows cross-clippy of
+  the whole workspace), all green. The audit against the design's acceptance items found: (1) the
+  step A12 gap of the second unique-local address, which B6 never took up although the B3 entry
+  above listed it as B6's: fixed in `6b7d91e3` (one ULA offered, `local::MAX_ULA` = 1, a deviation
+  from design §7.1's two; `link::tests::offered`; decision M1-78 item (2)); (2) eleven ledger rows
+  still OPEN on steps that had run (statuses corrected, evidence unchanged); (3) no
+  `docs/DEPENDENCIES.md` row for the fuzz manifest's `tornect-net` path dependency (added).
+  Nothing else is left that this container can run: the list is the ledger row "What of design
+  `direct` is still not done".
 
 ## Gotchas found at this checkpoint
 
@@ -457,3 +474,8 @@ and the crates below ring check here).
   aliases for them too.
 - `pkill -f <pattern>` with a pattern from the running command line also kills the shell that runs
   it: stop a hung test binary by its PID.
+- `cargo test -p <crate>` resolves features for that package alone (no `test-support` from the
+  other crates' dev-dependencies, Arti's features unified differently), so it builds its own copy
+  of the crate and of what sits below it beside the workspace's: on this container's disk each
+  such run costs about 1 GB. Run the workspace's tests for the record, and delete a per-package
+  test binary (`target/debug/deps/<crate>-<hash>`) once its run is pasted.
