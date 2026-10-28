@@ -103,6 +103,11 @@ pub struct General {
     pub autostart: bool,
     /// The window's colours (the settings page's General section).
     pub theme: Theme,
+    /// The window has shown its one-time notice that direct connections
+    /// are on (design `direct` §3.6) and its OK was pressed. A saved
+    /// `network.paranoid = false` cannot be told apart from a deliberate
+    /// choice, so the notice asks once, then never again.
+    pub direct_notice_seen: bool,
 }
 
 /// The window's colours (`[general] theme = "…"`).
@@ -312,15 +317,24 @@ pub struct Network {
     /// no server is asked and no name is resolved; only router mapping and
     /// this computer's own addresses remain.
     pub enable_stun: bool,
-    /// Try UPnP-IGD port mapping.
+    /// Try UPnP-IGD port mapping. The Settings router switch ("Ask this
+    /// network's router to open a port") shows on only while `upnp`,
+    /// `nat_pmp` and `pcp` are all on, and sets all three.
     pub upnp: bool,
-    /// Try NAT-PMP port mapping.
+    /// Try NAT-PMP port mapping (the router switch, with `upnp` and `pcp`).
     pub nat_pmp: bool,
-    /// Try PCP port mapping.
+    /// Try PCP port mapping (the router switch, with `upnp` and `nat_pmp`).
     pub pcp: bool,
-    /// Only accept/offer LAN candidates (no STUN, no Tor fallback for media).
+    /// Direct connections on this network only, in both roles (decisions
+    /// M1-79 and M1-85): this computer offers and admits same-site
+    /// candidates only (its on-link RFC 1918 prefixes and its own ULA /48),
+    /// never asks a STUN server or the router, and a session that finds no
+    /// direct path ends instead of relaying its media through Tor. Config
+    /// only; it cannot be set together with `paranoid`.
     pub lan_only: bool,
-    /// Paranoid mode: media always relayed through Tor; peers never learn IPs.
+    /// Every session's media relayed through Tor; the computers this one
+    /// meets never learn its addresses. The Settings switch "Allow direct
+    /// connections" is its opposite.
     pub paranoid: bool,
     /// How long the viewer tries the direct path, from the host's accept,
     /// before relaying the session's media through Tor (`docs/PLAN.md` §B.2:
@@ -482,6 +496,7 @@ impl Default for General {
             device_name: default_device_name(),
             autostart: false,
             theme: Theme::Dark,
+            direct_notice_seen: false,
         }
     }
 }
@@ -829,6 +844,23 @@ future_key = "ignored"
         assert!(text.contains("direct_with_bridges = true"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, set);
+    }
+
+    /// Design `direct` §3.6: the one-time notice is unseen unless a file
+    /// says it was seen, an older file without the key reads as unseen
+    /// (an upgrade is asked once), and the key round-trips.
+    #[test]
+    fn the_direct_notice_is_unseen_until_the_file_says_seen() {
+        assert!(!Config::default().general.direct_notice_seen);
+        let old: Config = toml::from_str("[general]\ndevice_name = \"Desk\"\n").unwrap();
+        assert!(!old.general.direct_notice_seen);
+        let seen: Config = toml::from_str("[general]\ndirect_notice_seen = true\n").unwrap();
+        assert!(seen.general.direct_notice_seen);
+        seen.validate().unwrap();
+        let text = toml::to_string_pretty(&seen).unwrap();
+        assert!(text.contains("direct_notice_seen = true"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, seen);
     }
 
     /// A8 (§B.8.15): policy never lives in `config.toml` — an `[unattended]` table is
