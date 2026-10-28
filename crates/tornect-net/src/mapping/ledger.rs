@@ -185,6 +185,12 @@ pub fn encode_list(entries: &[LedgerEntry]) -> Vec<u8> {
 /// What a list holds: the entries this code can act on, and how many it
 /// dropped (malformed, an unknown protocol, beyond [`MAX_LEDGER_ENTRIES`]).
 /// Bytes that are not a CBOR array at all give no entry and one drop.
+///
+/// The work is bounded by the bytes, never by the array length the header
+/// declares (any `u64`): each round reads at least one byte or ends the
+/// read, and a full list stops reading. What a full list leaves unread
+/// counts as one drop per element declared, but never more than one per
+/// byte left (every element takes one), and at least one.
 #[must_use]
 pub fn decode_list(bytes: &[u8]) -> (Vec<LedgerEntry>, usize) {
     let mut d = Decoder::new(bytes);
@@ -193,10 +199,13 @@ pub fn decode_list(bytes: &[u8]) -> (Vec<LedgerEntry>, usize) {
     };
     let mut entries = Vec::new();
     let mut dropped = 0_usize;
-    for _ in 0..len {
+    for read in 0..len {
         if entries.len() == MAX_LEDGER_ENTRIES {
-            dropped += 1;
-            continue;
+            let declared = len - read;
+            let bytes_left = bytes.len().saturating_sub(d.position()) as u64;
+            let rest = declared.min(bytes_left).max(1);
+            dropped += usize::try_from(rest).unwrap_or(usize::MAX);
+            break;
         }
         let at = d.position();
         match d.decode::<WireEntry>() {
@@ -721,6 +730,97 @@ mod tests {
         assert_eq!(dropped, 3);
     }
 
+    /// The bytes of a full list (`MAX_LEDGER_ENTRIES` good entries) whose
+    /// header declares `declared` elements, then `tail`.
+    fn full_list_declaring(declared: u64, tail: &[u8]) -> Vec<u8> {
+        let full: Vec<LedgerEntry> = (0..MAX_LEDGER_ENTRIES as u64).map(natpmp_entry).collect();
+        let bytes = encode_list(&full);
+        // `encode_list` writes 64 as the two-byte head 0x98 0x40.
+        assert_eq!(&bytes[..2], [0x98, 0x40]);
+        let mut out = vec![0x9B];
+        out.extend_from_slice(&declared.to_be_bytes());
+        out.extend_from_slice(&bytes[2..]);
+        out.extend_from_slice(tail);
+        out
+    }
+
+    /// A header is untrusted: a full list that declares 2^64 - 1 elements
+    /// is read up to the bound and stops there, at once, rather than
+    /// counting each declared element (a sweep on the blocking pool that
+    /// never ended, and `doctor` with it). What it leaves unread counts no
+    /// more drops than it has bytes left, and at least one.
+    #[test]
+    fn a_huge_declared_length_stops_at_the_bound() {
+        let started = std::time::Instant::now();
+        let bare = full_list_declaring(u64::MAX, &[]);
+        assert_eq!(decode_list(&bare).0.len(), MAX_LEDGER_ENTRIES);
+        assert_eq!(decode_list(&bare).1, 1);
+        let tail = [0x01; 100];
+        let (entries, dropped) = decode_list(&full_list_declaring(u64::MAX, &tail));
+        assert_eq!(entries.len(), MAX_LEDGER_ENTRIES);
+        assert_eq!(dropped, tail.len());
+        let (entries, dropped) = decode_list(&full_list_declaring(1 << 32, &tail));
+        assert_eq!(entries.len(), MAX_LEDGER_ENTRIES);
+        assert_eq!(dropped, tail.len());
+        // A declared length the bytes honour is counted exactly.
+        let (_, dropped) = decode_list(&full_list_declaring(MAX_LEDGER_ENTRIES as u64 + 2, &tail));
+        assert_eq!(dropped, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Corpus policy (decision M1-36): the `ledger` fuzz target's seeds are
+    /// the golden one-entry list, a two-entry list of the other protocols
+    /// and the full list whose header declares 2^64 - 1 elements.
+    #[test]
+    fn the_fuzz_seeds_are_these_lists() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/seeds/ledger");
+        let read = |name: &str| std::fs::read(format!("{dir}/{name}")).expect("a committed seed");
+        let upnp = LedgerEntry {
+            via: MapVia::Upnp,
+            gateway: Ipv4Addr::new(192, 168, 0, 1),
+            client: Ipv4Addr::new(192, 168, 0, 42),
+            internal_port: 52_000,
+            external_port: Some(52_000),
+            pcp_nonce: None,
+            created: 1_700_000_100,
+        };
+        assert_eq!(read("pcp.bin"), encode_list(&[pcp_entry()]));
+        assert_eq!(
+            read("natpmp-upnp.bin"),
+            encode_list(&[natpmp_entry(9), upnp.clone()])
+        );
+        assert_eq!(
+            decode_list(&read("natpmp-upnp.bin")),
+            (vec![natpmp_entry(9), upnp], 0)
+        );
+        assert_eq!(
+            read("full-declaring-max.bin"),
+            full_list_declaring(u64::MAX, &[])
+        );
+    }
+
+    /// The same through the file reader the sweep and `doctor` use.
+    #[test]
+    fn a_leftover_declaring_a_huge_length_is_read_at_once() {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let dir = home.path().to_owned();
+        let owner = "00000000000000dd";
+        std::fs::write(
+            dir.join(format!("{owner}.cbor")),
+            full_list_declaring(u64::MAX, &[]),
+        )
+        .unwrap();
+        assert_eq!(MappingLedger::leftovers(&dir), MAX_LEDGER_ENTRIES);
+        let taken = MappingLedger::new(&dir).take_leftovers();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].entries.len(), MAX_LEDGER_ENTRIES);
+        assert_eq!(taken[0].unreadable, 1);
+    }
+
     fn arb_entry() -> impl Strategy<Value = LedgerEntry> {
         (
             0_u8..3,
@@ -753,12 +853,26 @@ mod tests {
 
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let (entries, _) = decode_list(&bytes);
+            let (entries, dropped) = decode_list(&bytes);
             prop_assert!(entries.len() <= MAX_LEDGER_ENTRIES);
+            prop_assert!(dropped <= bytes.len() + 1);
             for entry in entries {
                 prop_assert!(entry.internal_port != 0);
                 prop_assert!(entry.via != MapVia::Pcp || entry.pcp_nonce.is_some());
             }
+        }
+
+        /// A full list under any declared length, with any tail, is read
+        /// up to the bound and no further.
+        #[test]
+        fn a_full_list_under_any_declared_length_stops_at_the_bound(
+            declared in MAX_LEDGER_ENTRIES as u64..,
+            tail in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let bytes = full_list_declaring(declared, &tail);
+            let (entries, dropped) = decode_list(&bytes);
+            prop_assert_eq!(entries.len(), MAX_LEDGER_ENTRIES);
+            prop_assert!(dropped <= tail.len().max(1));
         }
     }
 

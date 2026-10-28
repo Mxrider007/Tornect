@@ -118,5 +118,15 @@ test = false
 doc = false
 bench = false
 
+# The router-port ledger loader (design `direct` §7.4 "Ledger", decision M1-81,
+# docs/PLAN.md §D.5): `decode_list` over arbitrary bytes, bounded by the input
+# whatever length its header declares; seeds in `seeds/ledger/`.
+[[bin]]
+name = "ledger"
+path = "fuzz_targets/ledger.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
