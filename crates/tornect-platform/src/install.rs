@@ -25,9 +25,14 @@
 //! `mimeapps.list` (`$XDG_CONFIG_HOME`, else `~/.config`): our lines only,
 //! every other byte kept, never through a link, and never over the user's
 //! own removal or another program's default; that step reports
-//! ([`LinkHandler`]) and never fails the install. Uninstalling takes those
-//! lines out again and removes exactly the three files, and only where they
-//! are regular files.
+//! ([`LinkHandler`]) and never fails the install. When the command hands it
+//! the running copy's pinned lyrebird ([`PinnedHelper`], read before the
+//! guard's dialog), it goes to `~/.local/bin/pt/lyrebird`, mode 0755, right
+//! after the executable and the same way, its `pt` folder under the same
+//! location rule: where the installed copy's lyrebird lookup finds it
+//! (`<exe dir>/pt`), never on `PATH`. Uninstalling takes those lines out
+//! again and removes exactly the files written, and only where they are
+//! regular files, and then the `pt` folder where it is empty.
 //!
 //! The folders come from the caller ([`LinuxInstall::new`]) or from `HOME`
 //! ([`LinuxInstall::for_this_user`]), never from Tornect's data directory or
@@ -70,6 +75,50 @@ use crate::helper_task::{Install as HelperInstall, Security, admin_only, guarded
 /// The name the installed program's entries show: the Linux menu entry, and
 /// on Windows the Start-menu entry and Apps and features.
 pub const ENTRY_NAME: &str = "Tornect";
+
+/// The pinned helper program an install puts beside the installed copy:
+/// lyrebird, the bridge helper, without which the installed copy cannot use
+/// obfs4 or Snowflake bridges (the final audit before the release). The
+/// command read `bytes` once from the handle it opened before the guard's
+/// dialog, from where the running copy's own lookup finds lyrebird (never a
+/// configured path or the developers' folder); `sha256` is this build's pin,
+/// lowercase hex. The install compares the two again before it writes
+/// anything ([`PinnedHelper::matches`]).
+#[derive(Clone, Copy)]
+pub struct PinnedHelper<'a> {
+    /// The program's bytes.
+    pub bytes: &'a [u8],
+    /// The SHA-256 the bytes must have, lowercase hex.
+    pub sha256: &'a str,
+}
+
+impl PinnedHelper<'_> {
+    /// Whether the bytes have the pinned SHA-256.
+    #[must_use]
+    pub fn matches(&self) -> bool {
+        sha256_hex(self.bytes) == self.sha256
+    }
+}
+
+/// The SHA-256 of `bytes`, lowercase hex, as a pin is written.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(bytes))
+}
+
+impl std::fmt::Debug for PinnedHelper<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedHelper")
+            .field("len", &self.bytes.len())
+            .field("sha256", &self.sha256)
+            .finish()
+    }
+}
+
+/// Why an install given a helper whose bytes are not its pin wrote nothing.
+pub const HELPER_NOT_PINNED: &str = "The lyrebird to install with Tornect is not the one this \
+     build pins (its SHA-256 differs), so nothing was installed.";
 
 /// Why an install or an uninstall did not happen, or did not finish.
 #[derive(Debug, thiserror::Error)]
@@ -1227,8 +1276,8 @@ pub fn uninstall_from_program_files(
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    Association, FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LinkHandler,
-    LinuxInstall, MENU_ENTRY, MIMEAPPS, Removal,
+    Association, FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LINUX_LYREBIRD,
+    LinkHandler, LinuxInstall, MENU_ENTRY, MIMEAPPS, PT_DIR, Removal,
 };
 
 /// The `mimeapps.list` edit of the Linux install: pure text.
@@ -1243,7 +1292,9 @@ mod linux {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
 
-    use super::{ENTRY_NAME, InstallError, LINK_ARGUMENT, mimeapps};
+    use super::{
+        ENTRY_NAME, HELPER_NOT_PINNED, InstallError, LINK_ARGUMENT, PinnedHelper, mimeapps,
+    };
     use crate::autostart::{
         AutostartError, PathFacts, desktop_exec, desktop_exec_bare, parse_status_ids,
         unix_exe_location_ok,
@@ -1251,6 +1302,15 @@ mod linux {
 
     /// The installed executable's name in the bin folder.
     pub const LINUX_EXE: &str = "tornect";
+
+    /// The folder beside the installed executable that holds lyrebird: the
+    /// release zip's `pt/`, where the installed copy's lyrebird lookup
+    /// (`<exe dir>/pt`) finds it. Never the bin folder itself, which is on
+    /// `PATH`.
+    pub const PT_DIR: &str = "pt";
+
+    /// lyrebird's file name in [`PT_DIR`].
+    pub const LINUX_LYREBIRD: &str = "lyrebird";
 
     /// The menu entry's file name in the applications folder.
     pub const MENU_ENTRY: &str = "tornect.desktop";
@@ -1433,6 +1493,18 @@ mod linux {
             self.bin_dir.join(LINUX_EXE)
         }
 
+        /// The folder of the installed lyrebird.
+        #[must_use]
+        pub fn pt_dir(&self) -> PathBuf {
+            self.bin_dir.join(PT_DIR)
+        }
+
+        /// The installed lyrebird.
+        #[must_use]
+        pub fn lyrebird(&self) -> PathBuf {
+            self.pt_dir().join(LINUX_LYREBIRD)
+        }
+
         /// The menu entry.
         #[must_use]
         pub fn menu_entry(&self) -> PathBuf {
@@ -1510,22 +1582,37 @@ mod linux {
             self.location_ok(nearest_existing(&self.bin_dir))
         }
 
-        /// Copy `source` (this program, read from the handle the command
-        /// opened first) to [`Self::exe`], then write the menu entry, then the
-        /// link entry, then name the link entry for `tornect:` links in
-        /// [`Self::mimeapps`]. Refused before anything is written by
-        /// [`Self::preflight`]'s checks; the bin folder is checked again once
-        /// it exists. A menu entry that cannot be written removes the copy
-        /// again, and a link entry that cannot be written removes the menu
-        /// entry and the copy; a folder this call created and a failure left
-        /// empty is removed too. The `mimeapps.list` step never fails the
-        /// install: what it did is the answer (the rules of `edit_mimeapps`).
+        /// [`Self::install_with`] without lyrebird.
         pub fn install(
             &self,
             source: &mut dyn std::io::Read,
             home: Option<&Path>,
         ) -> Result<LinkHandler, InstallError> {
+            self.install_with(source, None, home)
+        }
+
+        /// Copy `source` (this program, read from the handle the command
+        /// opened first) to [`Self::exe`], then `lyrebird`, when given, to
+        /// [`Self::lyrebird`], then write the menu entry, then the link
+        /// entry, then name the link entry for `tornect:` links in
+        /// [`Self::mimeapps`]. Refused before anything is written by
+        /// [`Self::preflight`]'s checks, and when `lyrebird`'s bytes are not
+        /// its pin ([`HELPER_NOT_PINNED`]); the bin folder and the `pt`
+        /// folder are checked again once they exist. A step that fails
+        /// removes what the steps before it wrote (the copy, lyrebird, the
+        /// menu entry); a folder this call created and a failure left empty
+        /// is removed too. The `mimeapps.list` step never fails the install:
+        /// what it did is the answer (the rules of `edit_mimeapps`).
+        pub fn install_with(
+            &self,
+            source: &mut dyn std::io::Read,
+            lyrebird: Option<PinnedHelper<'_>>,
+            home: Option<&Path>,
+        ) -> Result<LinkHandler, InstallError> {
             self.preflight(home)?;
+            if lyrebird.is_some_and(|helper| !helper.matches()) {
+                return Err(InstallError::Refused(HELPER_NOT_PINNED.to_owned()));
+            }
             let entry = self.menu_entry_text(home)?;
             let link_entry = self.link_entry_text(home)?;
             let mut created = create_dirs(&self.bin_dir, 0o755)?;
@@ -1543,6 +1630,28 @@ mod linux {
                 remove_empty(&created);
                 return Err(e);
             }
+            // What the steps so far wrote, removed again if a later one fails.
+            let mut wrote = vec![self.exe()];
+            if let Some(helper) = lyrebird {
+                let pt = self.pt_dir();
+                let put = create_dirs(&pt, 0o755).and_then(|dirs| {
+                    created.extend(dirs);
+                    self.location_ok(&pt)?;
+                    write_new(
+                        &pt,
+                        LINUX_LYREBIRD,
+                        0o755,
+                        &mut |f| f.write_all(helper.bytes),
+                        &|| true,
+                    )
+                    .map_err(InstallError::from)
+                });
+                if let Err(e) = put {
+                    remove_written(&wrote, &created);
+                    return Err(e);
+                }
+                wrote.push(self.lyrebird());
+            }
             let written = create_dirs(&self.apps_dir, 0o755).and_then(|dirs| {
                 created.extend(dirs);
                 write_new(
@@ -1555,10 +1664,10 @@ mod linux {
                 .map_err(InstallError::from)
             });
             if let Err(e) = written {
-                let _ = std::fs::remove_file(self.exe());
-                remove_empty(&created);
+                remove_written(&wrote, &created);
                 return Err(e);
             }
+            wrote.push(self.menu_entry());
             let linked = write_new(
                 &self.apps_dir,
                 LINK_ENTRY,
@@ -1567,9 +1676,7 @@ mod linux {
                 &|| true,
             );
             if let Err(e) = linked {
-                let _ = std::fs::remove_file(self.menu_entry());
-                let _ = std::fs::remove_file(self.exe());
-                remove_empty(&created);
+                remove_written(&wrote, &created);
                 return Err(e.into());
             }
             Ok(
@@ -1585,21 +1692,33 @@ mod linux {
         /// entry that is not there).
         #[must_use]
         pub fn installed(&self) -> bool {
-            [self.menu_entry(), self.link_entry(), self.exe()]
-                .iter()
-                .any(|p| std::fs::symlink_metadata(p).is_ok())
+            [
+                self.menu_entry(),
+                self.link_entry(),
+                self.exe(),
+                self.lyrebird(),
+            ]
+            .iter()
+            .any(|p| std::fs::symlink_metadata(p).is_ok())
         }
 
         /// Take the link entry out of [`Self::mimeapps`] (never failing the
         /// uninstall: [`Association`]), then remove the menu entry, the link
-        /// entry and the executable: regular files only, anything else at
-        /// those names left and reported. Removing nothing changes nothing.
+        /// entry, the executable and lyrebird: regular files only, anything
+        /// else at those names left and reported; then the `pt` folder, only
+        /// where it is a folder (not a link) and now empty. Removing nothing
+        /// changes nothing.
         pub fn uninstall(&self) -> Result<Removal, InstallError> {
             let mut done = Removal {
                 association: self.dissociate(),
                 ..Removal::default()
             };
-            for path in [self.menu_entry(), self.link_entry(), self.exe()] {
+            for path in [
+                self.menu_entry(),
+                self.link_entry(),
+                self.exe(),
+                self.lyrebird(),
+            ] {
                 match std::fs::symlink_metadata(&path) {
                     Ok(m) if m.file_type().is_file() => {
                         std::fs::remove_file(&path).map_err(|e| {
@@ -1616,6 +1735,14 @@ mod linux {
                         )));
                     }
                 }
+            }
+            // A folder that still holds anything is not removed (and not an
+            // error): only what the install wrote goes.
+            let pt = self.pt_dir();
+            if std::fs::symlink_metadata(&pt).is_ok_and(|m| m.is_dir())
+                && std::fs::remove_dir(&pt).is_ok()
+            {
+                done.removed.push(pt);
             }
             Ok(done)
         }
@@ -1713,6 +1840,15 @@ mod linux {
             created.push(path.to_path_buf());
         }
         Ok(created)
+    }
+
+    /// Undo a failed install's earlier steps: remove the files in `wrote`,
+    /// newest first, then the folders `create_dirs` made, where empty.
+    fn remove_written(wrote: &[PathBuf], created: &[PathBuf]) {
+        for path in wrote.iter().rev() {
+            let _ = std::fs::remove_file(path);
+        }
+        remove_empty(created);
     }
 
     /// Remove the folders `create_dirs` made, deepest first, where still
@@ -2442,6 +2578,171 @@ mod linux {
                 ])
             );
             assert!(!install.installed());
+        }
+
+        /// The lyrebird of the tests and its pin.
+        const LYREBIRD: &[u8] = b"\x7fELF the bridge helper";
+
+        fn lyrebird_pin() -> String {
+            super::super::sha256_hex(LYREBIRD)
+        }
+
+        /// The final audit before the release: an install handed the
+        /// running copy's pinned lyrebird puts it in `pt/` beside the
+        /// installed executable (where the installed copy's lookup finds
+        /// it, never on `PATH`), mode 0755, and nothing else besides what
+        /// an install without it writes. Without it, the installed copy
+        /// could not use obfs4 or Snowflake bridges.
+        #[test]
+        fn an_install_with_lyrebird_puts_it_in_pt_beside_the_copy() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let pin = lyrebird_pin();
+            let helper = PinnedHelper {
+                bytes: LYREBIRD,
+                sha256: &pin,
+            };
+            assert!(helper.matches());
+            install
+                .install_with(&mut std::io::Cursor::new(PROGRAM), Some(helper), None)
+                .unwrap();
+            assert_eq!(
+                tree.files(),
+                set(&[
+                    "home/.config/mimeapps.list",
+                    "home/.local/bin/pt/lyrebird",
+                    "home/.local/bin/tornect",
+                    "home/.local/share/applications/tornect-link.desktop",
+                    "home/.local/share/applications/tornect.desktop"
+                ])
+            );
+            assert_eq!(
+                install.lyrebird(),
+                install.exe().with_file_name("pt").join("lyrebird")
+            );
+            assert_eq!(std::fs::read(install.lyrebird()).unwrap(), LYREBIRD);
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&install.lyrebird()), 0o755);
+            assert_eq!(
+                mode(&install.pt_dir()) & 0o022,
+                0,
+                "others cannot write pt/"
+            );
+            assert!(install.installed());
+
+            // Uninstalling removes it and its folder, after the other three.
+            let removal = install.uninstall().unwrap();
+            assert_eq!(
+                removal.removed,
+                [
+                    install.menu_entry(),
+                    install.link_entry(),
+                    install.exe(),
+                    install.lyrebird(),
+                    install.pt_dir()
+                ]
+            );
+            assert!(!install.pt_dir().exists());
+            assert!(!install.installed());
+        }
+
+        /// A lyrebird whose bytes are not its pin is never written, and
+        /// nothing else is either.
+        #[test]
+        fn a_lyrebird_that_is_not_its_pin_is_never_written() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let pin = lyrebird_pin();
+            let swapped = PinnedHelper {
+                bytes: b"\x7fELF something else",
+                sha256: &pin,
+            };
+            assert!(!swapped.matches());
+            match install.install_with(&mut std::io::Cursor::new(PROGRAM), Some(swapped), None) {
+                Err(InstallError::Refused(why)) => assert_eq!(why, HELPER_NOT_PINNED),
+                other => panic!("installed a lyrebird that is not the pin: {other:?}"),
+            }
+            assert!(tree.files().is_empty(), "{:?}", tree.files());
+            assert!(!tree.root.join("home/.local/bin").exists());
+        }
+
+        /// A `pt` that is a link to another place is never written through:
+        /// the install is refused by the location rule, and the copy written
+        /// before it goes again.
+        #[test]
+        fn a_pt_folder_that_is_a_link_refuses_the_install() {
+            let tree = Tree::new();
+            let install = tree.install().with_facts(UID, GID, |path| {
+                let mut facts = owned(path)?;
+                facts.symlink = path.file_name().is_some_and(|n| n == PT_DIR)
+                    && std::fs::symlink_metadata(path)?.file_type().is_symlink();
+                Ok(facts)
+            });
+            let elsewhere = tree.root.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::create_dir_all(tree.root.join("home/.local/bin")).unwrap();
+            symlink(&elsewhere, install.pt_dir()).unwrap();
+            let pin = lyrebird_pin();
+            let helper = PinnedHelper {
+                bytes: LYREBIRD,
+                sha256: &pin,
+            };
+            match install.install_with(&mut std::io::Cursor::new(PROGRAM), Some(helper), None) {
+                Err(InstallError::Refused(why)) => {
+                    assert!(why.starts_with(FOLDER_OTHERS_CAN_CHANGE), "{why}");
+                }
+                other => panic!("installed through a link: {other:?}"),
+            }
+            assert!(!install.exe().exists(), "the copy goes again");
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        }
+
+        /// A menu entry that cannot be written removes lyrebird and its
+        /// folder with the copy.
+        #[test]
+        fn a_failed_menu_entry_removes_lyrebird_too() {
+            let tree = Tree::new();
+            let install = tree.install();
+            std::fs::create_dir_all(install.menu_entry()).unwrap();
+            let pin = lyrebird_pin();
+            let helper = PinnedHelper {
+                bytes: LYREBIRD,
+                sha256: &pin,
+            };
+            assert!(
+                install
+                    .install_with(&mut std::io::Cursor::new(PROGRAM), Some(helper), None)
+                    .is_err()
+            );
+            assert!(tree.files().is_empty(), "{:?}", tree.files());
+            assert!(!tree.root.join("home/.local/bin").exists());
+        }
+
+        /// Uninstalling leaves a `pt` folder that holds anything else, and
+        /// a link at lyrebird's name.
+        #[test]
+        fn uninstall_leaves_a_pt_folder_it_did_not_empty() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let pin = lyrebird_pin();
+            let helper = PinnedHelper {
+                bytes: LYREBIRD,
+                sha256: &pin,
+            };
+            install
+                .install_with(&mut std::io::Cursor::new(PROGRAM), Some(helper), None)
+                .unwrap();
+            std::fs::write(install.pt_dir().join("notes"), b"mine").unwrap();
+            let removal = install.uninstall().unwrap();
+            assert!(removal.removed.contains(&install.lyrebird()));
+            assert!(!removal.removed.contains(&install.pt_dir()));
+            assert_eq!(tree.files(), set(&["home/.local/bin/pt/notes"]));
+
+            std::fs::remove_file(install.pt_dir().join("notes")).unwrap();
+            symlink(install.pt_dir().join("x"), install.lyrebird()).unwrap();
+            let removal = install.uninstall().unwrap();
+            assert_eq!(removal.left, [install.lyrebird()]);
+            assert!(install.pt_dir().is_dir());
         }
 
         /// `mimeapps.list` after an install into an empty configuration

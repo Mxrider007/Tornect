@@ -11,7 +11,12 @@
 //!   is copied into `~/.local/bin` with a menu entry, a link entry for
 //!   `tornect:` links and its line in `mimeapps.list`
 //!   (`tornect_platform::install::LinuxInstall`); the install's line says
-//!   what links do (design `invite` §4.6). Then the setting's copy
+//!   what links do (design `invite` §4.6). The running copy's own pinned
+//!   lyrebird, read before the guard's dialog
+//!   (`tornect_signal::tor::bundled_lyrebird`), goes to
+//!   `~/.local/bin/pt/lyrebird`; without one, a line says that the installed
+//!   copy cannot use obfs4 or Snowflake bridges (the final audit before the
+//!   release). Then the setting's copy
 //!   about Tor at every sign-in, and the question `Start Tornect when I sign
 //!   in? [y/N]`: only a yes registers the start at sign-in, for the installed
 //!   copy, through `tornect service install`'s own guard operation.
@@ -21,7 +26,8 @@
 //!   them (never over another program's; the install's line says what links
 //!   do, design `invite` §4.6), and an uninstall that, run from the
 //!   installed copy, has that copy mark itself and its folder for removal at
-//!   the next restart.
+//!   the next restart. The Program Files copy carries no lyrebird yet
+//!   (decision M1-88), and the install says so.
 //!
 //! `tornect uninstall` removes the start at sign-in, whatever copy it runs,
 //! then the link entry's line in `mimeapps.list`, the menu entry, the link
@@ -77,6 +83,25 @@ pub(crate) fn linux_installed(
         ),
     }
 }
+
+/// What an install says when the installed copy has no lyrebird (`why`):
+/// it cannot use obfs4 or Snowflake bridges, which only a network that
+/// blocks Tor needs (the final audit before the release).
+#[cfg(target_os = "linux")]
+pub(crate) fn no_bridges_line(why: &str) -> String {
+    format!(
+        "The installed copy has no lyrebird ({why}), so it cannot use obfs4 or Snowflake bridges \
+         where Tor is blocked. To have them, run tornect install from the unpacked release \
+         folder, which holds pt/lyrebird."
+    )
+}
+
+/// What a Windows install says of lyrebird: the Program Files copy carries
+/// none yet (decision M1-88).
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_NO_BRIDGES: &str = "The installed copy has no lyrebird, so it cannot use \
+     obfs4 or Snowflake bridges where Tor is blocked; there, run tornect.exe from the unpacked \
+     release folder, which holds pt\\lyrebird.exe.";
 
 /// What a Linux uninstall says about a `mimeapps.list` that still names the
 /// link entry and could not be changed (design `invite` §4.6).
@@ -385,6 +410,16 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
         // this handle, which is the running image even if its path changes.
         let mut source =
             std::fs::File::open("/proc/self/exe").context("opening this program to copy it")?;
+        // Its own pinned lyrebird, read now from one handle: never a
+        // configured path or the developers' folder.
+        let bundled = tornect_signal::tor::bundled_lyrebird();
+        let lyrebird = match (&bundled, tornect_signal::tor::LYREBIRD_SHA256) {
+            (Ok((_, bytes)), Some(pin)) => {
+                Ok(tornect_platform::install::PinnedHelper { bytes, sha256: pin })
+            }
+            (Ok(_), None) => Err("this build pins none".to_owned()),
+            (Err(why), _) => Err(why.clone()),
+        };
         let host_running = crate::host::HostLock::holder(paths).is_some();
         anyhow::ensure!(!host_running, CLOSE_FIRST);
         let mut ctx = unattended::offline_context(paths)?;
@@ -396,7 +431,7 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
             host_running,
             autostart_for: &tornect_platform::autostart::for_this_os,
         };
-        install_linux(&mut deps, paths, &files, &mut source)
+        install_linux(&mut deps, paths, &files, &mut source, lyrebird)
     }
     #[cfg(windows)]
     {
@@ -476,11 +511,13 @@ pub(crate) trait UserInstall {
     fn mimeapps(&self) -> PathBuf;
     /// What `install` checks before writing, writing nothing.
     fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError>;
-    /// Copy `source`, write the menu entry and the link entry, and name the
-    /// link entry in `mimeapps.list`: what that last step did.
+    /// Copy `source` and `lyrebird`, write the menu entry and the link
+    /// entry, and name the link entry in `mimeapps.list`: what that last
+    /// step did.
     fn install(
         &self,
         source: &mut dyn std::io::Read,
+        lyrebird: Option<tornect_platform::install::PinnedHelper<'_>>,
         home: Option<&std::path::Path>,
     ) -> Result<tornect_platform::install::LinkHandler, InstallError>;
     /// Whether anything of an install is there.
@@ -507,9 +544,10 @@ impl UserInstall for tornect_platform::install::LinuxInstall {
     fn install(
         &self,
         source: &mut dyn std::io::Read,
+        lyrebird: Option<tornect_platform::install::PinnedHelper<'_>>,
         home: Option<&std::path::Path>,
     ) -> Result<tornect_platform::install::LinkHandler, InstallError> {
-        Self::install(self, source, home)
+        Self::install_with(self, source, lyrebird, home)
     }
 
     fn installed(&self) -> bool {
@@ -523,19 +561,22 @@ impl UserInstall for tornect_platform::install::LinuxInstall {
 
 /// `tornect install` on Linux: refused beside a running host, then the
 /// files' checks (no dialog for an install that cannot be made), the guard's
-/// operation, the files, and the offer to start at sign-in.
+/// operation, the files with the running copy's pinned `lyrebird` (read
+/// before the dialog; `Err` says why there is none, and the install goes on
+/// and says what that costs), and the offer to start at sign-in.
 #[cfg(target_os = "linux")]
 pub(crate) fn install_linux(
     deps: &mut Deps<'_>,
     paths: &Paths,
     files: &dyn UserInstall,
     source: &mut dyn std::io::Read,
+    lyrebird: Result<tornect_platform::install::PinnedHelper<'_>, String>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!deps.host_running, CLOSE_FIRST);
     let home = unattended::launch_home(paths)?;
     files.preflight(home.as_deref())?;
     authorize(paths, deps.ctx, &ExternalOp::Install)?;
-    let links = match files.install(source, home.as_deref()) {
+    let links = match files.install(source, lyrebird.as_ref().ok().copied(), home.as_deref()) {
         Ok(links) => links,
         Err(e) => {
             log_failure(deps.ctx, SessionEvent::Installed, "install", &e);
@@ -544,6 +585,9 @@ pub(crate) fn install_linux(
     };
     deps.console
         .out(&linux_installed(&links, &files.mimeapps()));
+    if let Err(why) = &lyrebird {
+        deps.console.out(&no_bridges_line(why));
+    }
     offer_sign_in(deps, paths, files.exe())
 }
 
@@ -663,6 +707,7 @@ pub(crate) fn install_windows(
     };
     deps.console
         .out(&windows_installed(&installed.folder, installed.links));
+    deps.console.out(WINDOWS_NO_BRIDGES);
     offer_sign_in(deps, paths, PathBuf::from(installed.exe))
 }
 
@@ -1036,6 +1081,8 @@ mod tests {
         fail: Option<&'static str>,
         links: LinkHandler,
         association: Association,
+        /// The lyrebird each install was handed.
+        lyrebirds: Mutex<Vec<Option<Vec<u8>>>>,
     }
 
     impl UserInstall for FakeFiles {
@@ -1055,8 +1102,13 @@ mod tests {
         fn install(
             &self,
             source: &mut dyn std::io::Read,
+            lyrebird: Option<tornect_platform::install::PinnedHelper<'_>>,
             _home: Option<&std::path::Path>,
         ) -> Result<LinkHandler, InstallError> {
+            self.lyrebirds
+                .lock()
+                .unwrap()
+                .push(lyrebird.map(|l| l.bytes.to_vec()));
             if let Some(why) = self.fail {
                 return Err(InstallError::Failed(why.to_owned()));
             }
@@ -1301,6 +1353,7 @@ mod tests {
                 fail: None,
                 links: LinkHandler::Registered,
                 association: Association::NotThere,
+                lyrebirds: Mutex::new(Vec::new()),
             },
         }
     }
@@ -1360,6 +1413,7 @@ mod tests {
                 &self.paths,
                 &self.files,
                 &mut std::io::Cursor::new(b"the program".to_vec()),
+                Err(NO_LYREBIRD_HERE.to_owned()),
             );
             (done, script)
         }
@@ -1379,6 +1433,110 @@ mod tests {
             let done = uninstall_linux(&mut deps, &self.paths, &self.files);
             (done, script)
         }
+    }
+
+    /// Why the tests' copy has no lyrebird to install.
+    const NO_LYREBIRD_HERE: &str = "none beside this test's copy";
+
+    /// The final audit before the release: the running copy's pinned
+    /// lyrebird goes with the install, and the install says nothing more;
+    /// without one it goes on and says, after its own line, that the
+    /// installed copy cannot use obfs4 or Snowflake bridges, and why.
+    #[test]
+    fn the_install_carries_lyrebird_or_says_what_its_absence_costs() {
+        const BYTES: &[u8] = b"the bridge helper";
+        let pin = "0".repeat(64);
+        for lyrebird in [
+            Ok(tornect_platform::install::PinnedHelper {
+                bytes: BYTES,
+                sha256: &pin,
+            }),
+            Err(NO_LYREBIRD_HERE.to_owned()),
+        ] {
+            let with = lyrebird.is_ok();
+            let mut env = linux_env(2);
+            let backends = Backends::default();
+            let make = |spec| backends.make(spec);
+            let mut script = Script::answering(&[Some("\n")]);
+            let mut deps = Deps {
+                ctx: &mut env.ctx,
+                console: &mut script,
+                host_running: false,
+                autostart_for: &make,
+            };
+            install_linux(
+                &mut deps,
+                &env.paths,
+                &env.files,
+                &mut std::io::Cursor::new(b"the program".to_vec()),
+                lyrebird,
+            )
+            .unwrap();
+            assert_eq!(
+                *env.files.lyrebirds.lock().unwrap(),
+                [with.then(|| BYTES.to_vec())]
+            );
+            let line = no_bridges_line(NO_LYREBIRD_HERE);
+            assert_eq!(script.said(&line), !with, "{:?}", script.lines);
+            assert!(
+                line.contains("cannot use obfs4 or Snowflake bridges"),
+                "{line}"
+            );
+            let installed = script
+                .lines
+                .iter()
+                .position(|l| {
+                    *l == format!(
+                        "out: {}",
+                        linux_installed(&LinkHandler::Registered, &env.files.mimeapps())
+                    )
+                })
+                .unwrap();
+            if !with {
+                assert_eq!(script.lines[installed + 1], format!("out: {line}"));
+            }
+        }
+    }
+
+    /// The final audit before the release: what the install puts beside the
+    /// installed copy is what that copy's own lyrebird lookup finds and
+    /// accepts (beside it in `pt/`, the pin, not writable by others), read
+    /// from a release folder's `pt/lyrebird` as `install` reads it.
+    #[test]
+    fn an_installed_copy_finds_the_lyrebird_its_install_put_beside_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tornect_signal::tor::bundled_lyrebird_in;
+        const BYTES: &[u8] = b"\x7fELF the bridge helper";
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        std::fs::create_dir_all(release.join("pt")).unwrap();
+        let shipped = release.join("pt").join("lyrebird");
+        std::fs::write(&shipped, BYTES).unwrap();
+        std::fs::set_permissions(&shipped, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pin = tornect_platform::install::sha256_hex(BYTES);
+        let (_, bytes) = bundled_lyrebird_in(Some(&release), Some(&pin)).unwrap();
+        let files = tornect_platform::install::LinuxInstall::new(
+            tmp.path().join("bin"),
+            tmp.path().join("apps"),
+            tmp.path().join("config"),
+        );
+        assert!(bundled_lyrebird_in(Some(&tmp.path().join("bin")), Some(&pin)).is_err());
+        files
+            .install_with(
+                &mut std::io::Cursor::new(b"the program".to_vec()),
+                Some(tornect_platform::install::PinnedHelper {
+                    bytes: &bytes,
+                    sha256: &pin,
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            bundled_lyrebird_in(Some(&tmp.path().join("bin")), Some(&pin)),
+            Ok((files.lyrebird(), BYTES.to_vec()))
+        );
+        files.uninstall().unwrap();
+        assert!(!files.pt_dir().exists());
     }
 
     /// §B.1.1: after the install, "Start Tornect when I sign in? [y/N]":
@@ -1578,6 +1736,7 @@ mod tests {
                 &env.paths,
                 &env.files,
                 &mut std::io::Cursor::new(b"the program".to_vec()),
+                Err(NO_LYREBIRD_HERE.to_owned()),
             );
             assert!(env.files.installed(), "{answer:?}: the install stays");
             assert_eq!(backends.installs(), 0, "{answer:?}");
@@ -1766,7 +1925,13 @@ mod tests {
             autostart_for: &make,
         };
         let results = [
-            install_linux(&mut deps, &env.paths, &env.files, &mut std::io::empty()),
+            install_linux(
+                &mut deps,
+                &env.paths,
+                &env.files,
+                &mut std::io::empty(),
+                Err(NO_LYREBIRD_HERE.to_owned()),
+            ),
             uninstall_linux(&mut deps, &env.paths, &env.files),
             install_windows(&mut deps, &env.paths, &Untouched, false),
             uninstall_windows(&mut deps, &env.paths, &Untouched),
@@ -2484,6 +2649,9 @@ mod tests {
             };
             install_windows(&mut deps, &env.paths, &sys, false).unwrap();
             assert!(script.said(line), "{found:?}: {:?}", script.lines);
+            // The final audit before the release: the Program Files copy
+            // carries no lyrebird yet (decision M1-88), and says so.
+            assert!(script.said(WINDOWS_NO_BRIDGES), "{:?}", script.lines);
             assert!(
                 !script
                     .lines

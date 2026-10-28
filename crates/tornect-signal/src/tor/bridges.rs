@@ -561,6 +561,73 @@ fn find_lyrebird_in(
     Ok(path)
 }
 
+/// The largest `lyrebird` [`bundled_lyrebird`] reads (lyrebird 0.8.1 is
+/// about 10 MB on either platform).
+const LYREBIRD_MAX: u64 = 64 * 1024 * 1024;
+
+/// The running copy's own bundled `lyrebird`, for `tornect install` to put
+/// beside the installed copy (the final audit before the release): where
+/// [`find_lyrebird`] finds it with no `tor.pt_path` (beside the executable,
+/// then its `pt/` folder), never `$TORNECT_PT_DIR` or a configured path,
+/// and only while this build pins one. The file is opened once; the checks
+/// are made on that handle (a regular file, on Unix not writable by group
+/// or others, at most 64 MiB), and its bytes, read from it, must have the
+/// pinned SHA-256. Its path and bytes, or why there is none to install.
+pub fn bundled_lyrebird() -> std::result::Result<(PathBuf, Vec<u8>), String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    bundled_lyrebird_in(exe_dir.as_deref(), LYREBIRD_SHA256)
+}
+
+/// [`bundled_lyrebird`] for the executable's folder `exe_dir` and the pin
+/// `pin`.
+pub fn bundled_lyrebird_in(
+    exe_dir: Option<&Path>,
+    pin: Option<&str>,
+) -> std::result::Result<(PathBuf, Vec<u8>), String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let Some(pin) = pin else {
+        return Err(format!("this build pins no `{LYREBIRD}` for this platform"));
+    };
+    let path = find_lyrebird_in(None, exe_dir, None, Some(pin))?;
+    let file = std::fs::File::open(&path).map_err(|e| format!("cannot open `{LYREBIRD}`: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect `{LYREBIRD}`: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("`{LYREBIRD}` at {} is not a file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o022 != 0 {
+            return Err(format!(
+                "`{LYREBIRD}` at {} is writable by other users",
+                path.display()
+            ));
+        }
+    }
+    if meta.len() > LYREBIRD_MAX {
+        return Err(format!(
+            "`{LYREBIRD}` at {} is larger than 64 MiB",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(LYREBIRD_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read `{LYREBIRD}`: {e}"))?;
+    if hex::encode(Sha256::digest(&bytes)) != pin {
+        return Err(format!(
+            "`{LYREBIRD}` at {} is not the pinned lyrebird 0.8.1 (SHA-256 mismatch)",
+            path.display()
+        ));
+    }
+    Ok((path, bytes))
+}
+
 /// The integrity checks of [`find_lyrebird`].
 fn check_lyrebird(
     path: &Path,
@@ -844,6 +911,40 @@ mod tests {
         assert!(err.contains("not the pinned lyrebird"), "{err}");
         let err = find_lyrebird_in(None, Some(exe.path()), None, None).unwrap_err();
         assert!(err.contains("pins no"), "{err}");
+    }
+
+    /// The final audit before the release: what `tornect install` copies is
+    /// the running copy's own pinned lyrebird (beside it, or in its `pt/`
+    /// folder), read from one handle: never the developers' folder, never
+    /// one that is not the pin, never one others can write to, and none
+    /// from a build that pins none.
+    #[test]
+    fn the_lyrebird_to_install_is_the_running_copys_pinned_one() {
+        let exe = tempfile::tempdir().unwrap();
+        let pt = exe.path().join("pt");
+        std::fs::create_dir(&pt).unwrap();
+        let bundled = fake_lyrebird(&pt);
+        let pin = pin_of(&bundled);
+        assert_eq!(
+            bundled_lyrebird_in(Some(exe.path()), Some(&pin)),
+            Ok((bundled.clone(), b"not really lyrebird".to_vec()))
+        );
+        let wrong = "0".repeat(64);
+        let err = bundled_lyrebird_in(Some(exe.path()), Some(&wrong)).unwrap_err();
+        assert!(err.contains("not the pinned lyrebird"), "{err}");
+        let err = bundled_lyrebird_in(Some(exe.path()), None).unwrap_err();
+        assert!(err.contains("pins no"), "{err}");
+        // A developers' copy is not the running copy's: nothing to install.
+        let bare = tempfile::tempdir().unwrap();
+        let err = bundled_lyrebird_in(Some(bare.path()), Some(&pin)).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o770)).unwrap();
+            let err = bundled_lyrebird_in(Some(exe.path()), Some(&pin)).unwrap_err();
+            assert!(err.contains("writable by other users"), "{err}");
+        }
     }
 
     /// SLICE-A1 A1-4: relative candidates are never used — they would resolve

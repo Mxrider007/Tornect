@@ -21,7 +21,7 @@ use arti_client::{ErrorKind, HasKind as _};
 
 pub use bridges::{
     BUILTIN_OBFS4, BUILTIN_SNOWFLAKE, LYREBIRD, LYREBIRD_SHA256, Ladder, PT_DIR_ENV, PtSource,
-    Rung, RungPolicy, Transport, find_lyrebird, last_good,
+    Rung, RungPolicy, Transport, bundled_lyrebird, bundled_lyrebird_in, find_lyrebird, last_good,
 };
 pub use config::{
     CONNECT_TIMEOUT, INTRO_RATE_LIMIT, MAX_STREAMS_PER_CIRCUIT, NUM_INTRO_POINTS,
