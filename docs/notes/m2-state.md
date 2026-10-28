@@ -210,7 +210,9 @@ and the crates below ring check here).
   presets (Balanced 1080p30 at 6 Mbit/s, Best performance 720p60 at 4 Mbit/s, Best quality 30 fps
   at 12 Mbit/s or `[media] max_bitrate_kbps`), picked by the host from the claimed path, a 300 ms
   ack window; `direct_loopback_stats` now reads 29.8 fps. Services: the second bidi stream of the
-  direct connection (`HOST_STREAMS` 2), bound by `ServicesHost::serve_direct` through
+  direct connection (the host's limit is the media stream alone, `HOST_STREAMS` 1, until a host with
+  services raises it to `HOST_STREAMS_WITH_SERVICES` 2 on the one connection whose media was claimed),
+  bound by `ServicesHost::serve_direct` through
   `DirectHost`'s `SecondStream` hook under its own MAC once the media is claimed on the same path
   by the pinned device; 4 MiB bulk window; priorities media 1, services 0; the host refuses the
   onion services port while the media is direct; the app's `ServicesSlot` (set once the services
@@ -220,7 +222,14 @@ and the crates below ring check here).
   bound; `services_bind_mac_direct`; the quantizer ranges, window floors and least bitrate of the
   Tor rows; the stream-count test's composition. Left as NEEDS-DEVICE: the direct row and the
   4 MiB window measured on real paths (ledger rows, after B12). `a8cfd817` fixed a `cargo doc`
-  failure `27597483` brought in (a public doc linking a crate-private constant).
+  failure `27597483` brought in (a public doc linking a crate-private constant). Review fixes
+  (2026-10-28, ledger rows "Step B10 review fix"): the services stream runs on a task of its own and
+  its end (services design §6.3 step 5: `Close{code}`, the summary, controls and workers) runs at
+  every host end, a kill and a device end included (`1b0f0b9c`); the viewer's services handle comes
+  with the bound media only (`DirectBound`) and a failed bind shuts the link before `TOR_FALLBACK`
+  (`5fc38220`); the second stream's credit is given per connection, after the claim, by a host with
+  services (`929f0e6d`); a kill seen as the port closes still takes the kill's goodbye (`6d76c23c`);
+  a viewer whose write fails after the host's end ends as the host's `Close` says (`42b7dfb8`).
 - B11: the Phase B copy and settings (STUN, router mapping).
 - B12: `INTERNET_DIRECT = true`.
 - B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11 (their recipes are
@@ -242,22 +251,28 @@ and the crates below ring check here).
   never take `rustls` out of `QUIET_TARGETS`.
 - The redaction e2e re-runs its own test binary as a child; run the session tests through cargo or
   the built binary, not through a wrapper that changes `current_exe()`.
-- The loopback session tests use `127.0.0.20` to `.41`; macOS needs `lo0` aliases for those.
+- The loopback session tests use `127.0.0.20` to `.47`; macOS needs `lo0` aliases for those.
 - The mapping tests give each fake router its own `127.0.0.N` from `.40` up (crab_nat always
   sends to port 5351); under Wine they fail (shared loopback port, answers from `127.0.0.1`).
 - The app's tests still run as `tester` (copy the binary from `cargo test -p tornect --no-run` to
   `/home/tester`, run with `runuser`, delete it afterwards).
-- The QUIC transport lets the viewer open two bidi streams at a time (`HOST_STREAMS` is 2, media
-  and services since B10): a test that opens a third while two are open waits forever, and in
-  paused time that shows as a hang with growing memory, not a timeout. Bound such an open with a
-  timeout, as `quic::tests` and `direct_loopback` do.
+- The QUIC transport lets the viewer open one bidi stream (`HOST_STREAMS` is 1, the media), and two
+  only once a host with services raised it on that connection after the claim
+  (`Established::allow_second_stream`, since the B10 review fixes): a test that opens one more than
+  the limit waits forever, and in paused time that shows as a hang with growing memory, not a
+  timeout. Bound such an open with a timeout, as `quic::tests` and `direct_loopback` do.
+- `DirectHost` can see the FSM's port close before the kill that caused it (the select's kill branch
+  was polled just before the kill): a closed port checks the kill guard first. Races like this show
+  only under parallel load; loop a module in four processes (`target/debug/deps/tornect_session-*
+  direct_loopback:: --skip a_direct_session_logs_no_address_port_or_key`, the redaction e2e's fake
+  routers sit on fixed ports) before calling an end-order test settled.
 - A public doc that links a `pub(crate)` item fails `cargo doc -D warnings`
   (`rustdoc::private-intra-doc-links`) while clippy and the tests pass: run the doc build before
   committing (B10 found one, fixed in `a8cfd817`).
 - A dual-stack `MemUdp` refuses a plain IPv4 destination (`InvalidInput`, as the OS does), forged
   sends through `spoof_as` included: give it the v4-mapped form (`direct_nat::forge`).
 - The redaction e2e's fake routers sit on `127.0.0.171` (PCP) and `127.0.0.172` (UPnP-IGD), beside
-  the loopback session's `127.0.0.20` to `.41` and the mapping tests' `.40` up; macOS needs `lo0`
+  the loopback session's `127.0.0.20` to `.47` and the mapping tests' `.40` up; macOS needs `lo0`
   aliases for them too.
 - `pkill -f <pattern>` with a pattern from the running command line also kills the shell that runs
   it: stop a hung test binary by its PID.
