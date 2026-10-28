@@ -1,6 +1,7 @@
 # Tornect: a pre-release build (the vertical slice)
 
-Tornect shares one computer's screen with another over Tor. A computer's
+Tornect shares one computer's screen with another, over Tor or, when the two
+can reach each other, directly ("Direct connections" below). A computer's
 Tornect ID is its Tor onion address, so it needs no server, no account and no
 port forwarding. This is a **pre-release** for testing between two machines
 you control, one Linux and one Windows. No one has audited it: do not rely on it
@@ -129,26 +130,69 @@ every session at once, press **Ctrl-C in the console where `tornect.exe host`
 runs**, or press Stop on the banner or the "Tornect: sharing" window when you
 use the window.
 
-## Direct connections on one network
+## Direct connections
 
-When both computers are on the same local network, a session's picture and
-input go straight between them over an encrypted connection (QUIC, each
-computer checking the other's key), which is faster than Tor; chat, clipboard
-text and files still go over Tor. Tor also still finds the other computer,
-checks who it is and carries the question; the two computers exchange their
-local-network addresses only after the sharing side accepts, so a computer you
-accept learns this computer's local address. The sharing side is told so when
-it decides (in the window's question, and in `tornect host`'s `note:` line).
-When no direct path is ready within 4 seconds, the session goes over Tor as
-before. Across the internet, every session still goes over Tor in this build.
+After the sharing side accepts a session, the two computers try to connect
+straight to each other, which is much faster than Tor: on the same local
+network, or across the internet when their routers let them. The picture,
+input, chat, clipboard text and files then go over that connection, which is
+encrypted (QUIC, each computer checking the other's key). Tor still finds the
+other computer, checks who it is and carries the question, and the two
+computers exchange their addresses over Tor only after the accept. When no
+direct path is ready within 4 seconds, the session goes over Tor as before.
+`tornect connect` prints which way the picture went: `ROUTE direct lan` or
+`ROUTE direct internet` (each with `ipv6` after it over IPv6), or `ROUTE tor
+<reason>`; `tornect host` prints `SESSION ROUTE <session> lan`, `direct` or
+`tor`.
 
-To keep every session on Tor, switch off "Connect directly when both
-computers are on the same local network" in Settings > Connection, or set
-`paranoid = true` under `[network]` in `config.toml`; `tornect connect
---tor-only` does it for one session. Direct connections are also off while
-Tor reaches the network through a bridge. `tornect connect` prints which way
-the picture went (`ROUTE direct lan` or `ROUTE tor <reason>`), and `tornect
-doctor` says whether direct connections are on.
+**What a direct connection reveals.** A computer you accept, a view-only one
+included, learns this computer's IP addresses: its local-network address, its
+public IPv4 address (the one your router shows the internet) and one global
+IPv6 address (a temporary one where the system has one). A computer you
+connect to learns yours in the same way. A computer that is refused, or never
+paired, learns nothing. Two other parties take part:
+
+- **A public STUN server.** To find this computer's public address, each
+  computer asks one public STUN server per session (a second only when the
+  first does not answer), by default from Cloudflare, Google, Twilio or
+  Nextcloud; the list is `stun_servers` under `[network]` in `config.toml`.
+  That server sees this computer's IP address and when a session starts, never
+  which computer it connects to (when both computers use the same list, as with
+  the default) and never the picture. Tornect looks these servers' names up
+  once Tor is connected and every 10 minutes, so the DNS resolver this computer
+  uses can tell that Tornect runs with direct connections on.
+- **This network's router.** Each computer asks its router (UPnP, NAT-PMP or
+  PCP) to open one UDP port for the session. The opening shows as "Tornect" in
+  the router's settings and is closed when the session ends; if Tornect stops
+  first, most routers drop it within 10 minutes, and Tornect removes it at its
+  next start.
+
+Your internet provider can see that the two computers exchange encrypted
+traffic directly, and may recognise it as Tornect. The sharing side is told
+before it decides: the window's question says that accepting also lets the
+other computer learn this computer's internet address, and `tornect host`
+adds a `note:` line saying so to its question; once Tor is connected it
+also prints `NOTICE direct connections are on: …`. The window shows a one-time
+notice with the switch; until you press OK there, it keeps unattended sessions
+on Tor.
+
+**Keeping sessions on Tor.** Switch off "Allow direct connections (faster;
+the other computer learns your IP address)" in Settings > Connection, or set
+`paranoid = true` under `[network]` in `config.toml`: every session then goes
+over Tor, and computers you connect to never learn your IP address. `tornect
+connect --tor-only` does the same for one session, and "Pictures and input
+through Tor only" in an unattended grant for that device. Under the switch,
+"Use public STUN servers" and "Ask this network's router to open a port (UPnP,
+NAT-PMP, PCP)" turn those two off; the other computer then still learns this
+computer's internet address from the direct connection itself. `lan_only =
+true` under `[network]` keeps sessions on the local network in both
+directions: no STUN server or router is asked, and a session that cannot
+connect directly ends instead of going through Tor. Direct connections are off
+while Tor reaches the network through a bridge, because they would show that
+network that Tornect is in use (`direct_with_bridges = true` under `[network]`
+allows them anyway). `tornect doctor` says whether direct connections are on,
+whether STUN servers and the router are asked, and which kinds of address this
+computer has, never the addresses themselves.
 
 On Windows, the first direct connection may make Windows ask whether Tornect
 may communicate on your networks: choose "Allow access". If you cancel, or
@@ -228,8 +272,12 @@ own, and anywhere else other accounts on the PC could read and change its keys.
 - Tested on one Linux machine (GNOME on Wayland) only. **Nothing has run on a
   real Windows machine yet**: only under Wine, which is not Windows. The window
   has not yet been used by a person for a whole session between two machines.
-- Everything travels over Tor: pictures are slow (a few frames per second for a
-  large desktop), and a connection takes from seconds to minutes to set up.
+- Without a direct connection everything travels over Tor: pictures are slow
+  (a few frames per second for a large desktop). Either way, Tor takes from
+  seconds to minutes to find the other computer.
+- Direct connections across the internet are new in this build and have run
+  only in simulation: not yet between two real homes, through real routers or
+  carrier NATs, over IPv6, through a VPN, or on Windows.
 - On GNOME, the "Tornect: sharing" window cannot stay above other windows
   (Wayland does not let it); GNOME shows its own screen-sharing icon.
 - The zips and the programs are not signed.

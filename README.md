@@ -13,14 +13,18 @@ itself: slower, but it *always* connects.
 > **Status: pre-alpha, under active development; no one has audited it.** Today's
 > build is the vertical slice: pairing with a code to compare, the consent question,
 > screen sharing with remote control (software H.264), the window with its sharing
-> banner and Stop, unattended access, and Linux and Windows builds. **When both
-> computers are on the same local network, the pictures travel over a direct QUIC
-> connection** (M2's first half: both device keys pinned, and only after the host
-> accepts; the other computer then learns this computer's local address, which the
-> host is told when it decides). **Otherwise everything, the pictures included,
-> travels over the Tor circuit**: the internet half of the direct path (STUN, router
-> port mapping, public addresses) is not built yet. `network.paranoid = true`, or
-> Settings > Connection, keeps every session on Tor. See the roadmap below and
+> banner and Stop, unattended access, and Linux and Windows builds. **When the two
+> computers can reach each other, on the same local network or across the internet
+> through ordinary home routers, the pictures travel over a direct QUIC connection**
+> (M2: both device keys pinned, and only after the host accepts; the other computer
+> then learns this computer's local and internet addresses, which the host is told
+> when it decides; one public STUN server per session sees this computer's IP address
+> and when the session starts, and the router is asked to open one UDP port for it).
+> **Otherwise everything, the pictures included, travels over the Tor circuit.** The
+> internet half has run only in simulation so far (an in-memory NAT matrix); the runs
+> between real networks and routers are pending. `network.paranoid = true`, or the
+> "Allow direct connections" switch in Settings > Connection, keeps every session on
+> Tor. See the roadmap below and
 > [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for what has actually been verified,
 > and on which machines.
 
@@ -110,7 +114,7 @@ one directory — handy for running a host and a client on the same machine.
 |---|---|---|
 | M0 | Workspace, identities, config, keystore, CI, Claude Code kit | ✅ done |
 | M1 | Signaling over Tor: embedded Arti onion service, pairing with SAS, unattended PAKE auth | in progress: built, acceptance runs open |
-| M2 | Direct connectivity: candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned QUIC, Tor fallback | in progress: the same-network half built (checkpoint `m2a` waits for its dev-VM runs); the internet half not started |
+| M2 | Direct connectivity: candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned QUIC, Tor fallback | in progress: both halves built and the internet half on; the dev-VM runs (checkpoint `m2a`), the live STUN check, real networks and routers, and the close (final decisions, security review) still to come |
 | M3 | Video pipeline on Linux/Wayland: capture, codecs, packetizer/FEC/jitter/pacer, wgpu render, loopback demo | |
 | M4 | End-to-end streaming between two machines with the minimal GUI | |
 | M5 | Input + audio: remote *control*, clipboard, gaming mode | |
