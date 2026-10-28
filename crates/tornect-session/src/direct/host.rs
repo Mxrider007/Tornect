@@ -257,7 +257,8 @@ impl DirectHost {
 
     /// The same host with internet scope on or off, whatever
     /// [`INTERNET_DIRECT`] says: the NAT matrix (the direct design §12.4)
-    /// runs in internet scope before step B12 turns it on.
+    /// runs in internet scope and the same-site tables in same-site scope,
+    /// whichever the build has.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_internet(mut self, on: bool) -> Self {

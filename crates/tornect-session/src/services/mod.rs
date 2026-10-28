@@ -180,7 +180,8 @@ impl Default for ServicesPolicy {
 }
 
 /// The bulk window of a services stream on a session's direct connection
-/// (the direct design §6.7; provisional until step B12 measures it): 4 MiB,
+/// (the direct design §6.7; provisional until it is measured on real
+/// paths): 4 MiB,
 /// where Tor's is 256 KiB. It matches the connection's stream window, so
 /// one stream's credit never waits on QUIC's.
 pub const DIRECT_BULK_WINDOW: u32 = 4 << 20;

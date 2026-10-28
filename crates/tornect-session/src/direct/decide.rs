@@ -273,8 +273,8 @@ pub fn decide(
     decide_with(INTERNET_DIRECT, p_h, mine, media, host_dir1, same_key)
 }
 
-/// [`decide`] with the internet scope given: tests build Phase B's scope
-/// before the constant turns it on (the direct design §2).
+/// [`decide`] with the internet scope given: tests build either scope,
+/// whatever the constant says (the direct design §2).
 pub(crate) fn decide_with(
     internet: bool,
     p_h: TransportPolicy,
@@ -391,11 +391,25 @@ mod tests {
                 );
             }
         }
+        // The build's own scope (step B12 turned it on): `decide` is the
+        // table with `INTERNET_DIRECT`.
         assert_eq!(
             decide(ANY, Mine::of(ANY), true, true, false),
-            same_site(false),
-            "Phase A: no internet scope"
+            Decision::Try {
+                scope: Scope::Internet,
+                lan_only: false,
+            },
+            "Phase B: the internet scope"
         );
+        for p_h in [ANY, TOR, LAN] {
+            for mine in [ANY, TOR, LAN] {
+                assert_eq!(
+                    decide(p_h, Mine::of(mine), true, true, false),
+                    decide_with(INTERNET_DIRECT, p_h, Mine::of(mine), true, true, false),
+                    "host {p_h:?}, viewer {mine:?}"
+                );
+            }
+        }
     }
 
     /// Rules 1–3 come before the table (the direct design §4): no media is

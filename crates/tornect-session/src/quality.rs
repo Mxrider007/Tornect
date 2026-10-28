@@ -7,8 +7,8 @@
 //!
 //! The Tor rows are provisional until the live per-preset measurement over
 //! Tor freezes them (the design's step 19, `docs/VERIFICATION.md`); the
-//! direct rows (the direct design §6.8) until the direct measurement does
-//! (its step B12 and the devices of B13).
+//! direct rows (the direct design §6.8) until their measurement on real
+//! paths does (its steps B12 and B13, `docs/VERIFICATION.md`).
 
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ impl Route {
 pub const WINDOW_SPAN: Duration = Duration::from_millis(1500);
 
 /// How long a direct stream's ack window lasts (the direct design §6.8;
-/// provisional until step B12 measures it): a direct round trip is tens of
+/// provisional until it is measured on real paths): a direct round trip is tens of
 /// milliseconds, so the window bounds the latency a link slower than the
 /// preset's bitrate adds, as [`WINDOW_SPAN`] does over Tor. The floors
 /// below still hold, so at 30 fps the window is their 20 units.

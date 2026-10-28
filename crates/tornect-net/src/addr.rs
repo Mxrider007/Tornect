@@ -26,7 +26,7 @@ pub enum Scope {
     /// asked and no global address is offered or admitted.
     SameSite,
     /// Same-site plus public IPv4, one global IPv6, srflx and mapped
-    /// candidates (Phase B, behind `INTERNET_DIRECT`).
+    /// candidates (Phase B: the session layer's `INTERNET_DIRECT`).
     Internet,
 }
 

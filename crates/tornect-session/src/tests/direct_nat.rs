@@ -5,7 +5,7 @@
 //! homes sit behind `NatBox`es on an internet segment, with a `MemStun` per
 //! side and the boxes' routers as `MemMapper`s. Both halves run in internet
 //! scope ([`ViewerDirect::with_internet`], [`DirectHost::with_internet`]),
-//! as step B12 will turn on. Every row asserts the route, the time, the
+//! as step B12 turned on. Every row asserts the route, the time, the
 //! host's `PathSummary` and the `CountingEnv` counts. Paused time.
 //!
 //! A direct row binds its media to see the host's claim: the test backend's
@@ -231,6 +231,10 @@ struct NatOpts {
     mine: Mine,
     viewer_options: DirectOptions,
     host_options: DirectOptions,
+    /// Both halves in internet scope (`Some(true)`, every matrix row), or
+    /// in the scope the build itself gives them (`None`:
+    /// [`INTERNET_DIRECT`], as the app builds them).
+    internet: Option<bool>,
 }
 
 impl NatOpts {
@@ -243,7 +247,15 @@ impl NatOpts {
             mine: Mine::of(ANY),
             viewer_options: options(),
             host_options: options(),
+            internet: Some(true),
         }
+    }
+
+    /// Both halves as the app builds them, with no scope of the test's
+    /// own: what [`INTERNET_DIRECT`] gives a release build.
+    fn in_the_builds_scope(mut self) -> Self {
+        self.internet = None;
+        self
     }
 
     /// STUN off on both sides (`network.enable_stun = false`).
@@ -357,8 +369,11 @@ async fn nat_fixture(
         key(opts.viewer),
         DirectSettings::new(opts.viewer_options.clone()),
         viewer_env.clone(),
-    )
-    .with_internet(true);
+    );
+    let viewer = match opts.internet {
+        Some(on) => viewer.with_internet(on),
+        None => viewer,
+    };
     NatFx {
         session: *session,
         viewer,
@@ -391,18 +406,19 @@ fn host_half(
     deps.sessions = rig.host.clone();
     let ends = Arc::new(Ends::default());
     deps.audit = ends.clone();
-    let direct = Arc::new(
-        DirectHost::new(
-            rig.host.clone(),
-            None,
-            key(opts.host),
-            DirectSettings::new(opts.host_options.clone()),
-            env.clone(),
-            deps.kill.clone(),
-            Arc::new(|_: &MediaOutcome| {}),
-        )
-        .with_internet(true),
+    let direct = DirectHost::new(
+        rig.host.clone(),
+        None,
+        key(opts.host),
+        DirectSettings::new(opts.host_options.clone()),
+        env.clone(),
+        deps.kill.clone(),
+        Arc::new(|_: &MediaOutcome| {}),
     );
+    let direct = Arc::new(match opts.internet {
+        Some(on) => direct.with_internet(on),
+        None => direct,
+    });
     let taps = Taps {
         inner: direct as Arc<dyn PathExchange>,
         from_viewer: Arc::default(),
@@ -673,6 +689,36 @@ async fn home_and_home_go_direct_through_stun() {
             ran.summary
         );
         assert_eq!(ran.asked, (GATHERED, GATHERED));
+    }
+}
+
+/// Step B12: the build's own scope ([`INTERNET_DIRECT`]), with neither
+/// half told to use the internet, as the app builds them: home × home goes
+/// direct over the internet through STUN within 2.5 s, as the first row
+/// does, both sides asking what that row's sides ask. A build whose direct
+/// connections stay on the same site (Phase A) fails here: its viewer never
+/// offers more than the site.
+#[tokio::test(start_paused = true)]
+async fn this_build_goes_direct_over_the_internet() {
+    for (viewer, host) in orders() {
+        let lab = Lab::new(1);
+        let (v, _) = lab.viewer_home(|b| b);
+        let (h, _) = lab.host_home(|b| b);
+        let opts = NatOpts::new(viewer, host).in_the_builds_scope();
+        let ran = run(&lab, v, h, &opts).await;
+        let (route, winner, elapsed) = ran.direct();
+        assert_eq!(route, INTERNET_V4);
+        assert_eq!(winner, CandidateKind::Srflx);
+        assert!(elapsed <= HOME_BOUND, "{elapsed:?}");
+        assert_eq!(ran.transport, Some(TransportKind::Direct));
+        assert_eq!(ran.says(), ("direct", Some("srflx"), false));
+        assert_eq!(ran.asked, (GATHERED, GATHERED));
+        assert!(
+            offered(&ran.from_host)
+                .iter()
+                .all(|(_, scope)| *scope == Scope::Internet),
+            "the host echoed the internet scope"
+        );
     }
 }
 

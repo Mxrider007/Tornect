@@ -1248,6 +1248,16 @@ where
     }
 }
 
+impl<S> Raw<S> {
+    /// The viewer in same-site scope whatever the build's scope (a
+    /// `lan_only` side's, or a Phase A build's), with its policy still
+    /// `Any`.
+    fn in_same_site_scope(mut self) -> Self {
+        self.viewer = self.viewer.with_internet(false);
+        self
+    }
+}
+
 async fn raw_duplex(host_feats: &[&str], policy: u8) -> Raw<DuplexStream> {
     let (client_end, host_end) = duplex(64 * 1024);
     raw(client_end, host_end, host_feats, policy).await
@@ -1307,12 +1317,16 @@ async fn an_old_host_is_sent_the_m1_bytes_at_once() {
 /// The direct design §4 "Frame limits" and "Scope", on the viewer: of the
 /// host's frames it takes at most 6 `CANDIDATES` and one `DONE` (the rest
 /// are dropped and counted, never answered), and drops (and counts) a frame
-/// whose scope is above its own; the host's `TOR_FALLBACK{OFF}` then ends
-/// the attempt as the host's policy, answered `PEER_OFF` after the link
-/// closed. The viewer's own frames carry its scope.
+/// whose scope is above its own (a viewer in same-site scope, as a Phase A
+/// build's or a `lan_only` one's, is sent an internet frame); the host's
+/// `TOR_FALLBACK{OFF}` then ends the attempt as the host's policy, answered
+/// `PEER_OFF` after the link closed. The viewer's own frames carry its
+/// scope.
 #[tokio::test(start_paused = true)]
 async fn the_hosts_frames_are_limited_and_scoped() {
-    let mut fx = raw_duplex(&[feats::DIR1], transport::ANY).await;
+    let mut fx = raw_duplex(&[feats::DIR1], transport::ANY)
+        .await
+        .in_same_site_scope();
     let host = &mut fx.host;
     let script = async {
         let (kind, body) = viewer_frame(host).await;

@@ -2451,7 +2451,7 @@ connection) and `tor_only` sends zero candidates.
 *Amended at M2 (decisions M1-77…M1-86; design `direct`, revision 4).* Two phases in one milestone. **Phase A** (built;
 checkpoint `m2a`, tagged by the owner after its dev-VM demo, fuzz runs and release zips, M1-77) is the same-site path:
 on-link private IPv4 and unique-local IPv6 candidates only, no third party contacted
-(`tornect_session::direct::INTERNET_DIRECT = false`). **Phase B** (not built) adds the internet candidates: one public IPv4, one global IPv6, a
+(`tornect_session::direct::INTERNET_DIRECT = false` in that build). **Phase B** (built; on since step B12, `INTERNET_DIRECT = true`) adds the internet candidates: one public IPv4, one global IPv6, a
 server-reflexive one from one public STUN server per side (a hand-written RFC 8489 Binding codec, not the `stun`
 crate) and one router mapping per side (`crab_nat` PCP/NAT-PMP, `igd-next` UPnP); the gateway from `netdev`'s
 `gateway` feature on Linux and macOS and from `GetBestRoute2` on Windows (M1-81). Candidate gathering reads the

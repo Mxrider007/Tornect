@@ -35,11 +35,13 @@ pub use viewer::{
 pub use wire::{from_wire, to_wire};
 
 /// Whether a session may reach beyond the same site (the direct design
-/// §4): public addresses, server-reflexive and mapped candidates. Off in
-/// Phase A, so both sides' scope is always
-/// [`Scope::SameSite`](tornect_net::Scope::SameSite); Phase B
-/// turns it on once its gathering and its tests land.
-pub const INTERNET_DIRECT: bool = false;
+/// §4): public addresses, server-reflexive and mapped candidates. On since
+/// step B12 of the direct design (Phase B), once its gathering, the NAT
+/// matrix and the redaction e2e were green; a session still keeps to
+/// [`Scope::SameSite`](tornect_net::Scope::SameSite) when either side is
+/// `lan_only`. Off, it is the Phase A build (checkpoint `m2a`), whose
+/// sessions never leave the same site and ask no third party.
+pub const INTERNET_DIRECT: bool = true;
 
 /// The quinn send priority of a direct connection's media stream, on both
 /// ends (the direct design §6.7): higher is sent first, so the viewer's

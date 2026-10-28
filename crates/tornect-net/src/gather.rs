@@ -22,8 +22,9 @@
 //!   it ([`Mapping::keep_renewed`]) until the link closes, which drops it
 //!   and so releases it on the link's runtime.
 //!
-//! The app starts the names' refresh when the internet direct path is on
-//! (steps B11, B12); until then only tests ask a server.
+//! The app starts the names' refresh once Tor has bootstrapped, and it
+//! looks names up only while a session may ask a server (design §5.3;
+//! steps B11, B12).
 //!
 //! - **Who is asked** (§5.3, decision M1-81): the servers of this side's
 //!   part of the list ([`stun::partition`]), one at a time. The first,
