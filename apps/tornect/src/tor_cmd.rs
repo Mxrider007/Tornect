@@ -4402,6 +4402,25 @@ mod tests {
         while streams.join_next().await.is_some() {}
     }
 
+    /// Waits, at most 5 s, until `services` has no stream open. A refused
+    /// stream gives its place up only as its task returns, just after the
+    /// refusal was written, so a viewer that has read the refusal can look
+    /// before it did (the OPEN row of the review of step B11: read once,
+    /// the count was 1 under load).
+    async fn no_open_services_streams(services: &ServicesHost, what: &str) {
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while services.open_streams() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "{what}: {} services streams still open",
+            services.open_streams()
+        );
+    }
+
     /// Design `services` §0, §6.1, and the review of steps 20–21: the
     /// terminal host serves a bound session's services stream as a window
     /// host whose `[services]` switches are all off would: once the session's
@@ -4462,7 +4481,7 @@ mod tests {
             "{heard:?}"
         );
         assert_eq!(media.live(), 1, "the session goes on");
-        assert_eq!(services.open_streams(), 0);
+        no_open_services_streams(&services, "the onion stream").await;
         drop(viewer);
         media.on_end(&session_id, None);
         while streams.join_next().await.is_some() {}
@@ -4823,7 +4842,7 @@ mod tests {
         );
         assert_eq!(media.route(&sid), Some(TransportKind::Lan));
         assert_eq!(media.live(), 1, "the session goes on");
-        assert_eq!(services.open_streams(), 0);
+        no_open_services_streams(&services, "the direct stream").await;
         assert_eq!(
             log.opens.load(Ordering::SeqCst),
             1,
@@ -4894,7 +4913,7 @@ mod tests {
             );
             assert_eq!(media.route(&sid), Some(TransportKind::Lan), "{case}");
             assert_eq!(media.live(), 1, "{case}: the session goes on");
-            assert_eq!(services.open_streams(), 0, "{case}");
+            no_open_services_streams(&services, &case).await;
             assert_eq!(
                 log.opens.load(Ordering::SeqCst),
                 0,
