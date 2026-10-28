@@ -329,6 +329,14 @@ async fn nat_fixture(
     host_spec: MachineSpec,
     opts: &NatOpts,
 ) -> NatFx {
+    let host_machine = lab.net.machine(host_spec);
+    let viewer_machine = lab.net.machine(viewer_spec);
+    nat_fixture_on(viewer_machine, host_machine, opts).await
+}
+
+/// [`nat_fixture`] on machines the caller made: the viewer's and the
+/// host's halves may share one machine (two instances on one computer).
+async fn nat_fixture_on(viewer_machine: MemHost, host_machine: MemHost, opts: &NatOpts) -> NatFx {
     let tmp = tempfile::tempdir().unwrap();
     let onion = Arc::new(HostIdentity::from_seed(&[0x52; 32]));
     let trusted = Arc::new(TrustedDeviceStore::with(
@@ -340,7 +348,7 @@ async fn nat_fixture(
     consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
     let mut deps = HostDeps::headless(onion.clone(), trusted);
     deps.consent = consent;
-    let host_env = CountingEnv::new(lab.net.machine(host_spec));
+    let host_env = CountingEnv::new(host_machine);
     let (taps, ends, rig) = host_half(&mut deps, &host_env, opts);
     let mut cfg = HostConfig::new("Desk", key(opts.host).verifying_key().to_bytes());
     cfg.transport = TransportKnob::fixed(opts.host_policy);
@@ -364,7 +372,7 @@ async fn nat_fixture(
     else {
         panic!("no session");
     };
-    let viewer_env = CountingEnv::new(lab.net.machine(viewer_spec));
+    let viewer_env = CountingEnv::new(viewer_machine);
     let viewer = ViewerDirect::new(
         key(opts.viewer),
         DirectSettings::new(opts.viewer_options.clone()),
@@ -591,7 +599,22 @@ async fn run_with<T>(
     opts: &NatOpts,
     before: impl FnOnce(&NatFx) -> T,
 ) -> (Ran, T) {
-    let mut fx = nat_fixture(lab, viewer, host, opts).await;
+    let fx = nat_fixture(lab, viewer, host, opts).await;
+    run_fixture(fx, opts, before).await
+}
+
+/// [`run`] on machines the caller made ([`nat_fixture_on`]).
+async fn run_on(viewer: MemHost, host: MemHost, opts: &NatOpts) -> Ran {
+    let fx = nat_fixture_on(viewer, host, opts).await;
+    run_fixture(fx, opts, |_| ()).await.0
+}
+
+/// The session of `fx`, its path phase run to its end as [`run`] says.
+async fn run_fixture<T>(
+    mut fx: NatFx,
+    opts: &NatOpts,
+    before: impl FnOnce(&NatFx) -> T,
+) -> (Ran, T) {
     let early = before(&fx);
     let choice = fx.choose(opts.mine).await;
     let asked = fx.asked();
@@ -1393,6 +1416,67 @@ async fn a_lan_only_viewer_keeps_both_sides_on_the_site() {
                 .collect();
             assert!(!scopes.is_empty());
             assert!(scopes.iter().all(|s| *s == scope::SAME_SITE), "{scopes:?}");
+        }
+    }
+}
+
+/// Two instances on one computer (decision M1-82's deviation from design
+/// §12.5 "two instances on one VM still give `ROUTE direct lan`"): the
+/// viewer's and the host's halves share one machine behind a home router.
+/// Each refuses the other's host candidate as one of its own addresses
+/// (design §7.7), so the site never carries them. On the site only (Phase
+/// A's scope), in internet scope with STUN and every router protocol off,
+/// and behind a router that does not hairpin, the viewer falls back
+/// `tor no-path` having heard nothing, no QUIC datagram is sent and the
+/// host's summary says `no-path`. Behind a router that hairpins, the two
+/// meet at their server-reflexive addresses: `direct internet`, never
+/// `direct lan`. No datagram is ever addressed to the machine itself.
+#[tokio::test(start_paused = true)]
+async fn two_instances_on_one_machine_never_go_direct_on_the_site() {
+    let [low, _, high] = keys_by_order();
+    // (internet scope, STUN and the router protocols on, the box hairpins)
+    for (internet, gather, hairpin) in [
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let row = format!("internet {internet}, gather {gather}, hairpin {hairpin}");
+        let lab = Lab::new(1);
+        let (spec, _nat) = lab.viewer_home(|b| NatBox { hairpin, ..b });
+        let own = spec.addrs[0].ip;
+        let machine = lab.net.machine(spec);
+        let mut opts = NatOpts::new(low, high);
+        opts.internet = Some(internet);
+        if !gather {
+            opts = opts.without_stun();
+            opts.viewer_options.map = MapProtocols::NONE;
+            opts.host_options.map = MapProtocols::NONE;
+        }
+        let ran = run_on(machine.clone(), machine, &opts).await;
+        let wire = lab.net.wire();
+        assert!(wire.iter().all(|w| w.to.ip() != own), "{row}");
+        if internet && gather && hairpin {
+            let (route, winner, _) = ran.direct();
+            assert_eq!(route, INTERNET_V4, "{row}");
+            assert_eq!(PathEnd::Direct(route).route_words(), "direct internet");
+            assert_eq!(winner, CandidateKind::Srflx, "{row}");
+            assert_eq!(ran.transport, Some(TransportKind::Direct), "{row}");
+            assert_eq!(ran.says(), ("direct", Some("srflx"), false), "{row}");
+        } else {
+            let (why, _) = ran.tor();
+            assert_eq!(
+                why,
+                TorWhy::Fallback(FallbackWhy::NoPath { heard: false }),
+                "{row}"
+            );
+            assert_eq!(PathEnd::Tor(why).route_words(), "tor no-path");
+            assert_eq!(ran.transport, None, "{row}");
+            assert_eq!(ran.says(), ("no-path", None, false), "{row}");
+            assert!(
+                wire.iter().all(|w| w.kind != WireKind::Other),
+                "{row}: QUIC sent"
+            );
         }
     }
 }
