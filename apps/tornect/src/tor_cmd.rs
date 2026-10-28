@@ -4792,6 +4792,127 @@ mod tests {
         assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
     }
 
+    /// Design `direct` §6.7 under `lan_only` (decisions M1-79 and M1-85),
+    /// with the host wired as `tornect host` wires it and its services in
+    /// the wiring's slot: whether the host signs `lan_only` or the viewer
+    /// holds it, the session binds on its same-site link, its services ride
+    /// that connection as its second stream (the terminal host's all-off
+    /// services refuse them there, `NOT_OFFERED`) and the session goes on;
+    /// no onion stream is opened at all, since a `lan_only` session has no
+    /// Tor fallback to pre-open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lan_only_sessions_services_ride_its_link() {
+        use tornect_proto::services::reason;
+        let mut lan_only = Config::default();
+        lan_only.network.lan_only = true;
+        for (seed, host_cfg, viewer_cfg) in [
+            (15, &lan_only, &Config::default()),
+            (16, &Config::default(), &lan_only),
+        ] {
+            let case = format!("host lan_only {}", host_cfg.network.lan_only);
+            let (viewer_net, host_net) = lan_pair(seed);
+            let media = test_card();
+            let mut rig = rig(host_cfg, host_net, Arc::clone(&media)).await;
+            let services = terminal_services(&media);
+            rig._wiring.services.set(&services);
+            let session = &mut rig.session;
+            assert!(session.host_has(feats::SVC1), "{case}");
+            let sid = session.session_token().session_id();
+            let ctx = viewer_ctx(viewer_cfg, Arc::new(viewer_net), 0x22, false);
+            let log = OnionLog::default();
+            let binding = Binding::new(session.session_token(), &session.th());
+            let (_stop, stopped) = watch::channel(false);
+            let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+                .await
+                .unwrap_or_else(|end| panic!("{case}: not bound: {end:?}"));
+            assert_eq!(
+                crate::direct::route_line(&bound.end),
+                "ROUTE direct lan",
+                "{case}"
+            );
+            assert!(!bound.onion_services, "{case}");
+            let MediaPath::Direct(_viewer) = bound.media else {
+                panic!("{case}: not direct");
+            };
+            let direct = bound
+                .direct_services
+                .unwrap_or_else(|| panic!("{case}: svc1 offered, no direct services stream"));
+            let (start, news, _ops) = kept_services(session.session_token());
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                run_direct_services(direct, start, std::future::pending()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the refusal comes once capture is live"));
+            let heard = std::mem::take(&mut *news.lock().unwrap());
+            assert!(
+                matches!(
+                    heard.as_slice(),
+                    [ServicesNews::NotOpened(Some(reason::NOT_OFFERED))]
+                ),
+                "{case}: {heard:?}"
+            );
+            assert_eq!(media.route(&sid), Some(TransportKind::Lan), "{case}");
+            assert_eq!(media.live(), 1, "{case}: the session goes on");
+            assert_eq!(services.open_streams(), 0, "{case}");
+            assert_eq!(
+                log.opens.load(Ordering::SeqCst),
+                0,
+                "{case}: no onion stream at all"
+            );
+        }
+    }
+
+    /// The step B10 late-bound slot (`ServicesSlot`): a direct
+    /// connection's second stream that arrives before the host set its
+    /// services is dropped, so the viewer hears its services did not open
+    /// (no refusal code), and the session goes on, on its direct route,
+    /// with nothing opened over the onion service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_stream_before_the_services_are_set_is_dropped_alone() {
+        let (viewer_net, host_net) = lan_pair(17);
+        let media = test_card();
+        // The wiring's slot is left unset.
+        let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let session = &mut rig.session;
+        assert!(session.host_has(feats::SVC1));
+        let sid = session.session_token().session_id();
+        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        assert!(!bound.onion_services);
+        let MediaPath::Direct(_viewer) = bound.media else {
+            panic!("not direct");
+        };
+        let direct = bound
+            .direct_services
+            .expect("svc1 offered: the direct services stream");
+        let (start, news, _ops) = kept_services(session.session_token());
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_direct_services(direct, start, std::future::pending()),
+        )
+        .await
+        .expect("the dropped stream ends the services' start");
+        let heard = std::mem::take(&mut *news.lock().unwrap());
+        assert!(
+            matches!(heard.as_slice(), [ServicesNews::NotOpened(None)]),
+            "{heard:?}"
+        );
+        assert_eq!(media.route(&sid), Some(TransportKind::Lan));
+        assert_eq!(media.live(), 1, "the session goes on");
+        assert_eq!(
+            log.opens.load(Ordering::SeqCst),
+            1,
+            "the media pre-open only: no onion services stream"
+        );
+        assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
+    }
+
     /// One circuit's streams on a fake onion service, counted: the
     /// signaling stream is open from the start, and each stream opened
     /// counts until its viewer end is gone (its host end then reads the
