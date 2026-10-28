@@ -622,6 +622,15 @@ where
                 Err(choice) => Step::Done(choice),
             }
         }
+        // Gathering is over and this side offered nothing: it had no host
+        // candidate in scope (only a carrier-grade address, say) and found
+        // no server-reflexive or mapped one. The host starts its link at
+        // the first `CANDIDATES`, which an empty frame cannot be, so
+        // nothing would ever reach it: fall back now, as a link that could
+        // not start does, rather than at the punch timeout.
+        LinkNews::Local(LocalBatch::Done) if at.candidates_out == 0 => {
+            Step::GiveUp(TorWhy::Fallback(FallbackWhy::HereNoAddresses))
+        }
         LinkNews::Local(LocalBatch::Done) => match race(stop, session.send_candidates_done()).await
         {
             None => Step::Done(PathChoice::Interrupted),

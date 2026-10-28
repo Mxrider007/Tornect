@@ -1361,6 +1361,42 @@ async fn a_lan_only_viewer_keeps_both_sides_on_the_site() {
     }
 }
 
+/// Settles the direct design's open residual of step B6 (decision M1-87):
+/// a viewer with no host candidate in scope (an address on a carrier-grade
+/// NAT only) whose gathering finds nothing (its STUN server silent, its
+/// gateway's router too) used to send only `CANDIDATES_DONE` and wait for
+/// its punch timeout. It now falls back as
+/// soon as its gathering is over, with `NO_ADDRESSES`: at the gathering
+/// budget, the one frame it writes is `TOR_FALLBACK{NO_ADDRESSES}`, and the
+/// host, which starts its link at the first `CANDIDATES`, asks its network
+/// nothing at all.
+#[tokio::test(start_paused = true)]
+async fn a_viewer_that_gathers_nothing_falls_back_at_once() {
+    for (viewer, host) in orders() {
+        let lab = Lab::new(1);
+        lab.stun[0].set_mode(StunMode::Silent);
+        let (v, _) = lab.carrier_only();
+        let (h, _) = lab.host_home(|b| b);
+        let opts = NatOpts::new(viewer, host);
+        let ran = run(&lab, v, h, &opts).await;
+        let (why, elapsed) = ran.tor();
+        assert_eq!(why, TorWhy::Fallback(FallbackWhy::HereNoAddresses));
+        assert_eq!(elapsed, GATHER_BUDGET);
+        assert_eq!(
+            ran.from_viewer,
+            [PathFrame::TorFallback(Some(fallback::NO_ADDRESSES))]
+        );
+        assert!(ran.from_host.is_empty(), "{:?}", ran.from_host);
+        assert_eq!(ran.says(), ("no-addresses", None, false));
+        assert!(
+            fallback_ms(elapsed, opts.one_way).contains(&ran.summary.ms),
+            "{:?}",
+            ran.summary
+        );
+        assert_eq!(ran.asked, (GATHERED, Asked::NOTHING));
+    }
+}
+
 /// §12.4 "`LaggedDuplex` 1.5 s one way, home × home → Direct or
 /// `Tor(HostSilent)` exactly at T0+4.0 s; nomination grace ≤ 600 ms". With
 /// three times the delay the host's candidates reach the viewer 3 s after
