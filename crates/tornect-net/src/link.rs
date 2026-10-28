@@ -45,7 +45,7 @@ use std::fmt;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -238,6 +238,8 @@ struct Shared {
     gather: Arc<Mutex<GatherStats>>,
     /// Stream bytes read on this link's connection.
     received: AtomicU64,
+    /// The link was shut ([`LinkInner::shut`]).
+    shut: AtomicBool,
 }
 
 impl Shared {
@@ -278,6 +280,7 @@ impl LinkInner {
     /// the releases started after this returns cannot miss it. Needs no
     /// runtime context, so a drop anywhere closes.
     fn shut(&self) {
+        self.shared.shut.store(true, Ordering::Relaxed);
         self.driver.abort();
         if let Some(release) = &self.release {
             release.shut();
@@ -854,6 +857,25 @@ impl Established {
     #[must_use]
     pub fn stats(&self) -> LinkStats {
         self.inner.stats()
+    }
+
+    /// Shuts the whole link at once, whoever else still holds it (a clone,
+    /// a stream): the driver and the gathering stop, the router mapping's
+    /// release starts, and the endpoint closes with every connection on it
+    /// ([`DirectLink::close`] without its drain wait). The viewer's failed
+    /// direct `Bind` shuts its link so before the caller may write
+    /// `TOR_FALLBACK` (design §4). Read [`Self::closed_by_crypto`] first:
+    /// this side's close is the connection's reason when the peer gave none.
+    pub fn shut(&self) {
+        self.inner.shut();
+    }
+
+    /// Whether the link was shut: [`Self::shut`], [`DirectLink::close`], or
+    /// the last holder's drop (never seen through a holder).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn is_shut(&self) -> bool {
+        self.inner.shared.shut.load(Ordering::Relaxed)
     }
 
     /// Closes the connection with the application `code` and `reason`, as

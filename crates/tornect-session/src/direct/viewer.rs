@@ -205,8 +205,8 @@ impl PathChoice {
 }
 
 /// A session's open direct media stream, ready for the `Bind` (the direct
-/// design §8.5 `DirectMedia`), and what opens its services stream beside it
-/// ([`Self::services`]).
+/// design §8.5 `DirectMedia`); a successful [`Self::bind`] also hands over
+/// what opens the services stream beside it ([`DirectBound::services`]).
 pub struct DirectMedia {
     /// The media stream, opened at priority 1. The host sees it once the
     /// `Bind` is written.
@@ -221,7 +221,8 @@ pub struct DirectMedia {
     pub winner: CandidateKind,
     /// From the accept to the open stream.
     pub elapsed: Duration,
-    /// The connection: [`after_bind_close`] reads it when the bind fails.
+    /// The connection: [`after_bind_close`] reads it when the bind fails,
+    /// and [`Self::bind`] then shuts it.
     pub link: Established,
     /// The direct services binding, when the host's `HELLO_ACK` offers
     /// services (`svc1`).
@@ -251,41 +252,53 @@ pub struct DirectBindFailed {
     pub after: AfterBind,
 }
 
-impl DirectMedia {
+/// A direct media stream past its `Bind` ([`DirectMedia::bind`]), and what
+/// opens the session's services stream beside it.
+#[derive(Debug)]
+pub struct DirectBound {
+    /// The bound media stream.
+    pub media: MediaViewer<QuicStream>,
     /// What opens the session's services stream on this connection (the
-    /// direct design §6.7), to be opened once [`Self::bind`] succeeded;
-    /// `None` when the host offers no services. The onion services port is
-    /// never used while the media is direct.
-    #[must_use]
-    pub fn services(&self) -> Option<DirectServices> {
-        self.services.clone().map(|binding| DirectServices {
-            link: self.link.clone(),
-            binding,
-        })
-    }
+    /// direct design §6.7); `None` when the host offers no services
+    /// (`svc1`). The onion services port is never used while the media is
+    /// direct. It comes with the bound media only: nothing outside the
+    /// path phase holds the connection while a failed bind may still fall
+    /// back (§4).
+    pub services: Option<DirectServices>,
+}
 
+impl DirectMedia {
     /// Write the `Bind` and wait up to `wait` for the host's `BindProof`
     /// and `BindOk` ([`MediaViewer::bind`]; the caller's bind wait, never
-    /// the punch window). On failure the connection is dropped, and
+    /// the punch window). On failure the link is shut, whoever else still
+    /// holds it, before [`DirectBindFailed`] is returned: the caller may
+    /// then write `TOR_FALLBACK` (the direct design §4), and
     /// [`DirectBindFailed::after`] says whether the session may still use
     /// the onion path (decision M1-79's one exception).
     ///
     /// # Errors
     ///
     /// [`DirectBindFailed`], as above.
-    pub async fn bind(self, wait: Duration) -> Result<MediaViewer<QuicStream>, DirectBindFailed> {
+    pub async fn bind(self, wait: Duration) -> Result<DirectBound, DirectBindFailed> {
         let Self {
             stream,
             binding,
             link,
+            services,
             ..
         } = self;
         match MediaViewer::bind(stream, &binding, wait).await {
-            Ok(viewer) => Ok(viewer),
-            Err(error) => Err(DirectBindFailed {
-                error,
-                after: after_bind_close(&link),
+            Ok(media) => Ok(DirectBound {
+                media,
+                services: services.map(|binding| DirectServices { link, binding }),
             }),
+            Err(error) => {
+                // The reading first: this side's shut would otherwise be
+                // the connection's close reason.
+                let after = after_bind_close(&link);
+                link.shut();
+                Err(DirectBindFailed { error, after })
+            }
         }
     }
 }

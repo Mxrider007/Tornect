@@ -110,6 +110,8 @@ struct Opts {
     /// Both halves in internet scope ([`ViewerDirect::with_internet`],
     /// [`DirectHost::with_internet`]).
     internet: bool,
+    /// The host's `HELLO_ACK` offers services (`svc1`).
+    host_svc1: bool,
 }
 
 impl Opts {
@@ -127,6 +129,7 @@ impl Opts {
             punch: PUNCH,
             backend: TestBackend::default,
             internet: false,
+            host_svc1: false,
         }
     }
 }
@@ -288,6 +291,9 @@ async fn fixture(opts: &Opts) -> Fx {
     cfg.transport = TransportKnob::fixed(opts.host_policy);
     if opts.host_dir1 {
         cfg.feats.push(feats::DIR1.to_owned());
+    }
+    if opts.host_svc1 {
+        cfg.feats.push(feats::SVC1.to_owned());
     }
     let (client_end, host_end) = duplex(64 * 1024);
     let log = Arc::new(WriteLog::default());
@@ -1049,6 +1055,42 @@ async fn a_pin_the_host_refuses_leaves_the_onion_fallback_open() {
     assert_eq!(path.expect("a summary").outcome, "pin-refused");
 }
 
+/// The direct design §4 with the host's services offered (`svc1`, §6.7):
+/// what opens the services stream comes with a bound media stream only, and
+/// a failed bind shuts the link whoever else holds it. Here a clone of the
+/// connection outlives the bind, as a services binding taken before it
+/// would; the host refuses the pin, and when the bind returns the link is
+/// already shut (its driver, gathering and endpoint gone), before the
+/// caller writes `TOR_FALLBACK{QUIC}`.
+#[tokio::test(start_paused = true)]
+async fn a_failed_bind_shuts_the_link_before_the_fallback_whoever_holds_it() {
+    let [viewer, other, host] = keys_by_order();
+    let mut opts = Opts::new(viewer, host);
+    opts.link_key = Some(other);
+    opts.host_svc1 = true;
+    let mut fx = fixture(&opts).await;
+    assert!(fx.session.host_has(feats::SVC1));
+    let media = direct(fx.choose(Mine::of(ANY), true).await);
+    let held = media.link.clone();
+    assert!(!held.is_shut());
+    let failed = media.bind(WAIT).await.unwrap_err();
+    assert_eq!(failed.after, AfterBind::Fallback, "{:?}", failed.error);
+    assert!(held.is_shut(), "the link is shut before TOR_FALLBACK");
+    assert!(held.open_stream(0).await.is_err());
+    fx.session
+        .send_tor_fallback(Some(fallback::QUIC))
+        .await
+        .unwrap();
+    exchanged_then(
+        &fx.frames(3).await,
+        &[PathFrame::TorFallback(Some(fallback::QUIC))],
+    );
+    drop(held);
+    let (transport, path) = fx.end(bye::USER).await;
+    assert_eq!(transport, None);
+    assert_eq!(path.expect("a summary").outcome, "pin-refused");
+}
+
 /// Revision 1 blocker 1 through the caller (the direct design §4
 /// "Constants", §12.1): `choose_path` hands over an open stream well inside
 /// the 4 s punch window, and the caller's bind wait (30 s) covers the host's
@@ -1096,7 +1138,7 @@ async fn a_five_second_dialog_binds_through_the_caller() {
 async fn bind_through(
     fx: &mut Fx,
     wait: Duration,
-) -> (Result<MediaViewer<QuicStream>, DirectBindFailed>, Duration) {
+) -> (Result<DirectBound, DirectBindFailed>, Duration) {
     let t0 = Instant::now();
     let media = direct(fx.choose(Mine::of(ANY), true).await);
     assert!(media.elapsed < PUNCH, "{:?}", media.elapsed);

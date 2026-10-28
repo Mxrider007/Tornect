@@ -479,6 +479,38 @@ async fn close_ends_the_connection_on_both_sides() {
     assert!(!host.closed_by_crypto());
 }
 
+/// Design §4 for a link someone else still holds: the viewer's failed
+/// direct bind shuts its link while a clone of its connection (a services
+/// binding, a stream) is still alive. The clone sees the link shut, its
+/// driver stops, a new stream fails, and the host's connection ends; a
+/// second shut changes nothing.
+#[tokio::test]
+async fn shut_ends_the_link_whoever_else_holds_it() {
+    let mut pair = start_pair(
+        Arc::new(LoopbackNet::new(80)),
+        Arc::new(LoopbackNet::new(81)),
+        (1, 2),
+    )
+    .await;
+    let (viewer, host) = both_established(&mut pair).await;
+    let (_viewer_stream, _host_stream) = media_stream(&viewer, &host).await;
+    let held = viewer.clone();
+    assert!(!held.is_shut());
+    viewer.shut();
+    assert!(held.is_shut());
+    within(1, async {
+        while !held.inner.driver.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    within(5, host.closed()).await;
+    assert!(held.open_stream(0).await.is_err());
+    assert!(!host.closed_by_crypto());
+    viewer.shut();
+    assert!(held.is_shut());
+}
+
 /// Every message of `e` and of each error under it, and its `Debug`.
 fn error_texts(e: &(dyn std::error::Error + 'static)) -> Vec<String> {
     let mut texts = vec![format!("{e:?}")];

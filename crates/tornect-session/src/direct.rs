@@ -29,7 +29,8 @@ mod wire;
 pub use decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide};
 pub use host::{DirectHost, DirectHostStats, OnMedia};
 pub use viewer::{
-    DirectBindFailed, DirectMedia, DirectServices, PathChoice, ViewerDirect, ViewerDirectStats,
+    DirectBindFailed, DirectBound, DirectMedia, DirectServices, PathChoice, ViewerDirect,
+    ViewerDirectStats,
 };
 pub use wire::{from_wire, to_wire};
 

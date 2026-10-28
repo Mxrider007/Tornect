@@ -341,7 +341,8 @@ impl Lx {
         let viewer_media = media
             .bind(BIND_WAIT)
             .await
-            .expect("BindProof verified, BindOk read");
+            .expect("BindProof verified, BindOk read")
+            .media;
         let to_bind_ok = self.accepted.elapsed();
         assert_eq!(
             self.rig.host.route(&self.session_id),
@@ -470,11 +471,12 @@ async fn a_direct_session_carries_its_services_beside_the_media() {
     let PathChoice::Direct(media) = choice else {
         panic!("not direct: {choice:?}");
     };
-    let direct = media
-        .services()
-        .expect("svc1 offered: a direct services stream");
+    let DirectBound {
+        media: viewer_media,
+        services: direct,
+    } = media.bind(BIND_WAIT).await.expect("bound");
+    let direct = direct.expect("svc1 offered: a direct services stream");
     assert_eq!(direct.binding().session_id(), lx.session_id);
-    let viewer_media = media.bind(BIND_WAIT).await.expect("bound");
     assert_eq!(lx.rig.host.route(&lx.session_id), Some(TransportKind::Lan));
 
     let stream = tokio::time::timeout(WAIT, direct.open())
@@ -639,8 +641,11 @@ async fn serving(viewer_x: u8, host_x: u8, doing: Doing) -> Serving {
     let PathChoice::Direct(media) = choice else {
         panic!("not direct: {choice:?}");
     };
-    let direct = media.services().expect("svc1 offered");
-    let viewer_media = media.bind(BIND_WAIT).await.expect("bound");
+    let DirectBound {
+        media: viewer_media,
+        services: direct,
+    } = media.bind(BIND_WAIT).await.expect("bound");
+    let direct = direct.expect("svc1 offered");
     let stream = tokio::time::timeout(WAIT, direct.open())
         .await
         .expect("the second stream opens at once")

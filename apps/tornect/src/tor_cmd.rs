@@ -28,9 +28,9 @@ use tornect_session::services::{
     ViewerOp, ViewerServicesEnd,
 };
 use tornect_session::{
-    AfterBind, Binding, Decision, DesktopBackend, DirectBindFailed, DirectServices, FallbackWhy,
-    FrameSink, MediaHost, MediaLimits, MediaViewer, PathChoice, PathEnd, QuicStream, Screens,
-    ScreensNews, Source, SystemBackend, TorWhy, ViewerChannels, ViewerEnd, ViewerError,
+    AfterBind, Binding, Decision, DesktopBackend, DirectBindFailed, DirectBound, DirectServices,
+    FallbackWhy, FrameSink, MediaHost, MediaLimits, MediaViewer, PathChoice, PathEnd, QuicStream,
+    Screens, ScreensNews, Source, SystemBackend, TorWhy, ViewerChannels, ViewerEnd, ViewerError,
     ViewerRequest, ViewerStats, decide,
 };
 use tornect_signal::framing::FrameError;
@@ -1751,18 +1751,20 @@ where
             // The connection is up with the host's key pinned: the window
             // says so while the host opens its capture.
             direct.tell(PathEnd::Direct(route));
-            // The services ride the same connection (design `direct` §6.7).
-            let direct_services = media.services();
             match unless_interrupted(media.bind(MEDIA_BIND_WAIT), interrupted).await {
                 None => return Err(End::You),
-                Some(Ok(viewer)) => {
+                // The services ride the same connection (design `direct`
+                // §6.7), handed over with the bound media only: a failed
+                // bind leaves nothing holding the link while
+                // `TOR_FALLBACK` is written (§4).
+                Some(Ok(DirectBound { media, services })) => {
                     return Ok(BoundMedia {
-                        media: MediaPath::Direct(viewer),
+                        media: MediaPath::Direct(media),
                         end: PathEnd::Direct(route),
                         winner: Some(winner),
                         elapsed,
                         onion_services: false,
-                        direct_services,
+                        direct_services: services,
                     });
                 }
                 // A `lan_only` session never falls back: it ends as one
