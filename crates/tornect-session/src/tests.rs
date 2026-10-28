@@ -1510,6 +1510,42 @@ async fn a_viewer_with_nothing_to_say_pings_the_host() {
     let _ = bound.await;
 }
 
+/// A host that ended its stream before the viewer's answer to its last
+/// frame: the answer's write fails, while the host's `Close` is still
+/// unread behind that frame (on a direct QUIC stream the host's end stops
+/// the viewer's sending half; on this pipe the host's half is gone). The
+/// stream ends as the `Close` says, not with the write's error; with no
+/// `Close` among the frames left, the write's error stands.
+#[tokio::test(start_paused = true)]
+async fn a_failed_write_after_the_hosts_close_ends_as_the_close_says() {
+    for close in [true, false] {
+        let (mut host, viewer) = run_viewer_with(None).await;
+        // Neither task yields until the host's half is gone: the viewer
+        // reads the `Ping` only then, and its `Pong` fails.
+        write_msg(&mut host, &Msg::Ping { nonce: 7 }).await.unwrap();
+        if close {
+            let close = Msg::Close {
+                reason: reason::ENDED_BY_HOST,
+            };
+            write_msg(&mut host, &close).await.unwrap();
+        }
+        drop(host);
+        let (end, _) = tokio::time::timeout(WAIT, viewer).await.unwrap().unwrap();
+        if close {
+            assert!(
+                matches!(end, Ok(ViewerEnd::Host(reason::ENDED_BY_HOST))),
+                "{end:?}"
+            );
+        } else {
+            assert!(
+                matches!(&end, Err(ViewerError::Proto(tornect_proto::ProtoError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::BrokenPipe),
+                "{end:?}"
+            );
+        }
+    }
+}
+
 /// Bind a viewer over a pipe to a scripted host and run it with `input`;
 /// returns the host's end, past `BindOk`.
 async fn run_viewer_with(

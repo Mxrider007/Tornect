@@ -25,6 +25,9 @@ use crate::quality;
 const KEYFRAME_REQUEST_EVERY: Duration = Duration::from_millis(500);
 /// Bound on the `Close` written to a host that may not be reading.
 const LAST_WRITE: Duration = Duration::from_secs(5);
+/// Bound on the read for the host's `Close` after a write to it failed
+/// ([`host_said`]).
+const LAST_READ: Duration = Duration::from_secs(2);
 /// A viewer that has written nothing for this long pings the host, so that its
 /// silence means it is gone: the host lets go of held keys after a few seconds
 /// of it (`MediaLimits::viewer_quiet`, SLICE-C1 C1-3).
@@ -581,6 +584,17 @@ where
         // The request waiting for its answer, and the last id used.
         let mut pending: Option<Pending> = None;
         let mut last_request = 0u16;
+        // Every write: `stop` cutting it short ends the stream; a failed one
+        // ends it as the host's frames already here say ([`host_said`]).
+        macro_rules! write_or_end {
+            ($frame:expr) => {
+                match write_unless_stopped(&mut wr, $frame, stop.as_mut()).await {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(ViewerEnd::Stopped),
+                    Err(error) => return host_said(read, stop.as_mut(), error).await,
+                }
+            };
+        }
         loop {
             let give_up = pending.as_ref().map(|p| p.deadline);
             let msg = tokio::select! {
@@ -595,9 +609,7 @@ where
                         continue;
                     };
                     let frame = Msg::Input(event.encode());
-                    if !write_unless_stopped(&mut wr, &frame, stop.as_mut()).await? {
-                        return Ok(ViewerEnd::Stopped);
-                    }
+                    write_or_end!(&frame);
                     stats.input_sent += 1;
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                     continue;
@@ -611,9 +623,7 @@ where
                     let set = Msg::SetQuality {
                         quality: quality::code(preset),
                     };
-                    if !write_unless_stopped(&mut wr, &set, stop.as_mut()).await? {
-                        return Ok(ViewerEnd::Stopped);
-                    }
+                    write_or_end!(&set);
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                     continue;
                 }
@@ -643,9 +653,7 @@ where
                         list: listed.list,
                         monitor: asked,
                     };
-                    if !write_unless_stopped(&mut wr, &select, stop.as_mut()).await? {
-                        return Ok(ViewerEnd::Stopped);
-                    }
+                    write_or_end!(&select);
                     stats.monitor_requests += 1;
                     let now = tokio::time::Instant::now();
                     pending = Some(Pending {
@@ -678,9 +686,7 @@ where
                 () = tokio::time::sleep_until(next_ping) => {
                     nonce = nonce.wrapping_add(1);
                     let ping = Msg::Ping { nonce };
-                    if !write_unless_stopped(&mut wr, &ping, stop.as_mut()).await? {
-                        return Ok(ViewerEnd::Stopped);
-                    }
+                    write_or_end!(&ping);
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                     continue;
                 }
@@ -731,23 +737,17 @@ where
                             if keyframes.allow(Instant::now()) {
                                 stats.keyframe_requests += 1;
                                 let ask = Msg::KeyframeRequest;
-                                if !write_unless_stopped(&mut wr, &ask, stop.as_mut()).await? {
-                                    return Ok(ViewerEnd::Stopped);
-                                }
+                                write_or_end!(&ask);
                             }
                         }
                     }
                     let ack = Msg::VideoAck { seq };
-                    if !write_unless_stopped(&mut wr, &ack, stop.as_mut()).await? {
-                        return Ok(ViewerEnd::Stopped);
-                    }
+                    write_or_end!(&ack);
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                 }
                 Some(Msg::Ping { nonce }) => {
                     let pong = Msg::Pong { nonce };
-                    if !write_unless_stopped(&mut wr, &pong, stop.as_mut()).await? {
-                        return Ok(ViewerEnd::Stopped);
-                    }
+                    write_or_end!(&pong);
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                 }
                 Some(Msg::Pong { .. }) => {}
@@ -922,6 +922,44 @@ where
 {
     let msg = read_msg(&mut rd).await;
     (rd, msg)
+}
+
+/// How the stream ends after a write to the host failed with `error`: as
+/// the host's `Close` says, when one is among the frames already on their
+/// way, read through `read` (the read in progress, never cut short) for at
+/// most [`LAST_READ`]; with none, or once `stop` resolves, the write's
+/// error stands. A host's end can come before a frame this side writes
+/// after it: on a direct QUIC stream the host's end stops this side's
+/// sending half, so the `VideoAck` of a picture still unread at the end
+/// fails while that `Close` is still unread.
+async fn host_said<R, F, S>(
+    read: F,
+    stop: std::pin::Pin<&mut S>,
+    error: ViewerError,
+) -> Result<ViewerEnd, ViewerError>
+where
+    R: AsyncRead + Unpin,
+    F: Future<Output = (R, Result<Option<Msg>, ProtoError>)>,
+    S: Future<Output = ()>,
+{
+    let close = async {
+        let (mut rd, mut msg) = read.await;
+        loop {
+            match msg {
+                Ok(Some(Msg::Close { reason })) => return Some(reason),
+                Ok(Some(_)) => msg = read_msg(&mut rd).await,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        () = stop => Err(error),
+        close = tokio::time::timeout(LAST_READ, close) => match close {
+            Ok(Some(reason)) => Ok(ViewerEnd::Host(reason)),
+            Ok(None) | Err(_) => Err(error),
+        },
+    }
 }
 
 /// Write `msg`, unless `stop` resolves first: `Ok(false)` when it did. A write
