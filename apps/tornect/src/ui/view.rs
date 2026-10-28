@@ -2851,6 +2851,7 @@ mod tests {
         let model = Model {
             hosting: Hosting::Published {
                 reachable: true,
+                phase: tornect_signal::OnionPhase::Reachable,
                 state: "running".to_owned(),
                 problem: None,
             },

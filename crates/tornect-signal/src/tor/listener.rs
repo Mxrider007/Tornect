@@ -160,7 +160,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Sleep;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
-use tor_hsservice::status::{OnionServiceStatus, Problem};
+use tor_hsservice::status::{OnionServiceStatus, Problem, State};
 use tor_hsservice::{RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::stream::IncomingStreamRequest;
 use tornect_core::TornectId;
@@ -257,14 +257,51 @@ impl Default for RendezvousLimits {
     }
 }
 
+/// Where publishing the service stands, in the words a user is told
+/// (the final audit before the release): Arti's states, grouped. The
+/// window says these; Arti's own names and problems go to the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnionPhase {
+    /// Launched, its descriptor not out yet: `Shutdown` (the state a service
+    /// reports as it launches) or `Bootstrapping`. A listener that really
+    /// stops is no longer watched, so `Shutdown` is never its end here.
+    #[default]
+    Starting,
+    /// `Running` or `DegradedReachable`: clients can reach it.
+    Reachable,
+    /// `DegradedUnreachable` or `Recovering`, and any state a later Arti
+    /// adds: not reachable, and Tor keeps trying.
+    Trying,
+    /// `Broken`: Arti gave up on it.
+    Broken,
+}
+
+impl OnionPhase {
+    /// The phase of Arti's `state`.
+    #[must_use]
+    pub fn of(state: State) -> Self {
+        match state {
+            State::Shutdown | State::Bootstrapping => Self::Starting,
+            State::Running | State::DegradedReachable => Self::Reachable,
+            State::Broken => Self::Broken,
+            // `DegradedUnreachable`, `Recovering`, and what the
+            // non-exhaustive enum may add.
+            _ => Self::Trying,
+        }
+    }
+}
+
 /// Reachability of the published service, driven from Arti's status stream.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OnionStatus {
     /// `true` once the descriptor is on both HsDir rings and intro points are up
     /// (`Running` or `DegradedReachable`).
     pub reachable: bool,
+    /// Arti's state, grouped as a user is told it.
+    pub phase: OnionPhase,
     /// Arti's state name: `Shutdown`, `Bootstrapping`, `Running`,
     /// `DegradedReachable`, `DegradedUnreachable`, `Recovering`, `Broken`.
+    /// For the log and diagnostics, not for the window's words.
     pub state: String,
     /// The most severe current problem, if any (descriptor upload, intro points…).
     pub problem: Option<String>,
@@ -275,6 +312,7 @@ impl OnionStatus {
         let state = status.state();
         Self {
             reachable: state.is_fully_reachable(),
+            phase: OnionPhase::of(state),
             state: format!("{state:?}"),
             problem: status.current_problem().and_then(describe_problem),
         }
@@ -954,6 +992,30 @@ mod tests {
         assert!(!peer_closed(&reset));
         assert!(!peer_closed(&collapse));
         assert!(!peer_closed(&plain));
+    }
+
+    /// The final audit before the release: the window says the phase, so
+    /// each of Arti's states falls in the group a user is told. `Shutdown`
+    /// is the launch-time state, never a failure.
+    #[test]
+    fn each_onion_service_state_has_its_phase() {
+        for (state, phase) in [
+            (State::Shutdown, OnionPhase::Starting),
+            (State::Bootstrapping, OnionPhase::Starting),
+            (State::Running, OnionPhase::Reachable),
+            (State::DegradedReachable, OnionPhase::Reachable),
+            (State::DegradedUnreachable, OnionPhase::Trying),
+            (State::Recovering, OnionPhase::Trying),
+            (State::Broken, OnionPhase::Broken),
+        ] {
+            assert_eq!(OnionPhase::of(state), phase, "{state:?}");
+            assert_eq!(
+                phase == OnionPhase::Reachable,
+                state.is_fully_reachable(),
+                "{state:?}"
+            );
+        }
+        assert_eq!(OnionStatus::default().phase, OnionPhase::Starting);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use tornect_core::{DeviceId, TornectId};
 use tornect_input::Rect;
 use tornect_proto::{HostStats, MonitorEntry, QualityInfo};
 use tornect_session::{PathEnd, TorWhy};
+use tornect_signal::OnionPhase;
 use tornect_signal::consent::TransportPolicy;
 
 use super::backend::Secret;
@@ -489,7 +490,9 @@ pub enum Hosting {
     Published {
         /// Clients can reach this ID.
         reachable: bool,
-        /// Arti's state name.
+        /// Arti's state, grouped as the hosting line says it.
+        phase: OnionPhase,
+        /// Arti's state name (Recent activity, not the hosting line).
         state: String,
         /// Its most severe problem.
         problem: Option<String>,

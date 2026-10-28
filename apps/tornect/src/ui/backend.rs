@@ -2474,8 +2474,10 @@ const RETRY_MOST: Duration = Duration::from_secs(5 * 60);
 /// What the window says when no way into Tor worked (B02): plain words, no
 /// command and no file name; why each way failed is in the recent activity
 /// (the ladder's own notes).
-pub(super) const TOR_DOWN: &str = "Check that this computer is online. Where Tor is blocked, \
-    choose bridges in Settings, Connection, then start Tornect again.";
+pub(super) const TOR_DOWN: &str = "Check that this computer is online and that its clock is \
+    right. Where Tor is blocked, get private bridge lines from bridges.torproject.org, paste them \
+    under Private bridges in Settings, Connection (choose Automatic there if Tor without bridges \
+    is chosen), then start Tornect again.";
 
 /// What the window says when none of the ways into Tor the settings allow
 /// can run here (the ladder is empty: a bridge helper is missing).
@@ -2737,15 +2739,29 @@ fn watch_reachability(listener: &OnionListener, shared: Arc<Shared>) -> JoinHand
     let mut rx = listener.status();
     tokio::spawn(async move {
         let mut announced = false;
+        let mut noted: Option<(String, Option<String>)> = None;
         loop {
             let s = rx.borrow_and_update().clone();
             if s.reachable && !announced {
                 say(format_args!("REACHABLE"));
                 announced = true;
             }
+            // Arti's own words for a publish that is not going well go to
+            // Recent activity, once per change; the hosting line says the
+            // phase in plain words.
+            let note = trouble_note(&s).filter(|_| {
+                let now = Some((s.state.clone(), s.problem.clone()));
+                let changed = noted != now;
+                noted = now;
+                changed
+            });
             shared.update(|m| {
+                if let Some(note) = note {
+                    m.note(note);
+                }
                 m.hosting = Hosting::Published {
                     reachable: s.reachable,
+                    phase: s.phase,
                     state: s.state,
                     problem: s.problem,
                 };
@@ -2754,6 +2770,20 @@ fn watch_reachability(listener: &OnionListener, shared: Arc<Shared>) -> JoinHand
                 break;
             }
         }
+    })
+}
+
+/// Recent activity's line for a publish that is not going well (Tor keeps
+/// trying, or gave up): Arti's state and problem, which the hosting line no
+/// longer shows. `None` while it starts or once it is reachable.
+fn trouble_note(s: &tornect_signal::OnionStatus) -> Option<String> {
+    use tornect_signal::OnionPhase;
+    if matches!(s.phase, OnionPhase::Starting | OnionPhase::Reachable) {
+        return None;
+    }
+    Some(match &s.problem {
+        Some(problem) => format!("Publishing this ID: Tor reports {} ({problem})", s.state),
+        None => format!("Publishing this ID: Tor reports {}", s.state),
     })
 }
 
@@ -4172,7 +4202,7 @@ async fn viewed(
             return Err(anyhow::Error::msg(ended.text));
         }
     }
-    let stream = stream.map_err(explain)?;
+    let stream = stream.map_err(unreached)?;
     if ua.is_some() {
         b.shared.update(|m| m.client = ClientStage::Checking);
     } else if pins.known() {
@@ -4597,6 +4627,47 @@ fn not_started(err: HandshakeError, check: Option<CodeCheck>) -> anyhow::Error {
     tracing::debug!(error = %err, "the handshake ended before a session");
     anyhow::Error::msg(text)
 }
+
+/// The window's words when the computer asked for has no circuit (the
+/// final audit before the release). The command line's hints
+/// (`tor_cmd::explain`) name `tornect host` and its `REACHABLE` line; the
+/// other side most likely uses the window, which says "Reachable over Tor".
+/// The words stand alone (no "…: host is offline (…)" after them); the error
+/// itself goes to the debug log. Any error without window words of its own
+/// keeps the command line's, whose hints there name no command.
+pub(super) fn unreached(err: tornect_signal::SignalError) -> anyhow::Error {
+    use tornect_signal::SignalError;
+    let text = match &err {
+        SignalError::HostOffline => HOST_OFFLINE,
+        SignalError::HostNotRunning => HOST_NOT_RUNNING,
+        SignalError::Bootstrap(_) | SignalError::NotBootstrapped => TOR_NOT_UP,
+        SignalError::Config(_) => TOR_SETTING_REFUSED,
+        _ => return explain(err),
+    };
+    tracing::debug!(error = %err, "the computer could not be reached");
+    anyhow::Error::msg(text)
+}
+
+/// [`unreached`]'s words for a Tornect ID with no descriptor. A wrong or
+/// replaced ID is found nowhere, so it is named here, and only here: a stall
+/// after the descriptor was found (the same failure's other cause) proves
+/// the ID right.
+pub(super) const HOST_OFFLINE: &str = "Its Tornect ID is not published right now: Tornect is \
+     not open on that computer, or opened there in the last few minutes (wait for \"Reachable \
+     over Tor\" there). If it never works, check the ID with the person there: a computer that \
+     made a new ID is not found under its old one.";
+
+/// [`unreached`]'s words for a published ID that does not answer.
+pub(super) const HOST_NOT_RUNNING: &str = "Its ID is published but it does not answer: \
+     Tornect may have just closed there. Try again in a minute.";
+
+/// [`unreached`]'s words when Tor itself is not up here.
+pub(super) const TOR_NOT_UP: &str = "Tor is not reachable from this computer. Check that it is \
+     online and that its clock is right; where Tor is blocked, see Settings, Connection.";
+
+/// [`unreached`]'s words for a Tor setting this build refuses.
+pub(super) const TOR_SETTING_REFUSED: &str = "Tor refused a setting this build cannot honour, \
+     so nothing was sent. Check Settings, Connection.";
 
 /// Whether the viewer sends input, from the `mode` of the host's signed
 /// SESSION_ACCEPT: only a control grant does. A view-only grant never does,
@@ -8222,6 +8293,90 @@ mod tests {
                 assert!(!words.contains(terminal), "{words:?} says {terminal:?}");
             }
         }
+    }
+
+    /// The final audit before the release: Arti's own words for a publish
+    /// that is not going well go to Recent activity (the hosting line says
+    /// the phase only); nothing while it starts or once it is reachable.
+    #[test]
+    fn a_publish_in_trouble_is_noted_in_tors_own_words() {
+        use tornect_signal::{OnionPhase, OnionStatus};
+        let status = |phase, state: &str, problem: Option<&str>| OnionStatus {
+            reachable: phase == OnionPhase::Reachable,
+            phase,
+            state: state.to_owned(),
+            problem: problem.map(str::to_owned),
+        };
+        assert_eq!(
+            trouble_note(&status(OnionPhase::Starting, "Bootstrapping", None)),
+            None
+        );
+        assert_eq!(
+            trouble_note(&status(
+                OnionPhase::Reachable,
+                "DegradedReachable",
+                Some("x")
+            )),
+            None
+        );
+        assert_eq!(
+            trouble_note(&status(
+                OnionPhase::Trying,
+                "DegradedUnreachable",
+                Some("descriptor upload failed (3 attempt(s))")
+            ))
+            .as_deref(),
+            Some(
+                "Publishing this ID: Tor reports DegradedUnreachable (descriptor upload failed \
+                 (3 attempt(s)))"
+            )
+        );
+        assert_eq!(
+            trouble_note(&status(OnionPhase::Broken, "Broken", None)).as_deref(),
+            Some("Publishing this ID: Tor reports Broken")
+        );
+    }
+
+    /// The final audit before the release: a computer that cannot be
+    /// reached is said in the window's words. The command line's hint said
+    /// "On the host, run `tornect host` and wait for REACHABLE", followed by
+    /// ".: host is offline (…)". A missing descriptor names a changed ID;
+    /// an error with no window words of its own keeps the command line's.
+    #[test]
+    fn an_unreached_computer_is_said_in_window_words() {
+        use tornect_signal::SignalError;
+        let said = |e: SignalError| format!("{:#}", unreached(e));
+        let offline = said(SignalError::HostOffline);
+        assert_eq!(offline, HOST_OFFLINE);
+        assert!(offline.contains("\"Reachable over Tor\""), "{offline}");
+        assert!(offline.contains("made a new ID"), "{offline}");
+        assert_eq!(said(SignalError::HostNotRunning), HOST_NOT_RUNNING);
+        let words = [
+            offline,
+            said(SignalError::HostNotRunning),
+            said(SignalError::Bootstrap("no way in".to_owned())),
+            said(SignalError::NotBootstrapped),
+            said(SignalError::Config("bad".to_owned())),
+        ];
+        for words in &words {
+            for terminal in [
+                "tornect host",
+                "REACHABLE",
+                ".:",
+                "`",
+                "tornect ",
+                "config.toml",
+                "bridge_lines",
+                "https://",
+                "host is offline (",
+            ] {
+                assert!(!words.contains(terminal), "{words:?} says {terminal:?}");
+            }
+        }
+        assert_eq!(
+            said(SignalError::Timeout("connecting")),
+            format!("{:#}", explain(SignalError::Timeout("connecting")))
+        );
     }
 
     /// FR2-L1: when the keychain refuses to delete the remembered password,

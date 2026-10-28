@@ -35,7 +35,7 @@ pub(crate) use identity::expand_seed as identity_expand_seed;
 pub use identity::{ForgottenIdentity, forget_identity, onion_address_for};
 pub use listener::{
     ACCEPT_QUEUE_LEN, ACCEPT_TIMEOUT, Admission, CIRCUIT_IDLE_TIMEOUT, MAX_CONCURRENT_HANDSHAKES,
-    MAX_LIVE_CIRCUITS, OnionListener, OnionStatus, OnionStream, RENDEZVOUS_TIMEOUT,
+    MAX_LIVE_CIRCUITS, OnionListener, OnionPhase, OnionStatus, OnionStream, RENDEZVOUS_TIMEOUT,
     RendezvousLimits, STREAM_WRITE_TIMEOUT,
 };
 pub use node::{BootstrapProgress, Isolation, LadderEvent, TorNode, shutdown_runtime};

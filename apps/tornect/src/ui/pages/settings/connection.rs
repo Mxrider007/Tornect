@@ -30,6 +30,11 @@ pub(in super::super) const MODES: [(BridgeMode, &str); 4] = [
 /// When the way to Tor and the bridge lines apply.
 pub(in super::super) const NEXT_START: &str = "Applies the next time Tornect starts.";
 
+/// Where private bridge lines come from (the final audit before the
+/// release: the built-in bridges are what Automatic already tried).
+pub(in super::super) const WHERE_BRIDGES: &str = "Where Tor is blocked, get private bridge \
+    lines from bridges.torproject.org; they replace the built-in bridges of their kind.";
+
 /// How a bad bridge line is named.
 pub(in super::super) const BY_NUMBER: &str =
     "A line that does not parse is reported by its line number only.";
@@ -244,6 +249,7 @@ pub(super) fn section(
 
         ui.add_space(16.0);
         widgets::section_header(ui, "Private bridges");
+        line(ui, WHERE_BRIDGES, t.text_secondary);
         line(ui, BY_NUMBER, t.text_secondary);
         let draft = form
             .bridge_lines

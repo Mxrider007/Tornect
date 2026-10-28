@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
 use tornect_core::invite;
+use tornect_signal::OnionPhase;
 use tornect_signal::consent::TransportPolicy;
 
 use super::super::icons::{self, Icon};
@@ -496,11 +497,15 @@ fn status_line(ui: &mut Ui, icon: Icon, (text, color): (String, egui::Color32)) 
 }
 
 /// The chip beside "Your Tornect ID".
-fn reachability(hosting: &Hosting) -> (Tone, &'static str) {
+pub(super) fn reachability(hosting: &Hosting) -> (Tone, &'static str) {
     match hosting {
         Hosting::Published {
             reachable: true, ..
         } => (Tone::Ok, "Reachable over Tor"),
+        Hosting::Published {
+            phase: OnionPhase::Starting,
+            ..
+        } => (Tone::Warn, "Publishing…"),
         Hosting::Published { .. } => (Tone::Warn, "Not reachable yet"),
         Hosting::Publishing => (Tone::Warn, "Publishing…"),
         Hosting::Waiting => (Tone::Neutral, "Waiting for Tor"),
@@ -804,20 +809,37 @@ pub(super) fn tor_line(
     }
 }
 
+/// The hosting line while this ID is being published: launched and not out
+/// yet, which takes a few minutes the first time.
+pub(super) const PUBLISHING_LINE: &str =
+    "Incoming requests: publishing this ID (the first time can take a few minutes)…";
+
+/// The hosting line while Tor keeps trying to publish this ID.
+pub(super) const PUBLISH_TRYING_LINE: &str =
+    "Incoming requests: not reachable yet; Tor keeps trying to publish this ID";
+
+/// The hosting line once Tor gave up publishing this ID.
+pub(super) const PUBLISH_BROKEN_LINE: &str = "Incoming requests: publishing this ID failed";
+
 /// The hosting line, in words and colour. One label, whatever the state:
 /// the promise it makes must stay true (SLICE-E E1-5). `retry`: how long
 /// until publishing this ID is tried again by itself.
-fn hosting_line(t: &Tokens, hosting: &Hosting, retry: Option<Duration>) -> (String, egui::Color32) {
+pub(super) fn hosting_line(
+    t: &Tokens,
+    hosting: &Hosting,
+    retry: Option<Duration>,
+) -> (String, egui::Color32) {
     match hosting {
         Hosting::Waiting => (
             "Incoming requests: waiting for Tor".to_owned(),
             t.text_muted,
         ),
-        Hosting::Publishing => (
-            "Incoming requests: publishing this ID (the first time can take two minutes)…"
-                .to_owned(),
-            t.text_muted,
-        ),
+        Hosting::Publishing
+        | Hosting::Published {
+            reachable: false,
+            phase: OnionPhase::Starting,
+            ..
+        } => (PUBLISHING_LINE.to_owned(), t.text_muted),
         // True in every state (SLICE-E E1-5): a device granted unattended
         // access starts a session without asking (PLAN §B.8).
         Hosting::Published {
@@ -828,19 +850,16 @@ fn hosting_line(t: &Tokens, hosting: &Hosting, retry: Option<Duration>) -> (Stri
                 .to_owned(),
             t.ok,
         ),
+        // Arti's state names and problems are Recent activity's, not this
+        // line's (the final audit before the release).
         Hosting::Published {
             reachable: false,
-            state,
-            problem,
-        } => (
-            match problem {
-                Some(problem) => {
-                    format!("Incoming requests: not reachable yet ({state}: {problem})")
-                }
-                None => format!("Incoming requests: not reachable yet ({state})"),
-            },
-            t.warn,
-        ),
+            phase: OnionPhase::Broken,
+            ..
+        } => (PUBLISH_BROKEN_LINE.to_owned(), t.danger_text),
+        Hosting::Published {
+            reachable: false, ..
+        } => (PUBLISH_TRYING_LINE.to_owned(), t.warn),
         Hosting::Off(why) => (
             match retry {
                 Some(wait) => format!(
@@ -1424,6 +1443,17 @@ pub(super) fn host_actions(
     host_actions_with(ui, model, computer, ready, small, true, actions);
 }
 
+/// What a saved computer's Knock does, on hover (the final audit before the
+/// release: the connect card calls the same request "Connect").
+pub(super) const KNOCK_HOVER: &str = "Ask to connect: the person at that computer allows control \
+     or view only (the first time, you both compare a 6-digit code)";
+
+/// What a saved computer's own Connect does, on hover. Whether someone
+/// there is asked is the grant's, disclosed only in its signed accept: the
+/// words do not promise that nobody is.
+pub(super) const CONNECT_HOVER: &str = "Connect without asking first: your password for that \
+     computer; someone there may still block it";
+
 /// [`host_actions`], saying whether to offer "Connect without asking" here.
 pub(super) fn host_actions_with(
     ui: &mut Ui,
@@ -1446,6 +1476,7 @@ pub(super) fn host_actions_with(
             .icon(Icon::ArrowRight)
             .enabled(ready && !blocked)
             .show(ui)
+            .on_hover_text(CONNECT_HOVER)
             .clicked()
         {
             actions.push(Action::AskPassword(id));
@@ -1453,6 +1484,7 @@ pub(super) fn host_actions_with(
         if button(Kind::Secondary, "Knock")
             .enabled(ready)
             .show(ui)
+            .on_hover_text(KNOCK_HOVER)
             .clicked()
         {
             actions.push(Action::Connect(id));
@@ -1462,6 +1494,7 @@ pub(super) fn host_actions_with(
             .icon(Icon::ArrowRight)
             .enabled(ready)
             .show(ui)
+            .on_hover_text(KNOCK_HOVER)
             .clicked()
         {
             actions.push(Action::Connect(id));

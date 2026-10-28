@@ -50,7 +50,18 @@ pub(in super::super) const SIGN_IN_UNAVAILABLE: &str =
 /// That Tornect must be closed for its install or removal (§B.1.1).
 pub(in super::super) const CLOSE_FIRST: &str = "Close Tornect before installing or removing it.";
 
-/// The install's state and its command.
+/// How to install this copy (the final audit before the release): a copy
+/// that is not installed is not on `PATH`, so the command names the program
+/// in its own folder. `.\tornect` runs `tornect.exe` from cmd and from
+/// PowerShell alike.
+pub(in super::super) const INSTALL_HOW: &str = if cfg!(windows) {
+    "To install it: open a terminal in Tornect's folder and run .\\tornect install"
+} else {
+    "To install it: open a terminal in Tornect's folder and run ./tornect install"
+};
+
+/// The install's state and its command. Once installed, `tornect` is on
+/// `PATH` (`~/.local/bin`, the Program Files copy).
 #[must_use]
 pub(in super::super) fn install_lines(installed: Option<bool>) -> [&'static str; 2] {
     match installed {
@@ -58,13 +69,10 @@ pub(in super::super) fn install_lines(installed: Option<bool>) -> [&'static str;
             "Installed.",
             "To remove it: tornect uninstall in a terminal.",
         ],
-        Some(false) => [
-            "Not installed.",
-            "To install it: tornect install in a terminal.",
-        ],
+        Some(false) => ["Not installed.", INSTALL_HOW],
         None => [
             "Whether Tornect is installed could not be read.",
-            "To install it: tornect install in a terminal.",
+            INSTALL_HOW,
         ],
     }
 }

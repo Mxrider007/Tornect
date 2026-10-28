@@ -276,6 +276,7 @@ mod tests {
             },
             hosting: Hosting::Published {
                 reachable: true,
+                phase: tornect_signal::OnionPhase::Reachable,
                 state: "Running".to_owned(),
                 problem: None,
             },
@@ -379,6 +380,80 @@ mod tests {
         }
     }
 
+    /// The final audit before the release: the hosting line says where
+    /// publishing this ID stands in plain words, never Arti's state names
+    /// or problems (they go to Recent activity). It read "not reachable yet
+    /// (Bootstrapping)" in the warning colour for the first minutes of
+    /// every start.
+    #[test]
+    fn the_hosting_line_says_each_publish_phase_in_plain_words() {
+        use tornect_signal::OnionPhase;
+        let t = &theme::DARK;
+        let published = |phase, state: &str| Hosting::Published {
+            reachable: false,
+            phase,
+            state: state.to_owned(),
+            problem: Some("descriptor upload failed (3 attempt(s))".to_owned()),
+        };
+        for (hosting, line, colour, chip) in [
+            (
+                Hosting::Publishing,
+                home::PUBLISHING_LINE,
+                t.text_muted,
+                "Publishing…",
+            ),
+            (
+                published(OnionPhase::Starting, "Bootstrapping"),
+                home::PUBLISHING_LINE,
+                t.text_muted,
+                "Publishing…",
+            ),
+            (
+                published(OnionPhase::Starting, "Shutdown"),
+                home::PUBLISHING_LINE,
+                t.text_muted,
+                "Publishing…",
+            ),
+            (
+                published(OnionPhase::Trying, "DegradedUnreachable"),
+                home::PUBLISH_TRYING_LINE,
+                t.warn,
+                "Not reachable yet",
+            ),
+            (
+                published(OnionPhase::Trying, "Recovering"),
+                home::PUBLISH_TRYING_LINE,
+                t.warn,
+                "Not reachable yet",
+            ),
+            (
+                published(OnionPhase::Broken, "Broken"),
+                home::PUBLISH_BROKEN_LINE,
+                t.danger_text,
+                "Not reachable yet",
+            ),
+        ] {
+            let (said, color) = home::hosting_line(t, &hosting, None);
+            assert_eq!((said.as_str(), color), (line, colour), "{hosting:?}");
+            for arti in [
+                "Bootstrapping",
+                "Shutdown",
+                "Degraded",
+                "Recovering",
+                "Broken",
+                "descriptor",
+            ] {
+                assert!(!said.contains(arti), "{said}");
+            }
+            assert_eq!(home::reachability(&hosting).1, chip, "{hosting:?}");
+        }
+        let mut model = at_rest();
+        model.hosting = published(OnionPhase::Starting, "Bootstrapping");
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, home::PUBLISHING_LINE));
+        assert!(!has_text(&window, "Bootstrapping"));
+    }
+
     /// Home's ID and connect cards share the taller one's height, and shrink
     /// back once their content does (a long hosting line gives way to a
     /// short one).
@@ -386,11 +461,9 @@ mod tests {
     fn homes_cards_shrink_back_to_their_content() {
         let row = egui::Id::new("home-row-height");
         let mut model = at_rest();
-        model.hosting = Hosting::Published {
-            reachable: false,
-            state: "Bootstrapping".to_owned(),
-            problem: Some("the descriptor could not be uploaded ".repeat(8)),
-        };
+        // A long reason (the hosting line no longer shows Arti's problem:
+        // the final audit before the release).
+        model.hosting = Hosting::Off("the descriptor could not be uploaded ".repeat(8));
         let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
         let tall = window.ctx.data(|d| d.get_temp::<f32>(row)).expect("stored");
         window.model.hosting = Hosting::Waiting;
@@ -497,8 +570,9 @@ mod tests {
         let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
         assert!(has_text(
             &window,
-            "Tor: not reachable. Check that this computer is online."
+            "Tor: not reachable. Check that this computer is online and that its clock is right."
         ));
+        assert!(has_text(&window, "bridges.torproject.org"));
         assert!(has_text(&window, "Trying again in 2 min."));
         assert!(!has_text(&window, "config.toml") && !has_text(&window, "tornect doctor"));
         let now = window.center(home::RETRY);
@@ -1634,7 +1708,28 @@ mod tests {
         // and as Office PC's second action.
         assert_eq!(centres(&window, "Connect").len(), 2);
         assert_eq!(centres(&window, "Knock").len(), 3);
+        // The final audit before the release: on hover, Knock says it asks
+        // the person there, and the card's own Connect that it does not ask
+        // first; the connect card's Connect has no such words.
+        window
+            .ctx
+            .all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+        let hovered = |window: &mut Window, at: egui::Pos2| {
+            window.pass(vec![egui::Event::PointerMoved(at)]);
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            (
+                has_text(window, home::KNOCK_HOVER),
+                has_text(window, home::CONNECT_HOVER),
+            )
+        };
+        for knock in centres(&window, "Knock") {
+            assert_eq!(hovered(&mut window, knock), (true, false), "{knock:?}");
+        }
+        let card_connect = centres(&window, "Connect")[0];
+        assert_eq!(hovered(&mut window, card_connect), (false, false));
         let office_connect = *centres(&window, "Connect").last().unwrap();
+        assert_eq!(hovered(&mut window, office_connect), (false, true));
         assert_eq!(window.click(office_connect), vec![Action::AskPassword(id)]);
 
         let mut window = Window::new(model.clone(), Page::AddressBook, egui::Theme::Light, TALL);
@@ -4077,10 +4172,18 @@ mod tests {
     #[test]
     fn the_install_state_and_its_command_are_shown() {
         use settings::general;
+        // The final audit before the release: a copy that is not installed
+        // is not on PATH, so it is run from its own folder.
+        let here = if cfg!(windows) {
+            "run .\\tornect install"
+        } else {
+            "run ./tornect install"
+        };
+        assert!(general::INSTALL_HOW.ends_with(here));
         for (installed, state, command) in [
             (Some(true), "Installed.", "tornect uninstall"),
-            (Some(false), "Not installed.", "tornect install"),
-            (None, "could not be read", "tornect install"),
+            (Some(false), "Not installed.", here),
+            (None, "could not be read", here),
         ] {
             let mut manager = one_device();
             manager.installed = installed;
@@ -4947,7 +5050,11 @@ mod tests {
                 ..stored
             }))]
         );
-        for text in [connection::NEXT_START, connection::BY_NUMBER] {
+        for text in [
+            connection::NEXT_START,
+            connection::WHERE_BRIDGES,
+            connection::BY_NUMBER,
+        ] {
             assert!(has_text(&window, text), "{text}");
         }
         // This version's old note is gone (design `direct` §3.3).

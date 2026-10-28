@@ -2679,7 +2679,9 @@ pub(crate) fn explain(err: SignalError) -> anyhow::Error {
     let hint = match &err {
         SignalError::HostOffline => {
             "The host is offline or has not finished publishing its Tornect ID. \
-             On the host, run `tornect host` and wait for REACHABLE, then retry."
+             On the host, run `tornect host` and wait for REACHABLE (in the window: \
+             \"Reachable over Tor\"), then retry; a host that made a new ID is not found \
+             under its old one."
         }
         SignalError::HostNotRunning => {
             "The host's Tornect ID is published but the host is not reachable right now \

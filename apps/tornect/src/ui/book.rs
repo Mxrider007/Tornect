@@ -14,8 +14,8 @@ use tornect_core::words::{Known, Role};
 use tornect_core::{Paths, TornectId};
 use tornect_signal::TorNode;
 
+use super::backend::unreached;
 use super::model::{Book, Check, Computer, Device, UaRecord};
-use crate::tor_cmd::explain;
 
 /// How long a check waits for the computer's answer, the Tor circuit
 /// included (reaching an onion service takes 5–30 s, up to a minute).
@@ -210,7 +210,7 @@ pub fn apply(paths: &Paths, change: &Change) -> String {
 pub async fn check(node: &TorNode, id: TornectId) -> Check {
     let started = Instant::now();
     let asked = async {
-        let mut stream = node.connect(&id).await.map_err(explain)?;
+        let mut stream = node.connect(&id).await.map_err(unreached)?;
         ping_once(&mut stream).await?;
         if let Err(e) = stream.shutdown().await {
             tracing::debug!(error = %e, "closing the check's stream");
@@ -240,7 +240,7 @@ where
     )
     .await
     .map_err(|_| anyhow::anyhow!("no reply within {} s", PING_WAIT.as_secs()))?
-    .map_err(explain)
+    .map_err(unreached)
 }
 
 #[cfg(test)]

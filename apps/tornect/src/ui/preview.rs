@@ -635,9 +635,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
                 ipv6: false,
             },
         }),
-        Sheet::StageUnreachable => ClientStage::Ended(
-            "The host is offline or has not finished publishing its Tornect ID.".to_owned(),
-        ),
+        Sheet::StageUnreachable => ClientStage::Ended(super::backend::HOST_OFFLINE.to_owned()),
         Sheet::StageDenied => ClientStage::Ended("The host's user refused the session.".to_owned()),
         Sheet::StageCodesDiffer => {
             ClientStage::Ended("Not paired: you answered that the codes differ.".to_owned())
@@ -743,6 +741,7 @@ fn fill(m: &mut Model) {
     };
     m.hosting = Hosting::Published {
         reachable: true,
+        phase: tornect_signal::OnionPhase::Reachable,
         state: "Running".to_owned(),
         problem: None,
     };
@@ -832,6 +831,7 @@ fn rest(m: &mut Model) {
     };
     m.hosting = Hosting::Published {
         reachable: true,
+        phase: tornect_signal::OnionPhase::Reachable,
         state: "Running".to_owned(),
         problem: None,
     };
