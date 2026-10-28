@@ -723,9 +723,11 @@ async fn recv_local(local: &mut mpsc::Receiver<LocalBatch>, over: &mut bool) -> 
     }
 }
 
-/// The IPv6 addresses an IPv6 datagram may leave from: the first offered
-/// global and the first offered unique-local candidate (the one whose /48
-/// the remote filter takes).
+/// The IPv6 addresses an IPv6 datagram may leave from: the offered global
+/// and the offered unique-local candidate (the one whose /48 the remote
+/// filter takes). A side offers at most one of each
+/// ([`local::select_host_candidates`]), so every IPv6 candidate it offers
+/// is one of these (`tests::offered`).
 fn v6_sources(offered: &[Candidate]) -> V6Sources {
     let first = |class: AddrClass| {
         offered.iter().find_map(|c| match canon_ip(c.addr.ip()) {

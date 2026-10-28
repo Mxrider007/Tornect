@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a75f4af67b064a8cc3bb0b003d704aa1d26f743a23166c3d67b43e5af1a6ff45 # shrinks to addrs = [IfaceAddr { ip: v6 unique-local, prefix_len: 64, iface_index: 1, iface_kind: Physical, flags: ["up"], gateway_v4: None }, IfaceAddr { ip: v6 unique-local, prefix_len: 64, iface_index: 1, iface_kind: Physical, flags: ["up"], gateway_v4: None }], v4 = None, v6 = None, internet = false

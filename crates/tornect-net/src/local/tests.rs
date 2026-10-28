@@ -460,15 +460,16 @@ fn same_site_candidates_are_private_v4_and_ula_of_physical_interfaces() {
         Some("2001:470:1:2:5555:6666:7777:8888"),
     );
     let picked = select_host_candidates(&home(), &src, 50417, Scope::SameSite, false);
-    // The route source's interface first; one ULA per interface, temporary
-    // first; no global, no tunnel, docker, loopback or link-local address.
+    // The route source's interface first; one ULA, the route source
+    // interface's temporary one (never Ethernet's, whose ULA no datagram
+    // could leave from: `MAX_ULA`); no global, no tunnel, docker, loopback
+    // or link-local address.
     assert_eq!(
         ips(&picked),
         [
             "192.168.77.203",
             "192.168.88.20",
-            "fd12:3456:789a:1:9:9:9:9",
-            "fd12:3456:789a:2::20"
+            "fd12:3456:789a:1:9:9:9:9"
         ]
     );
     assert!(
@@ -537,8 +538,8 @@ fn skipped_addresses_are_never_offered() {
     }
 }
 
-/// Design §7.1: at most four private IPv4, two ULAs (one per interface),
-/// eight in all.
+/// Design §7.1: at most four private IPv4 and one ULA (two in the design;
+/// one since the feature's close, `MAX_ULA`), eight in all.
 #[test]
 fn host_candidates_are_capped() {
     use IfaceKind::*;
@@ -715,7 +716,8 @@ fn the_remote_filter_is_built_from_what_was_offered() {
     let offered = select_host_candidates(&home(), &src, 50417, Scope::SameSite, false);
     let f = remote_filter(Scope::SameSite, &home(), &src, &offered, true, None, false);
     assert_eq!(f.scope, Scope::SameSite);
-    assert_eq!(f.on_link.len(), 4);
+    // The two private /24s and the /64 of the one offered ULA (`MAX_ULA`).
+    assert_eq!(f.on_link.len(), 3);
     assert_eq!(
         f.own_ula48,
         Some("fd12:3456:789a::/48".parse::<Ipv6Net>().unwrap())

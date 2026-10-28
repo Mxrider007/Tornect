@@ -37,8 +37,12 @@ pub const MAX_HOST_CANDIDATES: usize = 8;
 /// The most private IPv4 host candidates.
 pub const MAX_PRIVATE_V4: usize = 4;
 
-/// The most unique-local IPv6 host candidates (at most one per interface).
-pub const MAX_ULA: usize = 2;
+/// The most unique-local IPv6 host candidates: one. It is the address every
+/// datagram to a unique-local peer leaves from (`V6Sources`) and the one
+/// whose /48 the remote filter takes as this side's own, so a second one
+/// would be disclosed to the peer and never usable (design §7.1 allows two;
+/// the step A12 finding, settled at the feature's close).
+pub const MAX_ULA: usize = 1;
 
 /// Lowercased pieces of an interface's name, friendly name or description
 /// that make it a tunnel (VPN clients; TAP adapters report Ethernet on
@@ -548,9 +552,9 @@ pub fn global_families(addrs: &[IfaceAddr], sources: &RouteSources, vpn: bool) -
 ///   or virtual; never deprecated, tentative, duplicated or EUI-64);
 /// - up to [`MAX_PRIVATE_V4`] private IPv4 addresses, the IPv4 route
 ///   source's interface first;
-/// - up to [`MAX_ULA`] unique-local addresses, at most one per interface,
-///   temporary first; in internet scope only when no private IPv4 is
-///   offered;
+/// - one unique-local address ([`MAX_ULA`]), a route-source interface's
+///   first, temporary first; in internet scope only when no private IPv4
+///   is offered;
 /// - internet scope outside VPN mode: one global IPv4 and one global IPv6,
 ///   each only from its family's route-source interface; the IPv6 one a
 ///   temporary address (the route source itself if it is one), else the
@@ -595,16 +599,7 @@ pub fn select_host_candidates(
                 !a.temporary,
             )
         });
-        let mut seen = Vec::new();
-        for a in ula {
-            if seen.len() == MAX_ULA {
-                break;
-            }
-            if !seen.contains(&a.iface_index) {
-                seen.push(a.iface_index);
-                picked.push(a.ip);
-            }
-        }
+        picked.extend(ula.iter().take(MAX_ULA).map(|a| a.ip));
     }
 
     if scope == Scope::Internet && !vpn {
