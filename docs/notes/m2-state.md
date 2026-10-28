@@ -5,8 +5,8 @@ with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-contai
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-is under way: B1 to B7 are done (2026-10-27), B8 and B9 too (2026-10-28; "OPEN, owned by Phase B
-steps" below).
+is under way: B1 to B7 are done (2026-10-27), B8, B9 and B10 too (2026-10-28; "OPEN, owned by
+Phase B steps" below); B11 is next, and `INTERNET_DIRECT` is still `false`.
 
 ## What Phase A does
 
@@ -196,18 +196,36 @@ and the crates below ring check here).
   host's network is never touched). Deviations (commit bodies, ledger): the ten minutes at the
   link, not a ten-minute session; the e2e's mapping beside its session, not in its gathering;
   the 1.5 s row's viewer-dials order falls back `Quic` by `T0` + 4.2 s, not `HostSilent` at
-  exactly 4.0 s; the `lan_only` viewer's winner is `Prflx`. Left OPEN (ledger rows): one NAT with
-  two subnets (the viewer labels the route internet, the host same-site); 20 % loss (4 of 8 seeds
-  direct, the design says direct); a `BYE` in the same instant as `TOR_FALLBACK` can end the
-  host's session before it records the reason. Left as NEEDS-DEVICE: the matrix between real
-  networks (design §13 rows 3 to 11, at B13).
-- B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
-  `direct_loopback_stats` shows 15 fps), the `SecondStream` hook (services on a direct session
-  still go over the onion service) and the onion stream-count test.
+  exactly 4.0 s; the `lan_only` viewer's winner is `Prflx`. Its three OPEN rows were settled on
+  2026-10-28 (decision M1-82's notes, ledger rows "Step B9: residual, …"): one NAT with two
+  subnets is read as the code behaves (the viewer's label stays internet, the host's same-site;
+  never relabelled, never inferred from the address class); 20 % loss is stated as a rate (at
+  least 3 of 8 seeds direct; measured 4 of 8, the rest `Quic` by 4.2 s or `NoPath` at 4.0 s), the
+  real rate measured at B13; the `BYE` racing `TOR_FALLBACK` is fixed (`831b9856`,
+  `PathExchange::heard`). C1's wording for the 1.5 s row is in M1-82's notes. Left as
+  NEEDS-DEVICE: the matrix between real networks (design §13 rows 3 to 11), with one recipe per
+  row in the ledger ("Step B13 recipe: design §13 row N", 2026-10-28).
+- B10 (done 2026-10-28, `1f788b8d`, `27597483`, `d4cbd71c`, `a8cfd817`; ledger rows "Step B10";
+  decisions M1-74, M1-76, M1-84 and M1-85's notes): quality: `Route::Direct`, the direct row of the
+  presets (Balanced 1080p30 at 6 Mbit/s, Best performance 720p60 at 4 Mbit/s, Best quality 30 fps
+  at 12 Mbit/s or `[media] max_bitrate_kbps`), picked by the host from the claimed path, a 300 ms
+  ack window; `direct_loopback_stats` now reads 29.8 fps. Services: the second bidi stream of the
+  direct connection (`HOST_STREAMS` 2), bound by `ServicesHost::serve_direct` through
+  `DirectHost`'s `SecondStream` hook under its own MAC once the media is claimed on the same path
+  by the pinned device; 4 MiB bulk window; priorities media 1, services 0; the host refuses the
+  onion services port while the media is direct; the app's `ServicesSlot` (set once the services
+  host exists) and the viewer's `run_direct_services` (5 s open bound); the onion stream-count test
+  on the Tor route. Deviations (commit bodies, the decisions' notes): `SecondStream::serve` takes
+  the peer and the path; the claim check under the registry lock; the late-bound slot; the 5 s
+  bound; `services_bind_mac_direct`; the quantizer ranges, window floors and least bitrate of the
+  Tor rows; the stream-count test's composition. Left as NEEDS-DEVICE: the direct row and the
+  4 MiB window measured on real paths (ledger rows, after B12). `a8cfd817` fixed a `cargo doc`
+  failure `27597483` brought in (a public doc linking a crate-private constant).
 - B11: the Phase B copy and settings (STUN, router mapping).
 - B12: `INTERNET_DIRECT = true`.
-- B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11, 15 and 16
-  (row 16, measured punch success, already reads the Phase A runs), tag `m2b`.
+- B13: the internet checkpoint, the `stun` fuzz target, the device rows 3 to 11 (their recipes are
+  written: ledger rows "Step B13 recipe: design §13 row 3" to "… row 11"), 15 and 16 (row 16,
+  measured punch success, already reads the Phase A runs), tag `m2b`.
 - C1: the final text of decision rows M1-77 to M1-86 (still placeholders with step notes) and of
   the plan: `docs/PLAN.md` describes Phase A since the Phase A close (Part C M2 amended, §B.2,
   §B.6, §B.8.6.4, §B.8.17 item 7, Parts E and G), in words C1 replaces with the final ones.
@@ -229,9 +247,13 @@ and the crates below ring check here).
   sends to port 5351); under Wine they fail (shared loopback port, answers from `127.0.0.1`).
 - The app's tests still run as `tester` (copy the binary from `cargo test -p tornect --no-run` to
   `/home/tester`, run with `runuser`, delete it afterwards).
-- The QUIC transport lets the viewer open one bidi stream at a time (`HOST_STREAMS` is 1): a test
-  that opens a second stream while the first is open waits forever, and in paused time that shows
-  as a hang with growing memory, not a timeout. Keep one stream and write on it.
+- The QUIC transport lets the viewer open two bidi streams at a time (`HOST_STREAMS` is 2, media
+  and services since B10): a test that opens a third while two are open waits forever, and in
+  paused time that shows as a hang with growing memory, not a timeout. Bound such an open with a
+  timeout, as `quic::tests` and `direct_loopback` do.
+- A public doc that links a `pub(crate)` item fails `cargo doc -D warnings`
+  (`rustdoc::private-intra-doc-links`) while clippy and the tests pass: run the doc build before
+  committing (B10 found one, fixed in `a8cfd817`).
 - A dual-stack `MemUdp` refuses a plain IPv4 destination (`InvalidInput`, as the OS does), forged
   sends through `spoof_as` included: give it the v4-mapped form (`direct_nat::forge`).
 - The redaction e2e's fake routers sit on `127.0.0.171` (PCP) and `127.0.0.172` (UPnP-IGD), beside
