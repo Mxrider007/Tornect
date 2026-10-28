@@ -775,6 +775,17 @@ pub trait PathExchange: Send + Sync {
         let _ = session_id;
         PathRecord::default()
     }
+
+    /// The viewer's path frame `frame` of session `session_id`, told the
+    /// moment the FSM admits it through the path rules, before it reads the
+    /// session's next frame, whether or not the [`PathPort`] inbox takes it.
+    /// The inbox is read on the path's own task, so a `BYE` right behind a
+    /// `TOR_FALLBACK` could otherwise end the session, and have its
+    /// [`Self::outcome`] read, before that task saw the reason. Must not
+    /// block.
+    fn heard(&self, session_id: &str, frame: &PathFrame) {
+        let _ = (session_id, frame);
+    }
 }
 
 /// No direct path: [`PathPort::default`] for every session (M1 behaviour,

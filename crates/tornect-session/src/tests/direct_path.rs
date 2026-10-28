@@ -72,6 +72,10 @@ impl PathExchange for Tap {
     fn outcome(&self, session_id: &str) -> PathRecord {
         self.inner.outcome(session_id)
     }
+
+    fn heard(&self, session_id: &str, frame: &PathFrame) {
+        self.inner.heard(session_id, frame);
+    }
 }
 
 /// What the host runs for the session's path.

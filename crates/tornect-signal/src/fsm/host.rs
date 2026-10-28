@@ -2091,16 +2091,23 @@ impl PathRules {
     }
 }
 
-/// A viewer's checked path frame: through the rules, then into the session's
-/// inbox without waiting. A frame the rules drop, or that finds the inbox
-/// full or absent, is counted and goes no further.
+/// A viewer's checked path frame: through the rules, told to the path
+/// exchange at once ([`PathExchange::heard`]), then into the session's inbox
+/// without waiting. A frame the rules drop goes no further; one the rules
+/// admit but that finds the inbox full or absent is still heard. Both are
+/// counted.
 fn pass_on(
     deps: &HostDeps,
     rules: &mut PathRules,
     port: &PathPort,
+    session_id: &str,
     frame: PathFrame,
 ) -> Result<(), HandshakeError> {
-    let delivered = rules.admit(&frame)?
+    let admitted = rules.admit(&frame)?;
+    if admitted {
+        deps.paths.heard(session_id, &frame);
+    }
+    let delivered = admitted
         && port
             .inbox
             .as_ref()
@@ -2300,12 +2307,12 @@ where
             Kind::Candidates => {
                 let c: messages::Candidates = checked_body(&rx)?;
                 have_path = true;
-                pass_on(deps, &mut rules, port, PathFrame::Candidates(c))?;
+                pass_on(deps, &mut rules, port, session_id, PathFrame::Candidates(c))?;
             }
             Kind::CandidatesDone => {
                 let _: messages::CandidatesDone = checked_body(&rx)?;
                 have_path = true;
-                pass_on(deps, &mut rules, port, PathFrame::Done)?;
+                pass_on(deps, &mut rules, port, session_id, PathFrame::Done)?;
             }
             Kind::TorFallback => {
                 let fallback: messages::TorFallback = checked_body(&rx)?;
@@ -2314,6 +2321,7 @@ where
                     deps,
                     &mut rules,
                     port,
+                    session_id,
                     PathFrame::TorFallback(fallback.reason),
                 )?;
             }

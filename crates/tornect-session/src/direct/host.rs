@@ -380,6 +380,24 @@ impl PathExchange for DirectHost {
             path: record.and_then(|r| r.summary(transport)),
         }
     }
+
+    /// The viewer's `TOR_FALLBACK` reason goes into the session's record
+    /// here, as the FSM admits the frame, and not only when the session's
+    /// task reads its inbox: a `BYE` right behind it may end the session,
+    /// and have its outcome read, before the task runs. An old viewer's
+    /// `TOR_FALLBACK{}` is M1's plain "no direct path" and names no reason:
+    /// its record keeps saying `old-viewer`.
+    fn heard(&self, session_id: &str, frame: &PathFrame) {
+        if let PathFrame::TorFallback(reason) = frame {
+            let reason = *reason;
+            self.shared.note(session_id, |r| {
+                if !r.old_viewer {
+                    let ms = ms_since(r.accepted);
+                    r.viewer_fallback.get_or_insert((reason, ms));
+                }
+            });
+        }
+    }
 }
 
 /// A session's open link and what runs on it.

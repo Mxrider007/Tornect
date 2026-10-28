@@ -288,6 +288,10 @@ impl PathExchange for Taps {
     fn outcome(&self, session_id: &str) -> PathRecord {
         self.inner.outcome(session_id)
     }
+
+    fn heard(&self, session_id: &str, frame: &PathFrame) {
+        self.inner.heard(session_id, frame);
+    }
 }
 
 /// One accepted session through the real FSMs over a lagged pipe, both
@@ -472,23 +476,6 @@ impl NatFx {
         }
     }
 
-    /// Waits until the host's half has the viewer's `TOR_FALLBACK`. The
-    /// half records the reason as the frame reaches it, and a `BYE` read in
-    /// the same breath could end the session first (an open residual), so a
-    /// test that wants the reason in the end line waits for it.
-    async fn fallback_reached(&self) {
-        let frames = Arc::clone(&self.from_viewer);
-        until("the host has the viewer's TOR_FALLBACK", || {
-            frames
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|f| matches!(f, PathFrame::TorFallback(_)))
-        })
-        .await;
-        tokio::time::sleep(ms(1)).await;
-    }
-
     /// The viewer ends the session with `BYE{reason}`; the host's end line.
     async fn end(self, reason: u16) -> (Option<TransportKind>, Option<PathSummary>) {
         self.session.bye(reason).await.unwrap();
@@ -610,10 +597,10 @@ async fn run_with<T>(
             );
             went
         }
-        PathChoice::Tor { why, elapsed } => {
-            fx.fallback_reached().await;
-            Went::Tor { why, elapsed }
-        }
+        // The viewer's `BYE` follows its `TOR_FALLBACK` at once: the host
+        // FSM tells its half of the fallback as it reads it, so the end line
+        // still names the viewer's reason.
+        PathChoice::Tor { why, elapsed } => Went::Tor { why, elapsed },
         other => panic!("neither direct nor Tor: {other:?}"),
     };
     let from_viewer = Arc::clone(&fx.from_viewer);
@@ -1598,7 +1585,6 @@ async fn a_peer_listing_victims_and_forging_requests_draws_bounded_probes() {
         .send_tor_fallback(Some(fallback::NO_PATH))
         .await
         .unwrap();
-    fx.fallback_reached().await;
     let host_asked = Asked::from(fx.host_env.calls());
     let (transport, summary) = fx.end(bye::USER).await;
     let summary = summary.expect("a path summary");

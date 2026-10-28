@@ -627,6 +627,40 @@ async fn nothing_binds_before_the_viewers_candidates_or_after_its_fallback() {
     );
 }
 
+/// The viewer's `TOR_FALLBACK` and its `BYE` in the same breath: the host's
+/// FSM reads both before the direct host's task runs, yet the end line
+/// carries the viewer's reason, because the FSM tells the direct host of the
+/// frame as it admits it (`PathExchange::heard`). The link closes all the
+/// same.
+#[tokio::test(start_paused = true)]
+async fn a_bye_right_behind_the_fallback_keeps_the_viewers_reason() {
+    let [viewer, _, host] = keys_by_order();
+    for reason in [Some(fallback::QUIC), None] {
+        let mut fx = fixture(&Opts::new(TransportPolicy::Any, viewer, host)).await;
+        fx.send_candidates(&[silent_candidate()]).await;
+        assert!(matches!(
+            fx.event(WAIT).await,
+            Some(SessionEvent::Candidates(_))
+        ));
+        assert_eq!(fx.event(WAIT).await, Some(SessionEvent::CandidatesDone));
+        assert_eq!(fx.host.links_open(), 1);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        fx.session.send_tor_fallback(reason).await.unwrap();
+        fx.session.bye(bye::USER).await.unwrap();
+        let (transport, path) = fx.host.ends.line().await;
+        assert_eq!(transport, None);
+        let path = path.expect("a summary");
+        assert_eq!(
+            path.outcome,
+            reason.map_or("unknown", fallback::name),
+            "{reason:?}"
+        );
+        assert!((700..800).contains(&path.ms), "{}", path.ms);
+        fx.fsm.await.unwrap().unwrap();
+        until("the link closed", || fx.host.links_open() == 0).await;
+    }
+}
+
 /// The linger (the direct design §4): a link with no direct claim closes
 /// 20 s after its bind, and the session goes on; the end line says
 /// `no-path`. Under `lan_only` the session then ends `BYE{NO_LAN_PATH}`.

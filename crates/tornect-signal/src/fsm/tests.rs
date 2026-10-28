@@ -2947,7 +2947,8 @@ struct Opened {
 /// the session's two channels (design `direct` §8.2): an inbox of `inbox`
 /// frames (none for `None`), never drained by the probe itself, and an outbox
 /// already holding `preload` (none for `None`), kept open by the probe. Its
-/// `outcome` answers `record`; both calls are noted in `order`.
+/// `outcome` answers `record`; both calls, and each frame it `heard`, are
+/// noted in `order`.
 struct PathsProbe {
     inbox: Option<usize>,
     preload: Option<Vec<PathFrame>>,
@@ -2958,6 +2959,8 @@ struct PathsProbe {
     outboxes: Mutex<Vec<mpsc::Sender<PathFrame>>>,
     record: Mutex<PathRecord>,
     order: Arc<Mutex<Vec<&'static str>>>,
+    /// The frames [`PathExchange::heard`] told, with their session.
+    heard: Mutex<Vec<(String, PathFrame)>>,
 }
 
 impl PathsProbe {
@@ -2979,6 +2982,7 @@ impl PathsProbe {
             outboxes: Mutex::default(),
             record: Mutex::default(),
             order: Arc::default(),
+            heard: Mutex::default(),
         });
         host.deps.paths = probe.clone();
         probe
@@ -2990,6 +2994,11 @@ impl PathsProbe {
 
     fn opened(&self) -> Vec<Opened> {
         self.opened.lock().unwrap().clone()
+    }
+
+    /// The frames heard so far, with their session.
+    fn heard(&self) -> Vec<(String, PathFrame)> {
+        self.heard.lock().unwrap().clone()
     }
 
     /// What the inbox of the `n`th opened session holds, in order (taken).
@@ -3043,6 +3052,14 @@ impl PathExchange for PathsProbe {
             "the outcome of the session served"
         );
         self.record.lock().unwrap().clone()
+    }
+
+    fn heard(&self, session_id: &str, frame: &PathFrame) {
+        self.order.lock().unwrap().push("heard");
+        self.heard
+            .lock()
+            .unwrap()
+            .push((session_id.to_owned(), frame.clone()));
     }
 }
 
@@ -11093,6 +11110,15 @@ async fn the_path_rules_cap_a_viewers_frames_and_count_what_they_drop() {
     expected.push(PathFrame::Done);
     expected.push(PathFrame::TorFallback(Some(messages::fallback::NO_PATH)));
     assert_eq!(frames, expected);
+    let session_id = probe.opened()[0].session_id.clone();
+    assert_eq!(
+        probe.heard(),
+        expected
+            .iter()
+            .map(|f| (session_id.clone(), f.clone()))
+            .collect::<Vec<_>>(),
+        "what the rules admit is heard, and only that"
+    );
     assert_eq!(
         host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
         5,
@@ -11684,6 +11710,77 @@ async fn the_path_outcome_is_read_before_on_end_and_recorded_with_the_end() {
             record.path
         ))
     );
+}
+
+/// Design `direct` §8.2, §8.5 `outcome()`: a viewer's `TOR_FALLBACK` is
+/// heard by the path exchange the moment the FSM admits it, before the next
+/// frame is read, so a `BYE` written right behind it in the same breath
+/// cannot end the session, and have its outcome read, before the path knows
+/// the viewer's reason. Heard with a full inbox too.
+#[tokio::test(start_paused = true)]
+async fn a_fallback_right_before_a_bye_is_heard_before_the_outcome_is_read() {
+    for inbox in [Some(PATH_INBOX), Some(1), None] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, live, probe) = path_host(tmp.path(), inbox, Some(Vec::new()));
+        host.deps.sessions = Arc::new(OrderedSink {
+            live: live.clone(),
+            order: probe.order.clone(),
+            panic_at_start: false,
+        });
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+        ping_through(&mut raw, 1).await;
+        // A `CANDIDATES` first fills a one-frame inbox.
+        raw.chan.send(&viewer_candidates(None), None).await.unwrap();
+        raw.chan
+            .send(
+                &messages::TorFallback {
+                    reason: Some(messages::fallback::QUIC),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        raw.chan
+            .send(
+                &messages::Bye {
+                    reason: bye::USER,
+                    detail: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        match task.await.unwrap().unwrap() {
+            HostOutcome::Session { end, .. } => {
+                assert_eq!(end, SessionEnd::PeerBye(bye::USER), "{inbox:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            probe.order(),
+            ["on_start", "open", "heard", "heard", "outcome", "on_end"],
+            "{inbox:?}"
+        );
+        let session_id = probe.opened()[0].session_id.clone();
+        assert_eq!(
+            probe.heard(),
+            [
+                (
+                    session_id.clone(),
+                    PathFrame::Candidates(viewer_candidates(None))
+                ),
+                (
+                    session_id,
+                    PathFrame::TorFallback(Some(messages::fallback::QUIC))
+                ),
+            ],
+            "{inbox:?}"
+        );
+    }
 }
 
 /// Design `direct` §8.2, SLICE-B1 B1-4: a session task that is cancelled, or
