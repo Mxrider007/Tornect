@@ -556,6 +556,21 @@ pub async fn aio::tokio::search_gateway(options: SearchOptions)
   to 20 tries on 718, once with equal ports on 724; `remove_port(protocol,
   external_port)` (`:280`). "The lease_duration parameter is in seconds. A value of 0 is
   infinite." Tornect always passes 600.
+- `get_generic_port_mapping_entry(index)` (`:303`, read 2026-10-28 in the 0.18.0 source):
+  `GetGenericPortMappingEntry` by index, parsed into a `PortMappingEntry { remote_host,
+  external_port, protocol, internal_port, internal_client, enabled,
+  port_mapping_description, lease_duration }` (`common/parsing.rs:465–546`; `remote_host`
+  and `internal_client` are the router's strings, a host name possible; a missing field is
+  an `InvalidResponse`). Errors: 606 `ActionNotAuthorized`, 713
+  `SpecifiedArrayIndexInvalid` (past the end; some routers answer 714 there), anything else
+  a `RequestError` (`errors.rs:198–219`). "Not all existing port mappings might be visible
+  to this client." igd-next 0.18 has no `GetSpecificPortMappingEntry`, and its
+  `perform_request` is private. `DeletePortMapping` names the external port and protocol
+  only (with an empty `NewRemoteHost`), and IGDv1 routers commonly let any LAN client
+  delete any mapping, so Tornect reads the table (at most 32 entries) before each delete
+  and deletes only the wildcard UDP entry that forwards to its own address and port under
+  its description (decision M1-81). What the table shows of other computers is compared
+  and dropped, never logged or kept.
 - Error mapping (`common/parsing.rs:418–449`): `AddPortError` 605 `DescriptionTooLong`, 606
   `ActionNotAuthorized`, 718 `PortInUse`, 724 `SamePortValuesRequired`, 725
   `OnlyPermanentLeasesSupported`; `AddAnyPortError` 718 `NoPortsAvailable` /

@@ -65,7 +65,9 @@ pub struct SweepReport {
     /// Leftovers of another router or address, kept for a later start.
     pub kept: usize,
     /// Leftovers too old to act on, unreadable, or of a UPnP request whose
-    /// port was never learnt: forgotten without contacting a router.
+    /// port was never learnt: forgotten without contacting a router; and
+    /// UPnP leftovers whose port the router's table gives to another
+    /// computer or to none: forgotten without a delete.
     pub dropped: usize,
     /// Leftovers whose removal failed, kept for a later start.
     pub failed: usize,
@@ -368,7 +370,9 @@ impl RealMapper {
     /// another router or address is kept for a later start (no other router
     /// is contacted); one older than [`LEDGER_MAX_AGE`] (a UPnP one: than
     /// its lease and a minute), or a UPnP one whose port was never learnt,
-    /// is forgotten. `here` is awaited only when there are leftovers. A
+    /// is forgotten. A UPnP leftover is deleted only while the router's
+    /// table gives its port to this computer under Tornect's description;
+    /// otherwise it is forgotten. `here` is awaited only when there are leftovers. A
     /// protocol whose router does not answer one removal is not asked for
     /// the rest. The caller bounds the call ([`SWEEP_CAP`]).
     pub async fn sweep(&self, here: impl Future<Output = Option<Router>>) -> SweepReport {
@@ -418,10 +422,13 @@ impl RealMapper {
                         None => Err(MapFail::NoGateway),
                     }
                 } else {
-                    nat::remove_leftover(entry).await
+                    nat::remove_leftover(entry)
+                        .await
+                        .map(|()| upnp::Removal::Deleted)
                 };
                 match result {
-                    Ok(()) => {
+                    Ok(upnp::Removal::NotOurs) => report.dropped += 1,
+                    Ok(upnp::Removal::Deleted) => {
                         report.removed += 1;
                         self.inner
                             .events

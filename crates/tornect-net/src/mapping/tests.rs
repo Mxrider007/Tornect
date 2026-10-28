@@ -3,7 +3,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::fake::{FakeIgd, FakePcp, IgdAnswer, IgdConfig, IgdHeard, PcpHeard, PcpMode};
+use super::fake::{
+    FakeIgd, FakePcp, IgdAnswer, IgdConfig, IgdHeard, IgdMapping, PcpHeard, PcpMode,
+};
 use super::*;
 
 fn request() -> MapRequest {
@@ -946,12 +948,14 @@ async fn a_private_upnp_address_is_released_as_not_global() {
         [
             add_port(PORT),
             IgdHeard::ExternalIp,
+            IgdHeard::MappingEntry { index: 0 },
             IgdHeard::DeletePort {
                 external_port: PORT
             }
         ]
     );
     assert!(mapper.ledger().entries().is_empty());
+    assert!(gw.table().is_empty());
 }
 
 /// PCP and UPnP at once: a public PCP mapping wins, and the UPnP router
@@ -1044,5 +1048,225 @@ fn router_values_print_no_address() {
     let text = format!("{here:?} {here:#?} {:?}", SweepReport::default());
     for piece in ["192", "168", "77", "203"] {
         assert!(!text.contains(piece), "\"{piece}\" in {text}");
+    }
+}
+
+// --- A UPnP delete names only a mapping of ours (decision M1-81). ---
+
+fn deletes(heard: &[IgdHeard]) -> usize {
+    heard
+        .iter()
+        .filter(|h| matches!(h, IgdHeard::DeletePort { .. }))
+        .count()
+}
+
+/// Our own mapping as the router's table holds it.
+fn ours() -> IgdMapping {
+    IgdMapping::udp(PORT, Ipv4Addr::LOCALHOST, PORT, "Tornect")
+}
+
+/// Another computer's mapping of the same external port.
+fn neighbours() -> IgdMapping {
+    IgdMapping::udp(PORT, Ipv4Addr::new(127, 0, 0, 99), 3_074, "game console")
+}
+
+/// The deadline cuts an `AddPortMapping` of a slow router (design §7.4
+/// "Deadline"). The guard reads the router's table (after the add: the
+/// router answers one request at a time) and deletes the port only when
+/// the table gives it to this computer's address and port under Tornect's
+/// description. A router about to refuse it as another computer's (718)
+/// keeps that computer's mapping, and a router that does not show its
+/// table gets no delete, its entry kept naming no port.
+#[tokio::test]
+async fn a_cut_add_deletes_only_a_port_the_table_gives_us() {
+    struct Case {
+        table: Vec<IgdMapping>,
+        lookup: IgdAnswer,
+        deleted: bool,
+        left: Vec<IgdMapping>,
+        entry_kept: bool,
+    }
+    let cases = [
+        // The router granted it after all: ours, deleted, forgotten.
+        Case {
+            table: Vec::new(),
+            lookup: IgdAnswer::Ok,
+            deleted: true,
+            left: Vec::new(),
+            entry_kept: false,
+        },
+        // Another computer holds the port: the add is refused (718), the
+        // neighbour's mapping stays, and nothing of ours is left.
+        Case {
+            table: vec![neighbours()],
+            lookup: IgdAnswer::Ok,
+            deleted: false,
+            left: vec![neighbours()],
+            entry_kept: false,
+        },
+        // The router will not show its table: no delete, whatever it holds.
+        Case {
+            table: Vec::new(),
+            lookup: IgdAnswer::Fault(606),
+            deleted: false,
+            left: vec![ours()],
+            entry_kept: true,
+        },
+    ];
+    for (n, case) in cases.into_iter().enumerate() {
+        let home = tempfile::tempdir().unwrap();
+        let events = Arc::new(Events::default());
+        let mut config = IgdConfig::granting(public(30));
+        config.table = case.table;
+        config.lookup = case.lookup;
+        config.add_delay = Duration::from_millis(600);
+        let gw = FakeIgd::start(loopback(), config).await.unwrap();
+        let mapper = upnp_mapper(home.path(), &events, &gw, None);
+        assert_eq!(
+            mapper
+                .map(ask(gw.ip(), upnp_only(), Duration::from_millis(250)))
+                .await
+                .expect_err("cut by the deadline"),
+            MapFail::Timeout,
+            "case {n}"
+        );
+        assert!(mapper.releases().wait(Duration::from_secs(2)).await);
+        let heard = controls(&gw.heard());
+        assert_eq!(heard[0], add_port(PORT), "case {n}: {heard:?}");
+        assert!(
+            heard.contains(&IgdHeard::MappingEntry { index: 0 }),
+            "case {n}: {heard:?}"
+        );
+        assert_eq!(
+            deletes(&heard),
+            usize::from(case.deleted),
+            "case {n}: {heard:?}"
+        );
+        assert_eq!(gw.table(), case.left, "case {n}");
+        let entries = mapper.ledger().entries();
+        if case.entry_kept {
+            assert_eq!(entries.len(), 1, "case {n}");
+            assert_eq!(entries[0].external_port, None, "case {n}");
+        } else {
+            assert!(entries.is_empty(), "case {n}: {entries:?}");
+        }
+        assert!(events.seen().is_empty(), "case {n}: {:?}", events.seen());
+    }
+}
+
+/// A release reads the table first: a port that has since become another
+/// computer's (the lease ran out, the router restarted), or no one's, is
+/// not deleted, and the mapping ends as closed; a router that does not
+/// show its table, or whose table is longer than the walk, still gets the
+/// delete of the port it granted us within its lease.
+#[tokio::test]
+async fn a_release_deletes_only_a_port_still_ours() {
+    let others: Vec<IgdMapping> = (0..u16::try_from(upnp::TABLE_WALK).unwrap() + 4)
+        .map(|i| IgdMapping::udp(40_000 + i, Ipv4Addr::new(127, 0, 0, 98), 40_000 + i, "x"))
+        .collect();
+    let mut long = others.clone();
+    long.push(ours());
+    let renamed = IgdMapping {
+        description: "another program".to_owned(),
+        ..ours()
+    };
+    let tcp = IgdMapping {
+        tcp: true,
+        ..ours()
+    };
+    // (table at release, lookup, deleted, lookups read)
+    let cases: [(Vec<IgdMapping>, IgdAnswer, bool, usize); 7] = [
+        (vec![ours()], IgdAnswer::Ok, true, 1),
+        (vec![neighbours()], IgdAnswer::Ok, false, 1),
+        (vec![renamed.clone()], IgdAnswer::Ok, false, 1),
+        (vec![tcp.clone()], IgdAnswer::Ok, false, 2),
+        (Vec::new(), IgdAnswer::Ok, false, 1),
+        (vec![ours()], IgdAnswer::Fault(401), true, 1),
+        (long, IgdAnswer::Ok, true, upnp::TABLE_WALK as usize),
+    ];
+    for (n, (table, lookup, deleted, reads)) in cases.into_iter().enumerate() {
+        let home = tempfile::tempdir().unwrap();
+        let events = Arc::new(Events::default());
+        let gw = FakeIgd::start(loopback(), IgdConfig::granting(public(31)))
+            .await
+            .unwrap();
+        let mapper = upnp_mapper(home.path(), &events, &gw, None);
+        let mapping = mapper
+            .map(ask(gw.ip(), upnp_only(), Duration::from_secs(3)))
+            .await
+            .expect("a UPnP mapping");
+        gw.set_table(table.clone());
+        gw.set_lookup(lookup);
+        let before = gw.heard().len();
+        mapping.release().await;
+        let heard = controls(&gw.heard()[before..]);
+        let lookups = heard
+            .iter()
+            .filter(|h| matches!(h, IgdHeard::MappingEntry { .. }))
+            .count();
+        assert_eq!(lookups, reads, "case {n}: {heard:?}");
+        assert_eq!(deletes(&heard), usize::from(deleted), "case {n}: {heard:?}");
+        if !deleted {
+            assert_eq!(gw.table(), table, "case {n}: the other mapping stays");
+        }
+        assert!(mapper.ledger().entries().is_empty(), "case {n}");
+        assert_eq!(
+            events.seen(),
+            [
+                MapEvent::Opened(MapVia::Upnp),
+                MapEvent::Closed(MapVia::Upnp)
+            ],
+            "case {n}"
+        );
+    }
+}
+
+/// A crash leftover whose port the router's table now gives to another
+/// computer, or to another program on this one, is forgotten without a
+/// delete; one still ours is deleted (`the_sweep_removes_a_upnp_leftover`).
+#[tokio::test]
+async fn the_sweep_leaves_a_port_that_is_no_longer_ours() {
+    let renamed = IgdMapping {
+        description: "another program".to_owned(),
+        ..ours()
+    };
+    for (n, table) in [vec![neighbours()], vec![renamed], Vec::new()]
+        .into_iter()
+        .enumerate()
+    {
+        let home = tempfile::tempdir().unwrap();
+        let events = Arc::new(Events::default());
+        let gw = FakeIgd::start(loopback(), IgdConfig::granting(public(32)))
+            .await
+            .unwrap();
+        let mapper = upnp_mapper(home.path(), &events, &gw, None);
+        let mapping = mapper
+            .map(ask(gw.ip(), upnp_only(), Duration::from_secs(3)))
+            .await
+            .unwrap();
+        mapper.ledger().abandon();
+        std::mem::forget(mapping);
+        drop(mapper);
+        gw.set_table(table.clone());
+        let before = gw.heard().len();
+        let next = upnp_mapper(home.path(), &events, &gw, None);
+        let here = Router {
+            gateway: gw.ip(),
+            client: Ipv4Addr::LOCALHOST,
+        };
+        let report = next.sweep(async move { Some(here) }).await;
+        assert_eq!(
+            report,
+            SweepReport {
+                dropped: 1,
+                ..SweepReport::default()
+            },
+            "case {n}"
+        );
+        let heard = controls(&gw.heard()[before..]);
+        assert_eq!(deletes(&heard), 0, "case {n}: {heard:?}");
+        assert_eq!(gw.table(), table, "case {n}");
+        assert_eq!(events.seen(), [MapEvent::Opened(MapVia::Upnp)], "case {n}");
+        assert_eq!(MappingLedger::leftovers(home.path()), 0, "case {n}");
     }
 }

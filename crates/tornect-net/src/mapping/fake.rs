@@ -1,14 +1,15 @@
 //! Fake routers on loopback addresses for the router protocols' tests
 //! (design `direct` §12.2 "mapping"): [`FakePcp`] answers PCP and NAT-PMP
 //! on `<ip>:5351` (crab_nat's fixed port), [`FakeIgd`] answers the SSDP
-//! search and the UPnP-IGD description and control requests. Both log what
-//! they heard. Each test gives its fakes their own `127.0.0.N` (Linux and
+//! search and the UPnP-IGD description and control requests, one at a
+//! time, over a port-mapping table of its own. Both log what they heard. Each test gives its fakes their own `127.0.0.N` (Linux and
 //! Windows route all of `127/8` to loopback; macOS needs `lo0` aliases).
 //! Built for this crate's tests and under the `test-support` feature only.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -259,6 +260,42 @@ pub enum IgdAnswer {
     Fault(u16),
 }
 
+/// One mapping in a [`FakeIgd`]'s table (UDP unless `tcp`, wildcard remote
+/// host).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgdMapping {
+    /// `NewExternalPort`.
+    pub external_port: u16,
+    /// `NewProtocol` TCP rather than UDP.
+    pub tcp: bool,
+    /// `NewInternalClient`, as the router writes it.
+    pub internal_client: String,
+    /// `NewInternalPort`.
+    pub internal_port: u16,
+    /// `NewPortMappingDescription`.
+    pub description: String,
+}
+
+impl IgdMapping {
+    /// A UDP mapping of `external_port` to `client:internal_port` under
+    /// `description`.
+    #[must_use]
+    pub fn udp(
+        external_port: u16,
+        client: Ipv4Addr,
+        internal_port: u16,
+        description: &str,
+    ) -> Self {
+        Self {
+            external_port,
+            tcp: false,
+            internal_client: client.to_string(),
+            internal_port,
+            description: description.to_owned(),
+        }
+    }
+}
+
 /// How a [`FakeIgd`] behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgdConfig {
@@ -275,6 +312,18 @@ pub struct IgdConfig {
     pub delete: IgdAnswer,
     /// What `GetExternalIPAddress` answers.
     pub external: Ipv4Addr,
+    /// The mappings in its table at start (another computer's, a crashed
+    /// run's). An `AddPortMapping` it grants, or an `AddAnyPortMapping`,
+    /// adds one; a `DeletePortMapping` it grants removes its port. An
+    /// `AddPortMapping` of a port the table gives to another client or
+    /// port is refused with 718, whatever `add_port` says.
+    pub table: Vec<IgdMapping>,
+    /// `GetGenericPortMappingEntry`: `Ok` answers the entry at the index,
+    /// or 713 past the end; a fault answers every index with it.
+    pub lookup: IgdAnswer,
+    /// How long it takes to answer an `AddPortMapping`; it answers one
+    /// control request at a time, so later requests wait behind it.
+    pub add_delay: Duration,
 }
 
 impl IgdConfig {
@@ -289,6 +338,9 @@ impl IgdConfig {
             any_port: 50_999,
             delete: IgdAnswer::Ok,
             external,
+            table: Vec::new(),
+            lookup: IgdAnswer::Ok,
+            add_delay: Duration::ZERO,
         }
     }
 }
@@ -325,12 +377,18 @@ pub enum IgdHeard {
         /// `NewExternalPort`.
         external_port: u16,
     },
+    /// `GetGenericPortMappingEntry`.
+    MappingEntry {
+        /// `NewPortMappingIndex`.
+        index: u32,
+    },
     /// Anything else.
     Other,
 }
 
 struct IgdState {
     config: IgdConfig,
+    table: Vec<IgdMapping>,
     heard: Vec<IgdHeard>,
 }
 
@@ -342,6 +400,17 @@ pub struct FakeIgd {
     state: Arc<Mutex<IgdState>>,
     tasks: [AbortHandle; 2],
 }
+
+const MAPPING_ENTRY_OUT: [&str; 8] = [
+    "NewRemoteHost",
+    "NewExternalPort",
+    "NewProtocol",
+    "NewInternalPort",
+    "NewInternalClient",
+    "NewEnabled",
+    "NewPortMappingDescription",
+    "NewLeaseDuration",
+];
 
 impl Drop for FakeIgd {
     fn drop(&mut self) {
@@ -423,6 +492,10 @@ fn service_description(with_any: bool) -> String {
         "<action><name>GetExternalIPAddress</name>{}</action>",
         arguments(&[], &["NewExternalIPAddress"])
     ));
+    actions.push_str(&format!(
+        "<action><name>GetGenericPortMappingEntry</name>{}</action>",
+        arguments(&["NewPortMappingIndex"], &MAPPING_ENTRY_OUT)
+    ));
     format!(
         r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
@@ -463,8 +536,23 @@ fn arg<'a>(body: &'a str, tag: &str) -> &'a str {
         .unwrap_or("")
 }
 
+/// The SOAP action of a control request's head.
+fn soap_action(head: &str) -> &str {
+    head.lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("soapaction:"))
+        .and_then(|l| l.split('#').nth(1))
+        .map(|a| a.trim_end_matches('"').trim())
+        .unwrap_or("")
+}
+
+/// The index of `port` (UDP) in `table`.
+fn slot(table: &[IgdMapping], port: u16) -> Option<usize> {
+    table.iter().position(|m| !m.tcp && m.external_port == port)
+}
+
 /// The answer to one HTTP request: status, body, and what it was.
-fn answer_http(config: &IgdConfig, head: &str, body: &str) -> (u16, String, IgdHeard) {
+fn answer_http(state: &mut IgdState, head: &str, body: &str) -> (u16, String, IgdHeard) {
+    let IgdState { config, table, .. } = state;
     let first = head.lines().next().unwrap_or("");
     if first.starts_with("GET /rootDesc.xml") {
         return (200, device_description(), IgdHeard::Describe);
@@ -479,12 +567,7 @@ fn answer_http(config: &IgdConfig, head: &str, body: &str) -> (u16, String, IgdH
     if !first.starts_with("POST /ctl") {
         return (404, String::new(), IgdHeard::Other);
     }
-    let action = head
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("soapaction:"))
-        .and_then(|l| l.split('#').nth(1))
-        .map(|a| a.trim_end_matches('"').trim())
-        .unwrap_or("");
+    let action = soap_action(head);
     let number = |tag: &str| arg(body, tag).parse::<u32>().unwrap_or(u32::MAX);
     let port = |tag: &str| arg(body, tag).parse::<u16>().unwrap_or(0);
     let reply = |answer: IgdAnswer, action: &str, out: &str| match answer {
@@ -493,13 +576,36 @@ fn answer_http(config: &IgdConfig, head: &str, body: &str) -> (u16, String, IgdH
     };
     match action {
         "AddPortMapping" => {
-            let heard = IgdHeard::AddPort {
+            let mapping = IgdMapping {
                 external_port: port("NewExternalPort"),
+                tcp: arg(body, "NewProtocol") == "TCP",
+                internal_client: arg(body, "NewInternalClient").to_owned(),
                 internal_port: port("NewInternalPort"),
-                lease: number("NewLeaseDuration"),
                 description: arg(body, "NewPortMappingDescription").to_owned(),
             };
-            let (status, text) = reply(config.add_port, action, "");
+            let heard = IgdHeard::AddPort {
+                external_port: mapping.external_port,
+                internal_port: mapping.internal_port,
+                lease: number("NewLeaseDuration"),
+                description: mapping.description.clone(),
+            };
+            let at = slot(table, mapping.external_port);
+            let taken = at.is_some_and(|i| {
+                table[i].internal_client != mapping.internal_client
+                    || table[i].internal_port != mapping.internal_port
+            });
+            let answer = if taken {
+                IgdAnswer::Fault(718)
+            } else {
+                config.add_port
+            };
+            if answer == IgdAnswer::Ok {
+                match at {
+                    Some(i) => table[i] = mapping,
+                    None => table.push(mapping),
+                }
+            }
+            let (status, text) = reply(answer, action, "");
             (status, text, heard)
         }
         "AddAnyPortMapping" => {
@@ -508,6 +614,19 @@ fn answer_http(config: &IgdConfig, head: &str, body: &str) -> (u16, String, IgdH
                 lease: number("NewLeaseDuration"),
             };
             let answer = config.add_any_port.unwrap_or(IgdAnswer::Fault(401));
+            if answer == IgdAnswer::Ok {
+                let mapping = IgdMapping {
+                    external_port: config.any_port,
+                    tcp: false,
+                    internal_client: arg(body, "NewInternalClient").to_owned(),
+                    internal_port: port("NewInternalPort"),
+                    description: arg(body, "NewPortMappingDescription").to_owned(),
+                };
+                match slot(table, config.any_port) {
+                    Some(i) => table[i] = mapping,
+                    None => table.push(mapping),
+                }
+            }
             let out = format!("<NewReservedPort>{}</NewReservedPort>", config.any_port);
             let (status, text) = reply(answer, action, &out);
             (status, text, heard)
@@ -516,7 +635,33 @@ fn answer_http(config: &IgdConfig, head: &str, body: &str) -> (u16, String, IgdH
             let heard = IgdHeard::DeletePort {
                 external_port: port("NewExternalPort"),
             };
+            if config.delete == IgdAnswer::Ok
+                && let Some(i) = slot(table, port("NewExternalPort"))
+            {
+                table.remove(i);
+            }
             let (status, text) = reply(config.delete, action, "");
+            (status, text, heard)
+        }
+        "GetGenericPortMappingEntry" => {
+            let index = number("NewPortMappingIndex");
+            let heard = IgdHeard::MappingEntry { index };
+            let entry = usize::try_from(index).ok().and_then(|i| table.get(i));
+            let (status, text) = match (config.lookup, entry) {
+                (IgdAnswer::Fault(code), _) => (500, soap_fault(code)),
+                (IgdAnswer::Ok, None) => (500, soap_fault(713)),
+                (IgdAnswer::Ok, Some(m)) => {
+                    let out = format!(
+                        "<NewRemoteHost></NewRemoteHost><NewExternalPort>{}</NewExternalPort><NewProtocol>{}</NewProtocol><NewInternalPort>{}</NewInternalPort><NewInternalClient>{}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{}</NewPortMappingDescription><NewLeaseDuration>600</NewLeaseDuration>",
+                        m.external_port,
+                        if m.tcp { "TCP" } else { "UDP" },
+                        m.internal_port,
+                        m.internal_client,
+                        m.description
+                    );
+                    reply(IgdAnswer::Ok, action, &out)
+                }
+            };
             (status, text, heard)
         }
         "GetExternalIPAddress" => {
@@ -580,9 +725,13 @@ impl FakeIgd {
         let http = TcpListener::bind((ip, 0)).await?;
         let http_port = http.local_addr()?.port();
         let state = Arc::new(Mutex::new(IgdState {
+            table: config.table.clone(),
             config,
             heard: Vec::new(),
         }));
+        // One control request at a time, as a router's single control
+        // thread answers them.
+        let serial = Arc::new(tokio::sync::Mutex::new(()));
         let shared = Arc::clone(&state);
         let search = tokio::spawn(async move {
             let mut buf = [0_u8; 2048];
@@ -613,13 +762,19 @@ impl FakeIgd {
                     continue;
                 };
                 let shared = Arc::clone(&shared);
+                let serial = Arc::clone(&serial);
                 tokio::spawn(async move {
                     let Ok((head, body)) = read_request(&mut stream).await else {
                         return;
                     };
+                    let _turn = serial.lock().await;
+                    let delay = lock(&shared).config.add_delay;
+                    if soap_action(&head) == "AddPortMapping" && !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let (status, text) = {
                         let mut state = lock(&shared);
-                        let (status, text, heard) = answer_http(&state.config, &head, &body);
+                        let (status, text, heard) = answer_http(&mut state, &head, &body);
                         state.heard.push(heard);
                         (status, text)
                     };
@@ -663,5 +818,22 @@ impl FakeIgd {
     #[must_use]
     pub fn heard(&self) -> Vec<IgdHeard> {
         lock(&self.state).heard.clone()
+    }
+
+    /// Its table now.
+    #[must_use]
+    pub fn table(&self) -> Vec<IgdMapping> {
+        lock(&self.state).table.clone()
+    }
+
+    /// Replaces its table (a lease that ran out, another computer taking
+    /// the port).
+    pub fn set_table(&self, table: Vec<IgdMapping>) {
+        lock(&self.state).table = table;
+    }
+
+    /// Changes how it answers `GetGenericPortMappingEntry`.
+    pub fn set_lookup(&self, lookup: IgdAnswer) {
+        lock(&self.state).config.lookup = lookup;
     }
 }
