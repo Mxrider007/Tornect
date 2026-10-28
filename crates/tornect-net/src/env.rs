@@ -232,9 +232,11 @@ impl RealNet {
     /// is read at each round and returns the list to resolve, or nothing
     /// when the refresh is not allowed now (it is only while the internet
     /// direct path is on, the effective policy allows direct paths, STUN is
-    /// on and no bridge is in use); the app calls this at start (GUI, `host`,
-    /// `connect`). A refresh already running is replaced. Returns false
-    /// outside a tokio runtime, where nothing starts.
+    /// on and no bridge is in use); the app calls this once Tor has
+    /// bootstrapped (GUI, `host`, `connect`), never before: until then
+    /// whether Tor needs a bridge is not known. A refresh already running is
+    /// replaced. Returns false outside a tokio runtime, where nothing
+    /// starts.
     pub fn prefetch(&self, entries: impl Fn() -> Vec<String> + Send + Sync + 'static) -> bool {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return false;

@@ -48,10 +48,10 @@
 //!   whatever the server answers ends it. The mapped address must be global
 //!   IPv4 with a port (loopback too in test environments); one equal to a
 //!   host candidate means there is no NAT, and no srflx candidate.
-//! - **DNS** (§5.3): names are resolved in the background, at start and
-//!   every [`DNS_REFRESH`] ± [`DNS_JITTER`] ([`StunDns::run`]); a session
-//!   reads them through [`NetEnv::resolve`], which on the real machine
-//!   answers from the cache. Once a refresh round has completed
+//! - **DNS** (§5.3): names are resolved in the background, from the app's
+//!   first Tor bootstrap and then every [`DNS_REFRESH`] ± [`DNS_JITTER`]
+//!   ([`StunDns::run`]); a session reads them through [`NetEnv::resolve`],
+//!   which on the real machine answers from the cache. Once a refresh round has completed
 //!   ([`StunDns::refreshed`]) a name the cache lacks is an error at once,
 //!   so the resolver never learns when a session starts; only a cold cache
 //!   (no round completed yet, as for the one-shot `connect`) is looked up
