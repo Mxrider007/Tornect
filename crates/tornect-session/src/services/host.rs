@@ -408,6 +408,14 @@ impl ServicesHost {
             .send_modify(|reads| *reads = reads.wrapping_add(1));
     }
 
+    /// Whether session `session_id` has a stream the host's user can reach
+    /// ([`Self::send_chat`] and the others): from its `Welcome` until its
+    /// end (step 5) let it go.
+    #[cfg(test)]
+    pub(crate) fn has_control(&self, session_id: &str) -> bool {
+        lock(&self.controls).contains_key(session_id)
+    }
+
     fn op(&self, session_id: &str, op: HostOp) -> bool {
         lock(&self.controls)
             .get(session_id)

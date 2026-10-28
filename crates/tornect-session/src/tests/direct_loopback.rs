@@ -29,14 +29,15 @@ use tornect_net::{
 use tornect_signal::HandshakeError;
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::fsm::client::ClientSession;
+use tornect_signal::fsm::host::KillSwitch;
 use tornect_signal::messages::feats;
 
 use super::direct_host::{Ends, key, keys_by_order, until};
 use super::*;
 use crate::services::{
-    DIRECT_BULK_WINDOW, HostEvent, ServicesEnv, ServicesHost, ServicesLimits, ServicesObserver,
-    ServicesPolicy, ServicesViewer, ViewerEvent, ViewerLocal, ViewerOp, ViewerServicesEnd,
-    sanitize_peer_text,
+    Access, DIRECT_BULK_WINDOW, HostEvent, ListingView, ServicesEnv, ServicesHost, ServicesLimits,
+    ServicesObserver, ServicesPolicy, ServicesViewer, TransferRow, TransferState, ViewerEvent,
+    ViewerLocal, ViewerOp, ViewerServicesEnd, sanitize_peer_text,
 };
 
 /// The app's bind wait for the media stream (`MEDIA_BIND_WAIT`).
@@ -108,6 +109,8 @@ struct Lx {
     accepted: Instant,
     /// The host's services, when it offers them.
     services: Option<LxServices>,
+    /// The host's kill switch (the panic key's, and the window's Stop).
+    kill: KillSwitch,
     _tmp: tempfile::TempDir,
 }
 
@@ -116,6 +119,8 @@ struct Lx {
 struct LxServices {
     host: Arc<ServicesHost>,
     heard: mpsc::UnboundedReceiver<(String, HostEvent)>,
+    /// The one place a viewer may list and copy files of: `Files`.
+    files: tempfile::TempDir,
     _policy: watch::Sender<ServicesPolicy>,
 }
 
@@ -175,11 +180,19 @@ async fn on_loopback_with(viewer_x: u8, host_x: u8, services: bool) -> Lx {
     let services = services.then(|| {
         let (tx, heard) = mpsc::unbounded_channel();
         let (policy, policy_rx) = watch::channel(ServicesPolicy::default());
+        let files = tempfile::tempdir().unwrap();
+        let env = ServicesEnv {
+            access: Arc::new(Access::new(
+                vec![("Files".to_owned(), files.path().to_path_buf())],
+                Vec::new(),
+            )),
+            ..ServicesEnv::default()
+        };
         let host = Arc::new(ServicesHost::new(
             rig.host.clone(),
             Arc::new(Heard(tx)),
             policy_rx,
-            ServicesEnv::default(),
+            env,
             ServicesLimits::default(),
         ));
         deps.sessions = Arc::new(Both {
@@ -189,6 +202,7 @@ async fn on_loopback_with(viewer_x: u8, host_x: u8, services: bool) -> Lx {
         LxServices {
             host,
             heard,
+            files,
             _policy: policy,
         }
     });
@@ -197,6 +211,7 @@ async fn on_loopback_with(viewer_x: u8, host_x: u8, services: bool) -> Lx {
     let host_env = Noting::new(host_x);
     let host_identity = key(host_seed);
     let host_key = host_identity.verifying_key().to_bytes();
+    let kill = deps.kill.clone();
     deps.paths = Arc::new(DirectHost::new(
         rig.host.clone(),
         services
@@ -256,6 +271,7 @@ async fn on_loopback_with(viewer_x: u8, host_x: u8, services: bool) -> Lx {
         host_key,
         accepted,
         services,
+        kill,
         _tmp: tmp,
     }
 }
@@ -546,6 +562,298 @@ async fn a_direct_session_carries_its_services_beside_the_media() {
     assert_eq!(transport, Some(TransportKind::Lan));
     assert_eq!(path.expect("a path summary").outcome, "direct");
     lx.fsm.await.unwrap().unwrap();
+}
+
+/// The size of the host's file a [`Serving`] session copies: far more than
+/// can arrive before its test ends the session (a sparse file).
+const BIG: u64 = 1 << 30;
+
+/// What a [`Serving`] session's services stream is doing when its test ends
+/// the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Doing {
+    /// Nothing: the viewer has looked at the host's places, and the stream
+    /// is between frames.
+    Idle,
+    /// The viewer is copying the host's [`BIG`] file: some of it arrived,
+    /// most has not, and file frames are flowing.
+    Downloading,
+}
+
+/// A direct session on loopback sockets whose viewer uses the services
+/// stream of the session's QUIC connection beside its pictures, as
+/// [`Doing`] says.
+struct Serving {
+    lx: Lx,
+    services: LxServices,
+    /// The viewer's half of the services stream's binding: holds the
+    /// connection, as the app's viewer does for the session's life.
+    _direct: DirectServices,
+    events: mpsc::Receiver<ViewerEvent>,
+    _ops: mpsc::Sender<ViewerOp>,
+    svc_task: JoinHandle<ViewerServicesEnd>,
+    media_task: JoinHandle<Result<ViewerEnd, ViewerError>>,
+    downloads: tempfile::TempDir,
+    /// The download's row as last seen ([`Doing::Downloading`] only).
+    row: Option<TransferRow>,
+}
+
+/// The viewer's next remote listing, skipping its other events.
+async fn remote_page(events: &mut mpsc::Receiver<ViewerEvent>) -> ListingView {
+    loop {
+        match tokio::time::timeout(WAIT, events.recv()).await {
+            Ok(Some(ViewerEvent::Listing { remote: true, view })) => return view,
+            Ok(Some(_)) => {}
+            other => panic!("expected a remote listing, got {other:?}"),
+        }
+    }
+}
+
+/// The handle of the entry named `name` in `view`.
+fn entry(view: &ListingView, name: &str) -> u32 {
+    view.entries
+        .iter()
+        .find(|entry| entry.name.as_str() == name)
+        .unwrap_or_else(|| panic!("{name} is not listed"))
+        .handle
+}
+
+/// A [`Serving`] session between `127.0.0.{viewer_x}` and
+/// `127.0.0.{host_x}`, its services stream `doing` that.
+async fn serving(viewer_x: u8, host_x: u8, doing: Doing) -> Serving {
+    let mut lx = on_loopback_with(viewer_x, host_x, true).await;
+    let services = lx.services.take().expect("the host offers services");
+    std::fs::File::create(services.files.path().join("big.bin"))
+        .unwrap()
+        .set_len(BIG)
+        .unwrap();
+    let choice = lx
+        .viewer
+        .choose_path(
+            &mut lx.session,
+            Mine::of(TransportPolicy::Any),
+            true,
+            pending(),
+        )
+        .await;
+    let PathChoice::Direct(media) = choice else {
+        panic!("not direct: {choice:?}");
+    };
+    let direct = media.services().expect("svc1 offered");
+    let viewer_media = media.bind(BIND_WAIT).await.expect("bound");
+    let stream = tokio::time::timeout(WAIT, direct.open())
+        .await
+        .expect("the second stream opens at once")
+        .expect("the connection is up");
+    let (svc, welcome) = ServicesViewer::bind(stream, direct.binding(), WAIT)
+        .await
+        .expect("Welcome on the direct connection");
+    assert_ne!(welcome.caps & tornect_proto::services::caps::BROWSE, 0);
+    let media_task = tokio::spawn(async move {
+        let mut sink = Tally(Arc::new(AtomicUsize::new(0)));
+        let mut stats = ViewerStats::default();
+        viewer_media.run(&mut sink, &mut stats, pending()).await
+    });
+    let downloads = tempfile::tempdir().unwrap();
+    let local = ViewerLocal {
+        downloads: Some(downloads.path().to_path_buf()),
+        free_space: Arc::new(|_: &Path| Ok(u64::MAX / 2)),
+        keep_free: 0,
+        ..ViewerLocal::default()
+    };
+    let (ops, ops_rx) = mpsc::channel(8);
+    let (events_tx, mut events) = mpsc::channel(64);
+    let svc_task = tokio::spawn(svc.run(ops_rx, events_tx, local, pending()));
+
+    ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    let places = remote_page(&mut events).await;
+    let row = match doing {
+        Doing::Idle => None,
+        Doing::Downloading => {
+            ops.send(ViewerOp::OpenRemote(entry(&places, "Files")))
+                .await
+                .unwrap();
+            let files = remote_page(&mut events).await;
+            ops.send(ViewerOp::Download(entry(&files, "big.bin")))
+                .await
+                .unwrap();
+            let row = loop {
+                match tokio::time::timeout(WAIT, events.recv()).await {
+                    Ok(Some(ViewerEvent::Transfer(row))) if row.done > 0 => break row,
+                    Ok(Some(_)) => {}
+                    other => panic!("expected the download under way, got {other:?}"),
+                }
+            };
+            assert_eq!((row.size, row.state.clone()), (BIG, TransferState::Running));
+            Some(row)
+        }
+    };
+    Serving {
+        lx,
+        services,
+        _direct: direct,
+        events,
+        _ops: ops,
+        svc_task,
+        media_task,
+        downloads,
+        row,
+    }
+}
+
+/// How a [`Serving`] session is ended.
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    /// The host's panic key (its kill switch).
+    Panic,
+    /// The viewer's `BYE{USER}`.
+    Bye,
+}
+
+impl Serving {
+    /// End the session as `ending` says: the host's services stream then
+    /// ends as on the onion path (the services design §6.3 step 5), in
+    /// order and at once, with `code` (a services reason: `ENDED_BY_HOST`
+    /// for a kill, `SESSION_OVER` for the session's end).
+    ///
+    /// The viewer's stream ends within [`DIRECT_DRAIN`] of the end. Between
+    /// frames it ends with the host's `Close{code}`, the stream's last
+    /// frame; while a file frame is going out it may instead end cut short,
+    /// as the services writer cuts a frame the end catches halfway (the
+    /// services design's test 11) on either path. A download stopped short
+    /// and its partial file is gone. The host told the download's end and
+    /// the stream's summary (`HostEvent::Closed`, the `services_summary`
+    /// line of `sessions.log`), and holds nothing of the stream.
+    async fn end_in_order(mut self, ending: Ending, code: u16) {
+        let downloading = self.row.is_some();
+        let t0 = Instant::now();
+        match ending {
+            Ending::Panic => self.lx.kill.kill(bye::PANIC),
+            Ending::Bye => self.lx.session.bye(bye::USER).await.unwrap(),
+        }
+        let end = tokio::time::timeout(WAIT, self.svc_task)
+            .await
+            .expect("the viewer's services ended in time")
+            .unwrap();
+        assert!(t0.elapsed() < DIRECT_DRAIN, "{:?}", t0.elapsed());
+        if downloading {
+            assert!(
+                matches!(end, ViewerServicesEnd::Io) || end == ViewerServicesEnd::Closed(code),
+                "{end:?}"
+            );
+        } else {
+            assert_eq!(end, ViewerServicesEnd::Closed(code));
+        }
+        let mut last = self.row;
+        let mut closed = None;
+        while let Some(event) = self.events.recv().await {
+            match event {
+                ViewerEvent::Transfer(row) if last.as_ref().is_some_and(|l| l.xfer == row.xfer) => {
+                    last = Some(row);
+                }
+                ViewerEvent::Closed(c) => closed = Some(c),
+                _ => {}
+            }
+        }
+        if let ViewerServicesEnd::Closed(code) = end {
+            assert_eq!(closed, Some(code), "the viewer told the host's Close");
+        }
+        if let Some(last) = last {
+            assert!(
+                !matches!(last.state, TransferState::Done { .. }) && last.done < BIG,
+                "{last:?}"
+            );
+        }
+        until("the partial download deleted", || {
+            std::fs::read_dir(self.downloads.path()).unwrap().count() == 0
+        })
+        .await;
+
+        let mut stopped = None;
+        let summary = loop {
+            let (sid, event) = tokio::time::timeout(WAIT, self.services.heard.recv())
+                .await
+                .expect("the host's services ended in time")
+                .expect("the host is there");
+            assert_eq!(sid, self.lx.session_id);
+            match event {
+                HostEvent::Transfer(row) => stopped = Some(row.state),
+                HostEvent::Closed { reason, summary } => {
+                    assert_eq!(reason, code);
+                    break summary;
+                }
+                _ => {}
+            }
+        };
+        if downloading {
+            assert_eq!(stopped, Some(TransferState::ended(code)));
+        }
+        assert_eq!(summary.files_out, 0);
+        assert_eq!(self.services.host.open_streams(), 0);
+        assert!(!self.services.host.has_control(&self.lx.session_id));
+
+        tokio::time::timeout(WAIT, self.media_task)
+            .await
+            .expect("the media ended in time")
+            .unwrap()
+            .expect("the media ran");
+        let (transport, path) = self.lx.ends.line().await;
+        assert_eq!(transport, Some(TransportKind::Lan));
+        assert_eq!(path.expect("a path summary").outcome, "direct");
+        self.lx.fsm.await.unwrap().unwrap();
+    }
+}
+
+/// The panic key while a direct session's services stream is idle (the
+/// services design §6.3 step 5, the direct design §6.7, §9.1 invariant 2):
+/// the host's services stream ends at once and in order, as on the onion
+/// path: `Close{ENDED_BY_HOST}` reaches the viewer and the host tells the
+/// stream's summary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_panic_key_ends_a_direct_sessions_idle_services_in_order() {
+    serving(36, 37, Doing::Idle)
+        .await
+        .end_in_order(
+            Ending::Panic,
+            tornect_proto::services::reason::ENDED_BY_HOST,
+        )
+        .await;
+}
+
+/// The panic key while the viewer copies a file over a direct session's
+/// services stream: the file stops short at once, the host's transfer and
+/// stream end with `ENDED_BY_HOST`, and the host tells the summary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_panic_key_ends_a_direct_sessions_download_in_order() {
+    serving(38, 39, Doing::Downloading)
+        .await
+        .end_in_order(
+            Ending::Panic,
+            tornect_proto::services::reason::ENDED_BY_HOST,
+        )
+        .await;
+}
+
+/// The viewer's `BYE` while a direct session's services stream is idle: the
+/// session's end ends the host's services stream in order
+/// (`Close{SESSION_OVER}`, the summary told) before the link closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_sessions_end_ends_its_idle_services_in_order() {
+    serving(42, 43, Doing::Idle)
+        .await
+        .end_in_order(Ending::Bye, tornect_proto::services::reason::SESSION_OVER)
+        .await;
+}
+
+/// The viewer's `BYE` while it copies a file over a direct session's
+/// services stream: the file stops short, the host's transfer and stream
+/// end with `SESSION_OVER`, and the host tells the summary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_sessions_end_ends_its_download_in_order() {
+    serving(44, 45, Doing::Downloading)
+        .await
+        .end_in_order(Ending::Bye, tornect_proto::services::reason::SESSION_OVER)
+        .await;
 }
 
 /// Decision M1-82's stand-in for `tornect demo --loopback

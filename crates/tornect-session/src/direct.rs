@@ -200,9 +200,13 @@ impl DirectSettings {
 /// [`ServicesHost::second_stream`](crate::services::ServicesHost::second_stream)
 /// serves. [`DirectHost`] accepts that stream only after the session's
 /// media was claimed on this connection, sets its send priority to 0
-/// (below the media stream's 1) and serves it beside the media stream,
-/// neither waiting on the other; a kill, the linger or the session's end
-/// drop it with the link. A host without one never accepts a second
+/// (below the media stream's 1) and serves it on its own task beside the
+/// media stream, neither waiting on the other. The session's end (which a
+/// kill and an end of the viewer's device set) ends it as it ends the
+/// media stream, and the link stays until both ended, within
+/// [`DIRECT_DRAIN`]; a link closed under it ends it through its I/O. The
+/// future [`Self::serve`] returns is always run to its end, so it may
+/// rely on its own teardown. A host without one never accepts a second
 /// stream: the viewer's waits unread, within the stream window
 /// ([`tornect_net::quic::HOST_STREAMS`]).
 pub trait SecondStream: Send + Sync {

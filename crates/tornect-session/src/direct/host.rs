@@ -19,6 +19,12 @@
 //!   [`DIRECT_DRAIN`]), on a refused direct `Bind`, on
 //!   the [`HOST_DIRECT_LINGER`] without a direct claim, and at the session's
 //!   end (after the media stream's last frames, bounded by [`DIRECT_DRAIN`]);
+//! - the second stream (the services stream) runs on its own task once
+//!   the media was claimed on the link: a kill, an end of the viewer's
+//!   device and the session's end set the session's end, which ends it as
+//!   it ends the media stream, and the link stays until both ended (within
+//!   [`DIRECT_DRAIN`]); a link closed under it ends it through its I/O, and
+//!   it still runs its own end (the services design §6.3 step 5);
 //! - a `TOR_FALLBACK` after a direct claim is ignored (counted);
 //! - a `lan_only` session with no direct path left ends `BYE{NO_LAN_PATH}`;
 //! - the session's `sessions.log` end line says how its path went
@@ -426,7 +432,9 @@ struct Open {
     /// The media stream: accepted, then served ([`MediaHost::serve_direct`]);
     /// `None` when no stream came.
     serving: Option<BoxFuture<'static, Option<MediaOutcome>>>,
-    /// The second stream ([`SecondStream`]), once the media was claimed.
+    /// The end of the second stream's task ([`SecondStream`]), once the
+    /// media was claimed. Dropping it lets the task run on: it is never
+    /// dropped halfway, so its own end always runs.
     second: Option<BoxFuture<'static, ()>>,
     /// The media stream was served to its end: the link closes once the
     /// viewer closed the connection, or at this time.
@@ -750,7 +758,12 @@ impl Task {
         if let (Some(second), Some(conn)) = (&self.second, &open.conn) {
             let (second, conn) = (Arc::clone(second), conn.clone());
             let (id, token) = (self.id.clone(), self.token.clone());
-            open.second = Some(Box::pin(async move {
+            // Its own task, as the onion path's services streams run: the
+            // session's end (which a kill sets too) ends it, as does the
+            // link's close (through its I/O), and either way it runs its own
+            // end: its workers stopped, its `Close`, its summary. Dropping
+            // the handle lets it go on.
+            let task = tokio::spawn(async move {
                 let Ok(stream) = conn.accept_stream().await else {
                     return;
                 };
@@ -758,8 +771,12 @@ impl Task {
                 let Ok(ekm) = conn.binding_secret(&token) else {
                     return;
                 };
-                let peer = DeviceId::from_bytes(conn.peer_key());
-                second.serve(stream, id, peer, ekm, path_of(&conn)).await;
+                let (peer, path) = (DeviceId::from_bytes(conn.peer_key()), path_of(&conn));
+                drop(conn);
+                second.serve(stream, id, peer, ekm, path).await;
+            });
+            open.second = Some(Box::pin(async move {
+                let _ = task.await;
             }));
         }
     }
@@ -787,18 +804,23 @@ impl Task {
 
     /// A kill, or an end of the viewer's device, while the session's media
     /// streams on this link (the direct design §9.1 invariants 2 and 10).
-    /// The session's media end is set here first (the media host's kill
-    /// watch may not have run yet, and it never hears a device's end), so
+    /// The session's end is set here first (the media host's kill watch may
+    /// not have run yet, and it never hears a device's end), so
     /// [`MediaHost::serve_direct`] returns through its own teardown, as on
     /// the onion path: capture stops, the observer hears `capture_stopped`,
     /// the outcome is handed on, and the viewer is told
-    /// `Close{ENDED_BY_HOST}`. That goodbye is bounded: the stream's end and
-    /// then the viewer's close of the connection are waited for until
+    /// `Close{ENDED_BY_HOST}`. The services stream hears the same end and
+    /// runs its own (the services design §6.3 step 5: its transfers stop at
+    /// once, the viewer is told `Close{ENDED_BY_HOST}`, its summary is
+    /// told). That goodbye is bounded: both streams' ends and then the
+    /// viewer's close of the connection are waited for until
     /// [`DIRECT_DRAIN`] after the kill, and the link then closes whatever
-    /// is left (a stream still running is dropped, which stops its capture
-    /// too). A stream not bound on this link (still before its `Bind`, or
-    /// flushing a refusal) and the drain after a stream's end are not waited
-    /// for: the link closes at once.
+    /// is left (a media stream still running is dropped, which stops its
+    /// capture too; the services stream's task ends through its I/O, and
+    /// still runs its own end). A media stream not bound on this link
+    /// (still before its `Bind`, or flushing a refusal) is not waited for,
+    /// nor the drain after a stream's end with no services stream: the link
+    /// closes at once.
     async fn media_goodbye(&mut self) {
         if !self.media_on_link() {
             return;
@@ -806,15 +828,19 @@ impl Task {
         let Some(open) = self.link.as_mut() else {
             return;
         };
-        let Some(serving) = open.serving.take() else {
+        let (serving, second) = (open.serving.take(), open.second.take());
+        if serving.is_none() && second.is_none() {
             return;
-        };
+        }
         self.media.end_by_host(&self.id);
         let deadline = Instant::now() + DIRECT_DRAIN;
-        let Ok(Some(outcome)) = tokio::time::timeout_at(deadline, serving).await else {
-            return;
-        };
-        (self.on_media)(&outcome);
+        let (outcome, ()) = tokio::join!(
+            until_deadline(serving, deadline),
+            until_deadline(second, deadline)
+        );
+        if let Some(outcome) = &outcome {
+            (self.on_media)(outcome);
+        }
         if let Some(conn) = &open.conn {
             let _ = tokio::time::timeout_at(deadline, conn.closed()).await;
         }
@@ -836,19 +862,28 @@ impl Task {
     }
 
     /// The session is over (the FSM let go of its port). A direct media
-    /// stream is let finish (the session's end ends it) and its last frames
-    /// reach the viewer, each wait bounded by [`DIRECT_DRAIN`] and cut short
-    /// by a kill; then the link closes.
+    /// stream and the services stream beside it are let finish (the
+    /// session's end ends both, and the services stream runs its own end:
+    /// the services design §6.3 step 5) and their last frames reach the
+    /// viewer, each wait bounded by [`DIRECT_DRAIN`] and cut short by a
+    /// kill; then the link closes.
     async fn session_over(&mut self) {
         self.inbox_open = false;
         if let Some(open) = self.link.as_mut()
             && self.direct_claim
         {
-            if let Some(serving) = open.serving.take() {
+            let (serving, second) = (open.serving.take(), open.second.take());
+            if serving.is_some() || second.is_some() {
+                let deadline = Instant::now() + DIRECT_DRAIN;
                 let served = tokio::select! {
                     biased;
                     _ = self.kill.killed() => None,
-                    served = tokio::time::timeout(DIRECT_DRAIN, serving) => served.ok().flatten(),
+                    (served, ()) = async {
+                        tokio::join!(
+                            until_deadline(serving, deadline),
+                            until_deadline(second, deadline)
+                        )
+                    } => served,
                 };
                 if let Some(outcome) = &served {
                     (self.on_media)(outcome);
@@ -867,8 +902,10 @@ impl Task {
         self.close_link().await;
     }
 
-    /// Closes the session's link, if open, and rules out any other: what
-    /// runs on it is dropped first, then the endpoint closes.
+    /// Closes the session's link, if open, and rules out any other: the
+    /// media stream's future is dropped first and the second stream's task
+    /// let go (it ends through its I/O and runs its own end), then the
+    /// endpoint closes.
     async fn close_link(&mut self) {
         self.may_bind = false;
         let Some(open) = self.link.take() else {
@@ -947,6 +984,16 @@ async fn link_news(link: &mut Option<Open>) -> Woke {
         news = link.next_news() => Woke::News(news),
         () = drained(conn.as_ref(), *drain_until) => Woke::Drained,
         () = sleep_until_opt(*linger_at) => Woke::Linger,
+    }
+}
+
+/// `future`'s output, if there is one and it comes before `deadline`.
+async fn until_deadline<T: Default>(future: Option<BoxFuture<'static, T>>, deadline: Instant) -> T {
+    match future {
+        Some(future) => tokio::time::timeout_at(deadline, future)
+            .await
+            .unwrap_or_default(),
+        None => T::default(),
     }
 }
 
