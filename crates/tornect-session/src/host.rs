@@ -802,7 +802,9 @@ impl MediaHost {
 
     /// Serve one stream accepted on `route`'s listener, from its `Bind` to
     /// its end. The route is the host's: the listener that accepted the
-    /// stream says it, never the viewer.
+    /// stream says it, never the viewer. The stream's claim is an onion
+    /// one whatever `route` says; a direct stream is served by
+    /// [`Self::serve_direct`], which takes its route from its link.
     pub async fn serve_on<S>(&self, stream: S, route: Route) -> MediaOutcome
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -914,8 +916,9 @@ impl MediaHost {
     /// source opens. A refusal is written with [`DirectStream::refuse`], so
     /// the viewer reads its reason before the connection closes (§6.5).
     ///
-    /// Until step B10 adds the direct row of the quality table, a direct
-    /// stream runs the Tor row (decision M1-84).
+    /// The stream then runs as an onion one does, on the direct row of the
+    /// quality table ([`Route::Direct`], the direct design §6.8): its
+    /// capture rate, its preset's encoder settings and its ack window.
     pub async fn serve_direct<S: DirectStream>(
         &self,
         mut stream: S,
@@ -1764,12 +1767,12 @@ struct Stream {
     path: TransportKind,
 }
 
-/// The quality table's row for a stream claimed on `path`. A direct or LAN
-/// stream runs the Tor row until step B10 adds the direct one (decision
-/// M1-84); this is the one place that changes then.
+/// The quality table's row for a stream claimed on `path`: a LAN stream
+/// runs the direct row, as an internet one does (the direct design §6.8).
 fn quality_route(path: TransportKind) -> Route {
     match path {
-        TransportKind::TorRelay | TransportKind::Lan | TransportKind::Direct => Route::Tor,
+        TransportKind::TorRelay => Route::Tor,
+        TransportKind::Lan | TransportKind::Direct => Route::Direct,
     }
 }
 
@@ -3576,6 +3579,7 @@ mod tests {
             QualityCaps {
                 max_fps: 10,
                 tor_max_kbps: 4000,
+                direct_max_kbps: 20_000,
                 min_kbps: 4000,
                 encoder_threads: 2,
             }

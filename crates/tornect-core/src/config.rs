@@ -410,7 +410,8 @@ pub enum LatencyMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Media {
-    /// Reserved for the direct route (not used yet), kbit/s.
+    /// No preset on a direct path exceeds it (Best quality there runs at
+    /// 12 000 or this, the lower), kbit/s.
     pub max_bitrate_kbps: u32,
     /// No preset goes below it, kbit/s.
     pub min_bitrate_kbps: u32,

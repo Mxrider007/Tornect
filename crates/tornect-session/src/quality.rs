@@ -6,7 +6,9 @@
 //! host's configured maximum, which is what Best quality means.
 //!
 //! The Tor rows are provisional until the live per-preset measurement over
-//! Tor freezes them (the design's step 19, `docs/VERIFICATION.md`).
+//! Tor freezes them (the design's step 19, `docs/VERIFICATION.md`); the
+//! direct rows (the direct design §6.8) until the direct measurement does
+//! (its step B12 and the devices of B13).
 
 use std::time::Duration;
 
@@ -16,21 +18,44 @@ use tornect_core::config::{Media, QualityPreset};
 use tornect_proto::QualityInfo;
 
 /// How a media stream reaches the viewer. The host chooses it from the
-/// listener that accepted the stream, never from anything the viewer sends.
-/// The direct route's design adds its variant and its table row.
+/// listener or the link that accepted the stream, never from anything the
+/// viewer sends.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Route {
     /// Over a Tor onion stream.
     #[default]
     Tor,
+    /// Over a direct QUIC connection, on the local network or across the
+    /// internet (the direct design §6.8): both run this one row.
+    Direct,
 }
 
-/// How long a stream's ack window lasts at the preset's frame rate and
+impl Route {
+    /// How long a stream's ack window lasts on this route at the preset's
+    /// frame rate and bitrate: [`WINDOW_SPAN`] over Tor,
+    /// [`DIRECT_WINDOW_SPAN`] direct.
+    #[must_use]
+    pub const fn window_span(self) -> Duration {
+        match self {
+            Self::Tor => WINDOW_SPAN,
+            Self::Direct => DIRECT_WINDOW_SPAN,
+        }
+    }
+}
+
+/// How long a Tor stream's ack window lasts at the preset's frame rate and
 /// bitrate: the measured Tor round trip of 1.0–1.3 s (decisions M1-43,
 /// M1-47) and a margin. Over a link slower than the preset's bitrate the
 /// latency is bounded by about this span × bitrate / link rate.
 pub const WINDOW_SPAN: Duration = Duration::from_millis(1500);
+
+/// How long a direct stream's ack window lasts (the direct design §6.8;
+/// provisional until step B12 measures it): a direct round trip is tens of
+/// milliseconds, so the window bounds the latency a link slower than the
+/// preset's bitrate adds, as [`WINDOW_SPAN`] does over Tor. The floors
+/// below still hold, so at 30 fps the window is their 20 units.
+pub const DIRECT_WINDOW_SPAN: Duration = Duration::from_millis(300);
 
 /// The least ack window of any preset, in access units.
 pub const WINDOW_MIN_FRAMES: usize = 20;
@@ -56,6 +81,8 @@ pub struct QualityCaps {
     pub max_fps: u32,
     /// Best quality's bitrate over Tor; no preset there exceeds it, kbit/s.
     pub tor_max_kbps: u32,
+    /// No preset on a direct path exceeds this bitrate, kbit/s.
+    pub direct_max_kbps: u32,
     /// No preset goes below this bitrate, kbit/s.
     pub min_kbps: u32,
     /// The encoder's threads (`tornect_codec::EncoderSettings::threads`).
@@ -64,10 +91,11 @@ pub struct QualityCaps {
 
 impl QualityCaps {
     /// The caps `media` sets, each held to its range: the frame rate to 1 to
-    /// 240, the Tor bitrate to 1 to 1 000 000 kbit/s, the least bitrate to 1
-    /// to the Tor bitrate, the threads to 0 to 4. A config that holds a
-    /// value out of range still loads (no rule was added to the keys it
-    /// had), so each value held is said in one note, for the host to log.
+    /// 240, the Tor bitrate and the direct one (`max_bitrate_kbps`) to 1 to
+    /// 1 000 000 kbit/s, the least bitrate to 1 to the Tor bitrate, the
+    /// threads to 0 to 4. A config that holds a value out of range still
+    /// loads (no rule was added to the keys it had), so each value held is
+    /// said in one note, for the host to log.
     #[must_use]
     pub fn from_media(media: &Media) -> (Self, Vec<String>) {
         let mut notes = Vec::new();
@@ -84,6 +112,14 @@ impl QualityCaps {
                 "media.tor_fallback_max_kbps ({}) is outside 1 to {MAX_KBPS}: presets use \
                  {tor_max_kbps}",
                 media.tor_fallback_max_kbps
+            ));
+        }
+        let direct_max_kbps = media.max_bitrate_kbps.clamp(1, MAX_KBPS);
+        if direct_max_kbps != media.max_bitrate_kbps {
+            notes.push(format!(
+                "media.max_bitrate_kbps ({}) is outside 1 to {MAX_KBPS}: direct presets use \
+                 {direct_max_kbps}",
+                media.max_bitrate_kbps
             ));
         }
         let min_kbps = media.min_bitrate_kbps.clamp(1, tor_max_kbps);
@@ -111,6 +147,7 @@ impl QualityCaps {
             Self {
                 max_fps,
                 tor_max_kbps,
+                direct_max_kbps,
                 min_kbps,
                 encoder_threads,
             },
@@ -120,8 +157,8 @@ impl QualityCaps {
 }
 
 impl Default for QualityCaps {
-    /// The caps of the default `[media]`: 60 fps, 4000 and 500 kbit/s, one
-    /// encoder thread.
+    /// The caps of the default `[media]`: 60 fps, 4000 kbit/s over Tor,
+    /// 20 000 direct, at least 500, one encoder thread.
     fn default() -> Self {
         Self::from_media(&Media::default()).0
     }
@@ -133,6 +170,8 @@ impl Default for QualityCaps {
 pub struct StreamSettings {
     /// The preset.
     pub preset: QualityPreset,
+    /// The route whose row this is: it sets the ack window's span.
+    pub route: Route,
     /// Frame rate, bitrate, quantizer range and threads.
     pub encoder: EncoderSettings,
     /// The picture cap.
@@ -173,13 +212,15 @@ impl StreamSettings {
 struct Row {
     cap: ResolutionCap,
     fps: u32,
-    /// `None`: the host's Tor bitrate.
+    /// `None`: the route's highest bitrate.
     kbps: Option<u32>,
     qp: Option<(u8, u8)>,
 }
 
-/// The table (the quality design §3.1; provisional until the live Tor
-/// measurement).
+/// The table (the quality design §3.1 for Tor, the direct design §6.8 for
+/// direct; each provisional until its live measurement). A direct row keeps
+/// its preset's quantizer range from the Tor one: the direct design gives
+/// none.
 const fn row(preset: QualityPreset, route: Route) -> Row {
     match (route, preset) {
         (Route::Tor, QualityPreset::BestQuality) => Row {
@@ -202,22 +243,53 @@ const fn row(preset: QualityPreset, route: Route) -> Row {
             kbps: Some(1000),
             qp: Some((28, 44)),
         },
+        // 12 Mbit/s, or the host's direct bitrate when that is lower.
+        (Route::Direct, QualityPreset::BestQuality) => Row {
+            cap: ResolutionCap::CODEC,
+            fps: 30,
+            kbps: Some(12_000),
+            qp: Some((18, 32)),
+        },
+        (Route::Direct, QualityPreset::Balanced) => Row {
+            cap: ResolutionCap::new(1920, 1080),
+            fps: 30,
+            kbps: Some(6000),
+            qp: None,
+        },
+        (Route::Direct, QualityPreset::BestPerformance) => Row {
+            cap: ResolutionCap::new(1280, 720),
+            fps: 60,
+            kbps: Some(4000),
+            qp: Some((28, 44)),
+        },
     }
 }
 
+/// The highest bitrate any preset on `route` is given under `caps`, at least
+/// 1 and at most `MAX_KBPS`.
+fn route_max_kbps(route: Route, caps: &QualityCaps) -> u32 {
+    let max = match route {
+        Route::Tor => caps.tor_max_kbps,
+        Route::Direct => caps.direct_max_kbps,
+    };
+    max.clamp(1, MAX_KBPS)
+}
+
 /// What `preset` runs with on `route` under `caps`: the row's frame rate held
-/// to `caps.max_fps` (at least 1); its bitrate (Best quality's is
-/// `caps.tor_max_kbps`) held between `caps.min_kbps` and `caps.tor_max_kbps`;
-/// its picture cap and quantizer range; the host's encoder threads.
+/// to `caps.max_fps` (at least 1); its bitrate (Best quality's over Tor is
+/// `caps.tor_max_kbps`) held between `caps.min_kbps` and the route's highest
+/// (`caps.tor_max_kbps` over Tor, `caps.direct_max_kbps` direct); its picture
+/// cap and quantizer range; the host's encoder threads.
 #[must_use]
 pub fn settings(preset: QualityPreset, route: Route, caps: &QualityCaps) -> StreamSettings {
     let row = row(preset, route);
-    let hi = caps.tor_max_kbps.clamp(1, MAX_KBPS);
+    let hi = route_max_kbps(route, caps);
     let lo = caps.min_kbps.min(hi);
     let kbps = row.kbps.unwrap_or(hi).clamp(lo, hi);
     let fps = row.fps.min(caps.max_fps).max(1);
     StreamSettings {
         preset,
+        route,
         encoder: EncoderSettings {
             bitrate_bps: kbps.saturating_mul(1000),
             // Exact: every frame rate here is a small integer.
@@ -243,13 +315,14 @@ pub fn capture_fps(route: Route, caps: &QualityCaps) -> u32 {
         .unwrap_or(1)
 }
 
-/// The ack window `settings` run with: [`WINDOW_SPAN`] of their frame rate
-/// and bitrate, at least [`WINDOW_MIN_FRAMES`] units and [`WINDOW_MIN_BYTES`]
-/// bytes, and at most `frames_cap` units and `bytes_cap` bytes (the host's
-/// `MediaLimits` caps). Returns `(frames, bytes)`.
+/// The ack window `settings` run with: their route's span
+/// ([`Route::window_span`]) of their frame rate and bitrate, at least
+/// [`WINDOW_MIN_FRAMES`] units and [`WINDOW_MIN_BYTES`] bytes, and at most
+/// `frames_cap` units and `bytes_cap` bytes (the host's `MediaLimits` caps).
+/// Returns `(frames, bytes)`.
 #[must_use]
 pub fn window(settings: &StreamSettings, frames_cap: usize, bytes_cap: usize) -> (usize, usize) {
-    let span_ms = WINDOW_SPAN.as_millis() as u64;
+    let span_ms = settings.route.window_span().as_millis() as u64;
     let frames = (u64::from(settings.fps()) * span_ms).div_ceil(1000);
     // kbit/s × 1000 / 8 bytes a second, for the span.
     let bytes = (u64::from(settings.kbps()) * span_ms).div_ceil(8);
@@ -309,6 +382,7 @@ mod tests {
             QualityCaps {
                 max_fps: 60,
                 tor_max_kbps: 4000,
+                direct_max_kbps: 20_000,
                 min_kbps: 500,
                 encoder_threads: 1,
             }
@@ -368,11 +442,15 @@ mod tests {
         let wild = QualityCaps {
             max_fps: 0,
             tor_max_kbps: u32::MAX,
+            direct_max_kbps: u32::MAX,
             min_kbps: u32::MAX,
             encoder_threads: u16::MAX,
         };
-        for preset in QualityPreset::ALL {
-            let s = settings(preset, Route::Tor, &wild);
+        for (preset, route) in QualityPreset::ALL
+            .into_iter()
+            .flat_map(|p| [(p, Route::Tor), (p, Route::Direct)])
+        {
+            let s = settings(preset, route, &wild);
             assert_eq!(s.fps(), 1);
             assert_eq!(s.kbps(), MAX_KBPS);
             assert!(i32::try_from(s.encoder.bitrate_bps).is_ok());
@@ -387,10 +465,12 @@ mod tests {
         }
         let none = QualityCaps {
             tor_max_kbps: 0,
+            direct_max_kbps: 0,
             min_kbps: 0,
             ..QualityCaps::default()
         };
         assert_eq!(settings(BP, Route::Tor, &none).kbps(), 1);
+        assert_eq!(settings(BP, Route::Direct, &none).kbps(), 1);
     }
 
     /// Capture runs at the fastest preset's rate on the route (20 on Tor),
@@ -433,6 +513,110 @@ mod tests {
         assert_eq!(window(&fast, usize::MAX, usize::MAX), (360, 187_500_000));
     }
 
+    /// The direct row of the direct design §6.8 with the default `[media]`:
+    /// Best quality at the codec's cap, 30 fps and 12 Mbit/s; Balanced at
+    /// 1080p, 30 fps and 6 Mbit/s; Best performance at 720p, 60 fps and
+    /// 4 Mbit/s; each preset's quantizer range as over Tor; the host's
+    /// threads. Capture opens at 60, held to `max_fps`.
+    #[test]
+    fn the_direct_table_with_the_default_caps() {
+        let caps = QualityCaps::default();
+        let table = QualityPreset::ALL.map(|p| row_of(&settings(p, Route::Direct, &caps)));
+        assert_eq!(
+            table,
+            [
+                ((3840, 2160), 30, 12_000, Some((18, 32))),
+                ((1920, 1080), 30, 6000, None),
+                ((1280, 720), 60, 4000, Some((28, 44))),
+            ]
+        );
+        for preset in QualityPreset::ALL {
+            let s = settings(preset, Route::Direct, &caps);
+            assert_eq!((s.preset, s.route), (preset, Route::Direct));
+            assert_eq!(s.encoder.threads, 1);
+            assert_eq!(s.encoder.bitrate_bps, s.kbps() * 1000);
+            assert_eq!(settings(preset, Route::Tor, &caps).route, Route::Tor);
+        }
+        assert_eq!(
+            settings(BAL, Route::Direct, &caps).info(),
+            QualityInfo {
+                preset: 2,
+                max_fps: 30,
+                kbps: 6000,
+                max_long: 1920,
+                max_short: 1080,
+            }
+        );
+        assert_eq!(capture_fps(Route::Direct, &caps), 60);
+        for (max_fps, want) in [(240, 60), (60, 60), (30, 30), (1, 1), (0, 1)] {
+            let caps = QualityCaps {
+                max_fps,
+                ..QualityCaps::default()
+            };
+            assert_eq!(capture_fps(Route::Direct, &caps), want, "max_fps {max_fps}");
+        }
+    }
+
+    /// No direct preset exceeds the host's direct bitrate, and Best quality
+    /// takes it when it is under 12 Mbit/s; above, the row holds 12. The
+    /// least bitrate raises a row, and is held to the route's highest. The
+    /// Tor rows never see the direct bitrate, nor the direct rows the Tor
+    /// one.
+    #[test]
+    fn the_direct_bitrate_bounds_every_direct_preset() {
+        let kbps =
+            |route, caps: &QualityCaps| QualityPreset::ALL.map(|p| settings(p, route, caps).kbps());
+        let (caps, notes) = QualityCaps::from_media(&Media {
+            max_bitrate_kbps: 5000,
+            ..Media::default()
+        });
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(kbps(Route::Direct, &caps), [5000, 5000, 4000]);
+        assert_eq!(kbps(Route::Tor, &caps), [4000, 1500, 1000]);
+        let wide = QualityCaps {
+            direct_max_kbps: 50_000,
+            tor_max_kbps: 30_000,
+            ..QualityCaps::default()
+        };
+        assert_eq!(kbps(Route::Direct, &wide), [12_000, 6000, 4000]);
+        assert_eq!(kbps(Route::Tor, &wide), [30_000, 1500, 1000]);
+        let floor = QualityCaps {
+            direct_max_kbps: 3000,
+            min_kbps: 2500,
+            ..QualityCaps::default()
+        };
+        assert_eq!(kbps(Route::Direct, &floor), [3000, 3000, 3000]);
+        assert_eq!(kbps(Route::Tor, &floor), [4000, 2500, 2500]);
+        let under = QualityCaps {
+            direct_max_kbps: 400,
+            ..QualityCaps::default()
+        };
+        assert_eq!(kbps(Route::Direct, &under), [400; 3]);
+    }
+
+    /// A direct window spans 300 ms of the preset's rate and bitrate, under
+    /// the same floors and caps as over Tor: the floors give every default
+    /// direct preset 20 units, and Best quality's 12 Mbit/s 450 000 bytes.
+    #[test]
+    fn a_direct_window_spans_300_ms() {
+        assert_eq!(Route::Tor.window_span(), Duration::from_millis(1500));
+        assert_eq!(Route::Direct.window_span(), Duration::from_millis(300));
+        let caps = QualityCaps::default();
+        let windows =
+            QualityPreset::ALL.map(|p| window(&settings(p, Route::Direct, &caps), 32, 1 << 20));
+        assert_eq!(windows, [(20, 450_000), (20, 262_144), (20, 262_144)]);
+        let fast = StreamSettings {
+            encoder: EncoderSettings {
+                max_fps: 240.0,
+                bitrate_bps: 1_000_000_000,
+                ..EncoderSettings::default()
+            },
+            ..settings(BQ, Route::Direct, &caps)
+        };
+        assert_eq!(window(&fast, usize::MAX, usize::MAX), (72, 37_500_000));
+        assert_eq!(window(&fast, 32, 1 << 20), (32, 1 << 20));
+    }
+
     /// Each value out of its range is held, and said once.
     #[test]
     fn from_media_holds_each_value_and_says_so() {
@@ -465,6 +649,7 @@ mod tests {
             QualityCaps {
                 max_fps: 240,
                 tor_max_kbps: 1,
+                direct_max_kbps: 20_000,
                 min_kbps: 1,
                 encoder_threads: 4,
             }
@@ -485,6 +670,31 @@ mod tests {
         });
         assert_eq!((caps.tor_max_kbps, caps.max_fps), (MAX_KBPS, 1));
         assert_eq!(notes.len(), 2, "{notes:?}");
+        // The direct bitrate is held alike, and said once; it never moves
+        // the least bitrate, which the Tor one holds.
+        let (caps, notes) = QualityCaps::from_media(&Media {
+            max_bitrate_kbps: u32::MAX,
+            ..Media::default()
+        });
+        assert_eq!((caps.direct_max_kbps, caps.min_kbps), (MAX_KBPS, 500));
+        assert_eq!(
+            notes,
+            [
+                "media.max_bitrate_kbps (4294967295) is outside 1 to 1000000: direct presets use \
+              1000000"
+            ]
+        );
+        let (caps, notes) = QualityCaps::from_media(&Media {
+            max_bitrate_kbps: 0,
+            min_bitrate_kbps: 0,
+            ..Media::default()
+        });
+        assert_eq!((caps.direct_max_kbps, caps.min_kbps), (1, 1));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(
+            notes[0],
+            "media.max_bitrate_kbps (0) is outside 1 to 1000000: direct presets use 1"
+        );
         let (caps, notes) = QualityCaps::from_media(&Media {
             encoder_threads: 0,
             ..Media::default()
@@ -661,6 +871,7 @@ mod tests {
                 ..EncoderSettings::default()
             },
             preset: BP,
+            route: Route::Direct,
         };
         let msg = tornect_proto::Msg::Quality {
             width: 8,

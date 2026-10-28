@@ -292,6 +292,90 @@ async fn a_direct_bind_is_answered_with_its_proof_first() {
     assert_eq!(*conn.closed_with.lock().unwrap(), None, "no refusal");
 }
 
+/// The direct design §6.8: a stream claimed on a direct or a LAN link runs
+/// the direct row of the quality table. `BindOk` says Balanced's 30 fps and
+/// 6 Mbit/s at 1080p, a pick of Best performance its 60 fps and 4 Mbit/s,
+/// and the source opens at the direct capture rate (60 under the default
+/// caps), not the Tor one (20). An onion stream on the same host keeps the
+/// Tor row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_stream_runs_the_direct_row_of_the_quality_table() {
+    use crate::quality::{Route, settings};
+
+    let rig = direct_rig(TestBackend::default());
+    let caps = MediaLimits::default().caps;
+    for (seed, route) in [(70, TransportKind::Direct), (71, TransportKind::Lan)] {
+        let viewer = start_direct(&rig.host, seed, TransportPolicy::Any);
+        let mut conn = connect_direct(&rig.host, &viewer, EKM, route);
+        write_msg(&mut conn.client, &viewer.bind(&EKM))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_msg(&mut conn.client).await.unwrap(),
+            Some(viewer.proof(&EKM))
+        );
+        let Some(Msg::BindOk { quality: info, .. }) = read_msg(&mut conn.client).await.unwrap()
+        else {
+            panic!("{route:?}: no BindOk");
+        };
+        assert_eq!(
+            info,
+            settings(QualityPreset::Balanced, Route::Direct, &caps).info()
+        );
+        assert_eq!((info.max_fps, info.kbps), (30, 6000), "{route:?}");
+        let fast = quality::BEST_PERFORMANCE;
+        write_msg(&mut conn.client, &Msg::SetQuality { quality: fast })
+            .await
+            .unwrap();
+        let since = tokio::time::Instant::now();
+        loop {
+            in_time(since, "Best performance's Quality");
+            if let Msg::Quality { quality: info, .. } = next_acking(&mut conn.client).await
+                && info.preset == fast
+            {
+                assert_eq!(
+                    info,
+                    settings(QualityPreset::BestPerformance, Route::Direct, &caps).info()
+                );
+                assert_eq!((info.max_fps, info.kbps), (60, 4000), "{route:?}");
+                break;
+            }
+        }
+        drop(conn.client);
+        assert!(matches!(
+            conn.served.await.unwrap(),
+            MediaOutcome::Served { .. }
+        ));
+    }
+
+    let viewer = start_direct(&rig.host, 72, TransportPolicy::Any);
+    let (mut client, served) = connect(&rig.host);
+    let (.., info) = bind_preset(&mut client, &viewer.onion(), quality::BALANCED).await;
+    assert_eq!(
+        info,
+        settings(QualityPreset::Balanced, Route::Tor, &caps).info()
+    );
+    assert_eq!((info.max_fps, info.kbps), (15, 1500));
+    drop(client);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+    assert_eq!(
+        *rig.backend.requests.lock().unwrap(),
+        [
+            SourceRequest::new(60),
+            SourceRequest::new(60),
+            SourceRequest::new(20)
+        ]
+    );
+    assert_eq!(
+        rig.routes.started(),
+        [
+            TransportKind::Direct,
+            TransportKind::Lan,
+            TransportKind::TorRelay
+        ]
+    );
+}
+
 /// The proof never waits on the desktop: it is written while the source's
 /// open (the portal's dialog here) is still up, and an end that comes then
 /// still cancels the open (revision 1 blocker 1; slice-G G1-1).
