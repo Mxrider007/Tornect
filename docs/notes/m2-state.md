@@ -1,4 +1,4 @@
-# M2 state: direct connections, Phases A and B (interim hand-off, 2026-10-28)
+# M2 state: direct connections, Phases A and B and the close (hand-off, 2026-10-28)
 
 Phase A of design `direct` (revision 4, `/mnt/project-files/designs/direct.md`), LAN-direct sessions
 with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-container half of
@@ -7,8 +7,11 @@ machines can give (the list below); the ledger rows for it are in `docs/VERIFICA
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
 is implemented in this container: B1 to B7 (2026-10-27), B8 to B13 (2026-10-28; "OPEN, owned by
 Phase B steps" below). **`INTERNET_DIRECT` is `true` since step B12 (`c1ec5a15`).** No tag was
-made; what the dev VM and real networks still owe is listed under B12 and B13 below. C1 and C2
-are next.
+made; what the dev VM and real networks still owe is listed under B12 and B13 below. **The close
+is done (2026-10-28):** C1 wrote the final text of decisions M1-77 to M1-86 and the plan's final
+words (the threat model included), C2 reviewed the whole feature's security and found no defect
+(the C1 and C2 entries at the end of "OPEN, owned by Phase B steps"). What is left before `m2` is the owner's: the three blockers below, then the
+tag.
 
 ## Blockers: no release zip to users, no `m2` tag
 
@@ -23,8 +26,11 @@ check is the owner's call. Until both are settled:
 2. **The `live_stun` run is pasted** from the dev VM (`cargo test -p tornect-net --test live_stun
    -- --ignored --nocapture`; ledger row "Step B12: the live STUN check"): four lines, each
    `srflx` or `no-nat`.
+3. **The Accept demo is pasted** from the dev VM (design §15 step C2 [VM]; ledger row "C2: the
+   Accept demo on the dev VM", which runs the live demos of both phases with one build of the
+   close's head).
 
-No zip from `cargo xtask dist` goes to users and no `m2` tag is made before both. If the owner
+No zip from `cargo xtask dist` goes to users and no `m2` tag is made before all three. If the owner
 rejects "no published terms", or an entry is silent in the run (asked, nothing global back), the
 entry is replaced with one of another operator as §5.4 says: `DEFAULT_STUN` and `config.rs`'s
 default-list test, the migration (saved configs hold today's four entries), `STUN_LINE`'s
@@ -331,12 +337,30 @@ and the crates below ring check here).
   tells a silent server from a name that did not resolve. The STUN list's checks are now the
   "Blockers" at the top of this note. The tautological nine-cell loop in `decide`'s test became a
   check of `decide` against the internet-scope table (fails with the constant off).
-- C1: the final text of decision rows M1-77 to M1-86 (still placeholders with step notes) and of
-  the plan: `docs/PLAN.md` describes Phase A since the Phase A close (Part C M2 amended, §B.2,
-  §B.6, §B.8.6.4, §B.8.17 item 7, Parts E and G), and Phase B in minimal edits since the review
-  of B12 and B13 (§B.2, §B.6, the release's limits, the r7 roadmap entry, Part G), in words C1
-  replaces with the final ones; the release README's "Direct connections" follows C1's words.
-- C2: the security-reviewer pass over the whole feature, the Accept demo, tag `m2`.
+- C1 (done 2026-10-28; ledger rows "C1: …" in *Direct connections, the close*): decisions M1-77
+  to M1-86 open with their final text ("**Final text (step C1, 2026-10-28).**": numbered items,
+  deviations, residuals and what is open), the placeholder and every step's note kept after it as
+  history; M1-81's carries the STUN operator split's same-list condition, M1-82's the 1.5 s row
+  in the words the B9 leftovers settled. The plan (both copies identical) has its final words: D6,
+  §A.4 item 4, the §B.2 diagram's candidates, §B.6's privacy modes and *The direct path* (the
+  threat model of design §9.3: a malicious accepted peer, the STUN servers with the same-list
+  condition, the resolver, the router and its ledger, a VPN user's physical address, the LAN
+  device that spoofs the gateway; §9.4's two signing contexts were already there), the §B.8.4.3
+  note, the §B.8.14 M2 row, Part C M2 (the fallback's timing, the close), the release's limits
+  ("relayed through Tor (≈ 16 fps cap) unless the two computers can reach each other directly",
+  the third parties, NEEDS-DEVICE), the roadmap entry, Part E's direct row and Part G. §B.8.6.4,
+  §B.8.11 and §B.8.17 item 7 already said the final thing and were left. `README.md` (privacy
+  modes, the M2 row) and the release README's limits follow. Three stale rows of the Phase A
+  ledger section were corrected. No release notes file was written: the notes of the next
+  pre-release are written at its dist run (`docs/RELEASING.md`) from the zipped README.
+- C2 (done 2026-10-28; `6caa2880`; ledger rows "C2: …"): the security review of the whole
+  direct-connection diff (`1a935a41..` the close; signal, net, session, platform, proto,
+  core, the app, the consent copy, the router mapping), judged against design §9.1's invariants
+  and the security invariants of `docs/PLAN.md` §B.6 and §B.8: no defect. One coverage gap closed: a view-only
+  session bound on the direct path never decodes or injects input
+  (`tests::direct_bind::a_view_only_direct_session_never_decodes_or_injects_input`; switching it
+  to control makes it fail). The Accept demo on the dev VM is NEEDS-DEVICE with its recipe
+  (blocker 3); no tag was made (the design's C2 tags `m2`; tags are the owner's).
 
 ## Gotchas found at this checkpoint
 

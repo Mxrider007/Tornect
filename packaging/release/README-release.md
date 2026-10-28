@@ -272,8 +272,9 @@ own, and anywhere else other accounts on the PC could read and change its keys.
 - Tested on one Linux machine (GNOME on Wayland) only. **Nothing has run on a
   real Windows machine yet**: only under Wine, which is not Windows. The window
   has not yet been used by a person for a whole session between two machines.
-- Without a direct connection everything travels over Tor: pictures are slow
-  (a few frames per second for a large desktop). Either way, Tor takes from
+- Unless the two computers can reach each other directly, everything travels
+  over Tor: at most about 16 pictures a second, and a few a second for a large
+  desktop. Either way, Tor takes from
   seconds to minutes to find the other computer.
 - Direct connections across the internet are new in this build and have run
   only in simulation: not yet between two real homes, through real routers or

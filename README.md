@@ -68,8 +68,11 @@ Host                          Tor network                       Client
 - **Capture & input, the modern way:** Windows.Graphics.Capture + SendInput;
   ScreenCaptureKit + CGEvent; xdg-desktop-portal ScreenCast/PipeWire + libei on
   Wayland. No root, no kernel hacks.
-- **Privacy modes:** default (signaling via Tor, media direct — peers see each
-  other's IP), *paranoid* (everything via Tor), LAN-only.
+- **Privacy modes:** default (signaling via Tor, media direct when the two
+  computers can reach each other, otherwise through Tor; the other computer of a
+  session sees your IP address, and so does one public STUN server; off while Tor
+  uses a bridge), *paranoid* (everything via Tor), LAN-only (direct on the
+  local network only, never through Tor).
 - **No telemetry.** Session events are logged locally only.
 
 The full design — research, decision record, protocol, milestones — is in
@@ -114,7 +117,7 @@ one directory — handy for running a host and a client on the same machine.
 |---|---|---|
 | M0 | Workspace, identities, config, keystore, CI, Claude Code kit | ✅ done |
 | M1 | Signaling over Tor: embedded Arti onion service, pairing with SAS, unattended PAKE auth | in progress: built, acceptance runs open |
-| M2 | Direct connectivity: candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned QUIC, Tor fallback | in progress: both halves built and the internet half on; the dev-VM runs (checkpoint `m2a`), the live STUN check, real networks and routers, and the close (final decisions, security review) still to come |
+| M2 | Direct connectivity: candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned QUIC, Tor fallback | in progress: both halves built and the internet half on; the close done (final decisions, a security review of the whole feature); still to come: the dev-VM runs (checkpoint `m2a`), the owner's call on the default STUN servers and their live check, real networks and routers |
 | M3 | Video pipeline on Linux/Wayland: capture, codecs, packetizer/FEC/jitter/pacer, wgpu render, loopback demo | |
 | M4 | End-to-end streaming between two machines with the minimal GUI | |
 | M5 | Input + audio: remote *control*, clipboard, gaming mode | |
