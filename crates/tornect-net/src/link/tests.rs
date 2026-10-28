@@ -245,6 +245,43 @@ async fn a_loopback_pair_connects_and_carries_16_mib() {
     assert_ne!(roles[0], roles[1], "each role dialled once");
 }
 
+/// Two instances on one computer with real sockets (decision M1-82's
+/// deviation from design §12.5; the MemNet rows
+/// `two_links_on_one_machine_find_no_path` and
+/// `two_links_on_one_machine_meet_only_through_a_hairpinning_router`):
+/// both links bind on the same `127.0.0.x`, at two ports. Each refuses the
+/// other's candidate as one of its own addresses, sends nothing and fails
+/// at once, having heard nothing.
+#[tokio::test]
+async fn two_links_on_one_loopback_address_find_no_path() {
+    let machine = LoopbackNet::new(70);
+    let mut pair = start_pair(Arc::new(machine), Arc::new(machine), (1, 2)).await;
+    let (viewer_at, host_at) = (pair.viewer_offered[0].addr, pair.host_offered[0].addr);
+    assert_eq!(viewer_at.ip(), IpAddr::V4(machine.ip()));
+    assert_eq!(host_at.ip(), IpAddr::V4(machine.ip()));
+    assert_ne!(viewer_at.port(), host_at.port());
+    let started = tokio::time::Instant::now();
+    let (viewer, host) = within(5, async {
+        tokio::join!(pair.viewer.established(), pair.host.established())
+    })
+    .await;
+    assert_eq!(
+        viewer.expect_err("no path for the viewer"),
+        DirectFail::NoPath { heard: false }
+    );
+    assert_eq!(
+        host.expect_err("no path for the host"),
+        DirectFail::NoPath { heard: false }
+    );
+    assert!(started.elapsed() < crate::checklist::SAME_SITE_SCHEDULE.fail);
+    for stats in [pair.viewer.stats(), pair.host.stats()] {
+        assert_eq!(stats.punch.candidates_refused, 1, "{stats:?}");
+        assert_eq!(stats.punch.requests_sent, 0, "{stats:?}");
+        assert_eq!(stats.socket.probes_sent, 0, "{stats:?}");
+        assert!(!stats.heard && !stats.established, "{stats:?}");
+    }
+}
+
 /// The 1 GiB transfer of design §12.2, with a checksum, at the checkpoint
 /// gate (step A22): `cargo test -p tornect-net --release --lib
 /// link::tests::a_loopback_pair_carries_1_gib -- --ignored --nocapture`.

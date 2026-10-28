@@ -13,6 +13,7 @@ use crate::gather::GatherConfig;
 use crate::mapping::{MAP_LEASE, MapProtocols};
 use crate::mem::{
     Fate, LinkSpec, MachineSpec, MapperMode, MemNet, NatBox, NatFiltering, NatMapping, RouterSeen,
+    WireKind,
 };
 
 /// The public address of the viewer's router.
@@ -192,5 +193,117 @@ async fn a_short_grant_is_renewed_through_a_ten_minute_link() {
             "{:?}",
             nat.router_log()
         );
+    }
+}
+
+/// Two instances on one computer behind its router, in internet scope
+/// (decision M1-82's deviation from design §12.5): each link refuses the
+/// other's host candidate as one of its own addresses, so only the router
+/// can join them. Each maps its port and offers the mapping. A router that
+/// hairpins loops each probe back in from the sender's mapping, which is
+/// not an address of this computer: both validate the other's mapping and
+/// connect on the internet route through it. A router that does not
+/// hairpin drops every probe at the box: neither side hears anything, and
+/// no address of this computer is ever probed.
+#[tokio::test(start_paused = true)]
+async fn two_links_on_one_machine_meet_only_through_a_hairpinning_router() {
+    for hairpin in [true, false] {
+        let net = MemNet::new(7);
+        let home = net.segment(LinkSpec::LAN);
+        let wide = net.segment(LinkSpec {
+            latency: Duration::from_millis(10),
+            loss: 0.0,
+        });
+        let nat = net.nat(NatBox {
+            lan: Some("192.168.1.1".parse().unwrap()),
+            hairpin,
+            router: Some(MapperMode::Ok),
+            ..NatBox::home(home, wide, PUBLIC)
+        });
+        let machine = net.machine(MachineSpec::on(home, "192.168.1.10/24").gateway("192.168.1.1"));
+        let machine_ip: IpAddr = "192.168.1.10".parse().unwrap();
+
+        let (mut viewer, from_viewer) = DirectLink::start(
+            internet(TornectRole::Viewer, 1, 2, MapProtocols::ALL),
+            Arc::new(machine.clone()),
+        )
+        .await
+        .expect("the viewer's link");
+        let (mut host, from_host) = DirectLink::start(
+            internet(TornectRole::Host, 2, 1, MapProtocols::ALL),
+            Arc::new(machine.clone()),
+        )
+        .await
+        .expect("the host's link");
+        let from_viewer = gathered(&mut viewer, from_viewer).await;
+        let from_host = gathered(&mut host, from_host).await;
+        for offered in [&from_viewer, &from_host] {
+            assert_eq!(offered.len(), 2, "{offered:?}");
+            assert!(
+                offered
+                    .iter()
+                    .any(|c| c.kind == CandidateKind::Host && c.addr.ip() == machine_ip)
+            );
+            assert!(
+                offered
+                    .iter()
+                    .any(|c| c.kind == CandidateKind::Mapped && c.addr.ip().to_string() == PUBLIC)
+            );
+        }
+        assert_eq!(nat.forwards().len(), 2);
+        host.add_remote(from_viewer, Scope::Internet);
+        host.remote_done();
+        viewer.add_remote(from_host, Scope::Internet);
+        viewer.remote_done();
+
+        if hairpin {
+            let (v, h) = tokio::join!(connected(&mut viewer), connected(&mut host));
+            for side in [&v, &h] {
+                assert_eq!(
+                    side.route(),
+                    Route {
+                        same_site: false,
+                        ipv6: false
+                    }
+                );
+                assert_eq!(side.winner(), CandidateKind::Mapped);
+            }
+            let (mut viewer_stream, mut host_stream) = media_stream(&v, &h).await;
+            within(10, exchange(&mut viewer_stream, &mut host_stream, 1)).await;
+            drop((v, h));
+            let wire = net.wire();
+            assert!(wire.iter().any(|w| w.kind == WireKind::Probe));
+            for w in wire.iter().filter(|w| w.fate == Fate::Delivered) {
+                let seen = w.seen_from.expect("a delivered datagram's source");
+                assert_eq!(seen.ip().to_string(), PUBLIC, "{w:?}");
+            }
+        } else {
+            let (v, h) = within(10, async {
+                tokio::join!(viewer.established(), host.established())
+            })
+            .await;
+            assert_eq!(
+                v.expect_err("no path for the viewer"),
+                DirectFail::NoPath { heard: false }
+            );
+            assert_eq!(
+                h.expect_err("no path for the host"),
+                DirectFail::NoPath { heard: false }
+            );
+            let wire = net.wire();
+            assert!(!wire.is_empty());
+            assert!(
+                wire.iter()
+                    .all(|w| w.kind == WireKind::Probe && w.fate == Fate::NoHairpin),
+                "{wire:?}"
+            );
+        }
+        assert!(net.wire().iter().all(|w| w.to.ip() != machine_ip));
+        for stats in [viewer.stats(), host.stats()] {
+            assert_eq!(stats.punch.candidates_refused, 1, "{stats:?}");
+            assert_eq!(stats.established, hairpin, "{stats:?}");
+        }
+        viewer.close().await;
+        host.close().await;
     }
 }

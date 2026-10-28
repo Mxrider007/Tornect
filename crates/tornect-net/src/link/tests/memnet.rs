@@ -387,6 +387,38 @@ async fn a_private_remote_off_link_is_refused_in_same_site_scope() {
     }
 }
 
+/// Two instances on one computer (design §7.7 "not one of our own
+/// addresses"; decision M1-82's deviation from design §12.5 "two instances
+/// on one VM still give `ROUTE direct lan`"): both links read the same
+/// interfaces, so each offers the machine's one address and refuses the
+/// other's candidate as its own, whatever the port. Not one datagram is
+/// sent and both fail at once, having heard nothing. The own-address rule
+/// is a reflection guard (a peer must not make this side probe its own
+/// services on other ports); a same-site direct path needs two machines.
+#[tokio::test(start_paused = true)]
+async fn two_links_on_one_machine_find_no_path() {
+    let net = MemNet::new(1);
+    let lan = net.segment(LinkSpec::LAN);
+    let machine = net.machine(MachineSpec::on(lan, "192.168.1.10/24"));
+    let t0 = tokio::time::Instant::now();
+    let mut pair = start_pair(env(&machine), env(&machine), (1, 2)).await;
+    let (viewer_at, host_at) = (pair.viewer_offered[0].addr, pair.host_offered[0].addr);
+    assert_eq!(pair.viewer_offered.len(), 1);
+    assert_eq!(pair.host_offered.len(), 1);
+    assert_eq!(viewer_at.ip(), host_at.ip());
+    assert_ne!(viewer_at.port(), host_at.port());
+    let (viewer_fail, host_fail) = both_fail(&mut pair).await;
+    assert_eq!(viewer_fail, DirectFail::NoPath { heard: false });
+    assert_eq!(host_fail, DirectFail::NoPath { heard: false });
+    assert!(t0.elapsed() < SAME_SITE_SCHEDULE.fail);
+    assert!(net.wire().is_empty());
+    for stats in [pair.viewer.stats(), pair.host.stats()] {
+        assert_eq!(stats.punch.candidates_refused, 1);
+        assert_eq!(stats.punch.requests_sent, 0);
+        assert!(!stats.heard && stats.validated == 0 && !stats.dialled);
+    }
+}
+
 /// On paused time the viewer's close returns within `CLOSE_WAIT` and ends
 /// the host's connection; no further stream opens.
 #[tokio::test(start_paused = true)]
