@@ -510,7 +510,12 @@ fn same_path(a: &str, b: &str) -> bool {
 /// Refused unless the held image can be the copy's source: robocopy keeps
 /// the file's name, so it must be `tornect.exe` (in any case), and its path
 /// goes quoted into robocopy's parameters, so it holds no `%`, `"` or
-/// control character.
+/// control character. No name in it may end in a dot or a space: the held
+/// handle's final path keeps such a name (made through a `\\?\` path), but
+/// Win32 path handling drops the dot or space when the folder is opened by
+/// that path again, for lyrebird beside the image and in robocopy's source,
+/// and both would then reach a sibling folder, which can be a junction
+/// re-pointed while the prompt is open.
 fn source_ok(path: &str) -> Result<(), InstallError> {
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
     if !name.eq_ignore_ascii_case(WINDOWS_EXE) {
@@ -522,6 +527,15 @@ fn source_ok(path: &str) -> Result<(), InstallError> {
         return Err(InstallError::Refused(format!(
             "{path:?} holds a character Windows' copy cannot take (%, \" or a control \
              character), so Tornect was not installed from it."
+        )));
+    }
+    if let Some(name) = path
+        .split(['\\', '/'])
+        .find(|name| name.ends_with(['.', ' ']))
+    {
+        return Err(InstallError::Refused(format!(
+            "{path:?} has a folder name that ends in a dot or a space ({name:?}), which Windows' \
+             copy would read as another folder's name, so Tornect was not installed from it."
         )));
     }
     Ok(())
@@ -5273,6 +5287,48 @@ mod windows_tests {
         }
         let mut fake = Fake::new();
         fake.image_path = "C:\\Users\\u\\Downloads\\TORNECT.EXE".to_owned();
+        install(&fake, &mut allow(&fake)).unwrap();
+    }
+
+    /// The security review of W4: a folder name that ends in a dot or a
+    /// space survives in the held handle's final path but not when the
+    /// folder is opened by that path again (lyrebird beside the image,
+    /// robocopy's source), which then reaches a sibling folder; such a
+    /// source is refused right after the image is held, before anything is
+    /// asked or run.
+    #[test]
+    fn a_source_folder_name_ending_in_a_dot_or_space_is_refused() {
+        for (path, name) in [
+            ("C:\\Users\\u\\Downloads\\tornect.\\tornect.exe", "tornect."),
+            ("C:\\Users\\u\\Downloads\\tornect \\tornect.exe", "tornect "),
+            ("C:\\Users\\u\\a...\\Downloads\\tornect.exe", "a..."),
+            ("\\\\server\\share \\tornect\\tornect.exe", "share "),
+        ] {
+            let mut fake = Fake::new();
+            fake.image_path = path.to_owned();
+            match install(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => assert_eq!(
+                    why,
+                    format!(
+                        "{path:?} has a folder name that ends in a dot or a space ({name:?}), \
+                         which Windows' copy would read as another folder's name, so Tornect \
+                         was not installed from it."
+                    ),
+                    "{path}"
+                ),
+                other => panic!("{path:?}: {other:?}"),
+            }
+            let events = fake.events();
+            assert!(
+                events
+                    .iter()
+                    .all(|e| matches!(e, Ev::OpenImage | Ev::ReadImage | Ev::CloseImage)),
+                "{path}: {events:?}"
+            );
+        }
+        // A dot inside a name, and a space inside one, are ordinary.
+        let mut fake = Fake::new();
+        fake.image_path = "C:\\Users\\u\\My Downloads\\tornect.v1\\tornect.exe".to_owned();
         install(&fake, &mut allow(&fake)).unwrap();
     }
 
