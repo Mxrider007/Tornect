@@ -489,7 +489,10 @@ no window or terminal to show one.
 
 `tornect paths` prints the directories: the keys of this machine's Tornect ID,
 the paired devices, `config.toml` and `sessions.log` (every pairing and session,
-kept on this machine). `--home <dir>` (or `TORNECT_HOME`) puts all of it
+kept on this machine). The settings this README names under `[network]`,
+`[tor]`, `[services]` and the like go in `config.toml`: `tornect config path`
+prints where it is, `tornect config init` writes one with every default where
+there is none, and `tornect config show` prints the settings in effect. `--home <dir>` (or `TORNECT_HOME`) puts all of it
 elsewhere, so two copies can run side by side on one machine. On Windows that
 directory must be inside your user folder (`C:\Users\<you>`), and Tornect
 refuses one elsewhere: it does not yet give its directories permissions of their
