@@ -1,11 +1,19 @@
-# Tornect: a pre-release build (the vertical slice)
+# Tornect: a pre-release build
 
-Tornect shares one computer's screen with another, over Tor or, when the two
-can reach each other, directly ("Direct connections" below). A computer's
-Tornect ID is its Tor onion address, so it needs no server, no account and no
-port forwarding. This is a **pre-release** for testing between two machines
-you control, one Linux and one Windows. No one has audited it: do not rely on it
-to protect anything yet. It collects no telemetry.
+Tornect lets you see and control another computer, like AnyDesk or
+TeamViewer, without any server of its own. A computer's Tornect ID is its Tor
+onion address: Tor finds the other computer and checks that it is the one you
+paired with, so there is no account, no server to trust and no port to
+forward. After the other side accepts, the two computers connect directly
+when they can reach each other (on the same local network or across the
+internet), which is much faster; otherwise the session goes over Tor
+("Direct connections" below).
+
+This is a **pre-release** for testing between two machines you control, one
+Linux and one Windows. No one has audited it: do not rely on it to protect
+anything yet. It collects no telemetry. Much of it has not yet run on a real
+desktop, between two real networks or on Windows at all ("What has been tried,
+and where" below).
 
 ## What is in this zip
 
@@ -53,46 +61,31 @@ share this desktop you need either a Wayland session with xdg-desktop-portal
     ./tornect doctor
 
 `tornect doctor` reports the session type, how this desktop would be shared,
-Tornect's directories, and on the `tor:` line the lyrebird it found: that must
-be `…/pt/lyrebird`. If the line says `UNAVAILABLE`, see the reason it gives. A
-tool that did not keep the file modes needs `chmod 755 tornect pt/lyrebird`,
-and Tornect refuses a lyrebird that other users can write to.
+Tornect's directories, whether direct connections are on, and on the `tor:`
+line the lyrebird it found: that must be `…/pt/lyrebird`. If the line says
+`UNAVAILABLE`, see the reason it gives. A tool that did not keep the file modes
+needs `chmod 755 tornect pt/lyrebird`, and Tornect refuses a lyrebird that
+other users can write to. `./tornect` with nothing after it opens the window
+("Using the window" below).
 
-**The window:** `./tornect` with nothing after it. It shows this machine's
-Tornect ID (give it to the other person over a channel you trust) and whether
-Tor is connected, which takes from a few seconds to a few minutes. To reach the
-other machine, paste its Tornect ID and press Connect. The first time, both
-screens show the same code: compare them (by phone, say), then press "Yes, the
-codes match" on the side that connects and "The codes match: pair" on the side
-that shares. The sharing side then asks "Deny", "View only" or "Allow control".
-Only a mouse click answers "Allow control", "View only" and the two "codes
-match" buttons, and only once the question has been on screen for a second:
-keys typed for another program never answer it. Deny also works from the keyboard.
-The picture opens in its own window; "End the session" or closing that window
-ends it. While your screen is shared, a banner and a small "Tornect: sharing"
-window show it, each with **Stop**. `./tornect gui --no-host` only connects to
-others, publishing no ID and answering no one. Ctrl-C in the terminal that
-started the window, or a `kill`, closes it the same way, ending every session
-with a goodbye.
+**The password dialog on Linux.** Every change that widens access asks for
+your password through polkit: `tornect install` and `uninstall`, `service
+install` and `uninstall`, unattended access (`unattended on`, `grant`,
+`set-password`, `enable`, `resume`, `unlock`, and the window's Unattended access
+section, including the acknowledgement of its banner) and `backup export` and
+`import`. polkit needs Tornect's policy file, which is **not in this zip**. Take
+`packaging/polkit/org.tornect.policy` from https://github.com/Mxrider007/Tornect
+at the commit that `BUILD-INFO.txt` names
+(`https://raw.githubusercontent.com/Mxrider007/Tornect/<commit>/packaging/polkit/org.tornect.policy`),
+and install it once as root:
 
-**The command line** does the same, one role per terminal:
+    sudo install -m 0644 org.tornect.policy /usr/share/polkit-1/actions/org.tornect.policy
+    sudo systemctl restart polkit
 
-    ./tornect host              # share this desktop; answer pairing and session questions here
-    ./tornect connect <ID>      # connect to a host; compare the code, then wait for its answer
-    ./tornect ping <ID>         # is that host reachable over Tor? (no pairing needed)
-    ./tornect panic             # end every session the running host serves
-
-`tornect host` prints `Tornect ID: …` at once (on a terminal, or with
-`--evidence`) and `REACHABLE` once the address is published, typically one to a
-few minutes later. For a new device it shows
-the code and asks you to type `yes` if it matches the other screen; for each
-session it asks for `a` (allow control) or `v` (view only). Anything else, or no
-answer within 60 s, refuses.
-`tornect connect` shows no picture (use the window for that): it pairs, asks for
-the session and reports what it receives until Ctrl-C. `--capture test-card`
-(for `host` and `gui`) shares a synthetic picture instead of the desktop.
-`./tornect --help` lists everything, including `--bridges`, `tor-check`,
-`devices` and `paths`.
+Until it is installed, those changes are refused with "polkit action
+`org.tornect.…` is not registered on this host". Sharing, connecting and
+pairing do not need it. polkit's dialog has not yet been tried with this
+build.
 
 **Sharing a Wayland desktop: the grant.** On Wayland, the desktop, not
 Tornect, decides what may be shared. The first time, GNOME shows its
@@ -103,7 +96,8 @@ the dialog. Do it ahead, in the window's "Screen sharing on this desktop" card
 (**Grant screen sharing**); otherwise the dialog appears when a viewer's picture
 starts, and someone at this screen must answer it within 30 s. `tornect doctor`
 names the file that holds the grant; **Revoke** in the window, or deleting that
-file, takes it back.
+file, takes it back. A Wayland desktop shares the one screen picked in that
+dialog.
 
 ## Windows
 
@@ -111,24 +105,145 @@ You need Windows 10 (version 20H1 or later) or 11, 64-bit. Right-click the zip,
 Extract All, and keep `pt\` beside `tornect.exe`. Windows may warn that the
 program is not recognised: it is not code-signed.
 
-Double-clicking `tornect.exe` opens the window **and a console window**:
-`tornect.exe` is a console program. Ctrl-C (or Ctrl-Break) in that console
-closes Tornect as the main window's close button does, ending every session with
-a goodbye to the other side; closing the console window itself ends Tornect at
-once, without it (neither yet tried on Windows). The window works as on Linux
-above; Windows asks for no grant.
+Double-clicking `tornect.exe` opens the window, with no console window
+(`tornect.exe` is a window program). Its close button ends every session with a
+goodbye to the other side. The window works as "Using the window" below says;
+Windows asks for no grant.
 
-From a console in the folder (`cmd` or PowerShell):
+From a console in the folder (`cmd`), start each command with `start /wait`.
+Without it `cmd` gives its prompt back at once, and the questions of `tornect
+host` then share the console with `cmd`:
 
-    .\tornect.exe doctor
-    .\tornect.exe host
-    .\tornect.exe connect <ID>
+    start /wait tornect.exe doctor
+    start /wait tornect.exe host
+    start /wait tornect.exe connect <ID>
 
-**Ending sessions on Windows: Ctrl-C.** `tornect panic` cannot reach a running
-Windows host yet (its control channel is still to come) and says so. To end
-every session at once, press **Ctrl-C in the console where `tornect.exe host`
-runs**, or press Stop on the banner or the "Tornect: sharing" window when you
-use the window.
+In PowerShell, type `cmd` first and use the same lines. Ctrl-C in that console
+ends a `tornect.exe host` with a goodbye to the other side. Ctrl-Break, or
+closing the console window, ends it at once, without one (none of this yet
+tried on Windows). `tornect.exe doctor > doctor.txt` writes the report to a
+file.
+
+**Ending sessions on Windows.** `start /wait tornect.exe panic`, run in a
+second console, ends every session of the Tornect running for this home (the
+default one, or the one `--home` names). It goes through Tornect's control
+channel, a named pipe that only this Windows account can open (not yet tried
+on Windows). Stop on the banner or on the "Tornect: sharing" window, the
+window's close button, and Ctrl-C in the console where `start /wait tornect.exe
+host` runs end them too.
+
+## Using the window
+
+**Your ID and invitations.** Home shows this computer's Tornect ID, with
+**Copy ID**, **Copy invitation** and **Show QR code**. Send the invitation (the
+ID, a `tornect://` link and where to download Tornect) to the other person over
+a channel you trust; `tornect id --invitation` prints it too. Home also says
+whether Tor is connected and whether this ID is reachable, which takes from a
+few seconds to a few minutes after Tornect starts.
+
+**Connecting.** Paste the other computer's Tornect ID, its `tornect://` link or
+its whole invitation into the Connect field and press Connect. A link only
+fills the field: it never connects by itself. The first time, both screens show
+the same code: compare them (by phone, say), then press "Yes, the codes match"
+on the side that connects and "The codes match: pair" on the side that shares.
+The sharing side then asks "Deny", "View only" or "Allow control". Only a mouse
+click answers "Allow control", "View only" and the two "codes match" buttons,
+and only once the question has been on screen for a second: keys typed for
+another program never answer it. Deny also works from the keyboard. A computer
+you connected to stays on Home: **Knock** asks for a session again (the person
+there answers), and **Check if reachable** asks whether it answers.
+
+**The session.** The picture opens in its own window, with a toolbar:
+**Quality** (Best quality, Balanced, Best performance; Settings › Display and
+quality sets the default), **Screens** where the other computer has several and
+shares them (Windows and X11), **Chat**, **Files**, the **Clipboard** switch,
+Pause my input, Save a screenshot, Fullscreen and **End session**. Closing that
+window ends the session too. The window says whether the picture comes
+directly (local network or internet) or is relayed through Tor.
+
+**While your screen is shared**, a banner and a small "Tornect: sharing" window
+show it, each with a Stop button. The panic key, Ctrl+Alt+End by default
+(`panic_key` under `[security]`), ends every session: on Windows through a
+keyboard hook, on Linux where the desktop offers its global-shortcuts portal
+(the desktop may ask you to confirm the key; neither yet tried on a real
+desktop). `./tornect gui --no-host` only connects to
+others, publishing no ID and answering no one. On Linux, Ctrl-C in the terminal
+that started the window, or a `kill`, closes it the same way, ending every
+session with a goodbye.
+
+## Chat, clipboard and files
+
+The picture window's toolbar has **Chat**, **Files** and a **Clipboard**
+switch. What someone connected to *this* computer may use is set in Settings ›
+Sharing, and every switch there is on by default:
+
+- **Chat**: they can write to you, and you to them, in any session.
+- **Clipboard**: when they control this computer, text copied here during the
+  session can be pasted there, and the other way round. Text a password
+  manager marks as private is not shared.
+- **Receive files**: when they control this computer, they can send files.
+  Files go to Downloads › Tornect and never replace a file there.
+- **Let them see and copy files**: when they control this computer, they can
+  see and copy **any file you can open here**. Tornect's own folders are never
+  shown.
+
+Turn off what you do not want before you accept: a change applies to sessions
+that start afterwards. During a session, **Turn off clipboard and files** under
+the session's line in the banner takes them away for the rest of that session
+(chat stays). The clipboard and files need input that actually reaches this
+desktop: a View only session gets chat only, and so does a control session
+whose input reaches nothing here (on a Wayland desktop, a grant made without
+**Allow Remote Interaction**). Files and the clipboard pause while this computer
+is locked (on Linux only with a screen locker that tells the system, as GNOME's
+and KDE's do; xscreensaver and swaylock do not pause them), and up to a second
+of access can follow a lock.
+
+Limits (`[services]` in `config.toml`): each file up to 2 GiB (`max_file_mib`);
+up to 8 GiB (`session_quota_mib`) and 1,000 files received in one session; 1 GiB
+of the disk always kept free (`keep_free_mib`). Files go one by one, never a
+folder. Files you download from the other computer go to your Downloads ›
+Tornect. A file dropped on the picture window is sent, on Windows and X11 (not
+on Wayland).
+
+Your own clipboard goes to the computer you view only while **Share my
+clipboard** (Settings › Sharing, `[viewer] clipboard_sync`, off by default) or
+the picture window's Clipboard switch is on; in the first session with a
+computer you just paired with, only the window's switch turns it on. In the
+same way, text the viewer copies reaches this computer only while the viewer's
+own switch is on.
+
+On a Wayland desktop this computer shares no clipboard while `[services]
+wayland_clipboard` is off, as it is by default. Turning it on makes the
+desktop's screen-sharing dialog ask again (that grant is kept apart, in
+`portal-restore-token-2`), and it is not yet tested on GNOME. Over Tor, files
+and clipboard text move at about 200 KB/s. `tornect host` on the command line
+offers none of these: its sessions carry the picture and input only.
+
+## The command line
+
+The command line does the same as the window, one role per terminal (on
+Windows, `start /wait tornect.exe …` as above):
+
+    ./tornect host              # share this desktop; answer pairing and session questions here
+    ./tornect connect <ID>      # connect to a host; compare the code, then wait for its answer
+    ./tornect ping <ID>         # is that host reachable over Tor? (no pairing needed)
+    ./tornect panic             # end every session the running host serves
+    ./tornect id --invitation   # print this computer's invitation
+
+`connect` and `ping` also take a `tornect://` link, or a whole invitation in
+quotes, in place of the ID. `tornect host` prints `Tornect ID: …` at once (on a
+terminal, or with `--evidence`) and `REACHABLE` once the address is published,
+typically one to a few minutes later. For a new device it shows the code and
+asks you to type `yes` if it matches the other screen; for each session it asks
+for `a` (allow control) or `v` (view only). Anything else, or no answer within
+60 s, refuses. `tornect connect` shows no picture (use the window for that): it
+pairs, asks for the session and reports what it receives until Ctrl-C;
+`--quality best-quality|balanced|best-performance` picks the quality and
+`--screen <1..16|all>` the other computer's screen. `--capture test-card` (for
+`host` and `gui`) shares a synthetic picture instead of the desktop.
+`./tornect --help` lists everything, including `--bridges`, `tor-check`,
+`devices` and `paths`. For a bug report, add `--log debug`: without it this
+build writes only warnings and errors.
 
 ## Direct connections
 
@@ -194,31 +309,101 @@ allows them anyway). `tornect doctor` says whether direct connections are on,
 whether STUN servers and the router are asked, and which kinds of address this
 computer has, never the addresses themselves.
 
-On Windows, the first direct connection may make Windows ask whether Tornect
-may communicate on your networks: choose "Allow access". If you cancel, or
-this Windows account cannot change the firewall, sessions go over Tor.
+**Firewalls and routers.** A direct connection is UDP. On Windows, the first
+direct connection may make Windows ask whether Tornect may communicate on your
+networks: choose "Allow access". If you cancel, or this Windows account cannot
+change the firewall, sessions go over Tor. When the other computer's probes
+arrive but none of this computer's is answered, `tornect connect` prints
+`ROUTE tor no-path-firewall` and the window says that the other computer's
+firewall may be blocking Tornect. Tornect picks a new UDP port for each
+session; `direct_port = <port>` under `[network]` (1024 or above) fixes it, for
+a firewall rule or a port forwarded by hand. Behind some routers and
+carrier-grade NATs no direct path can be found: the session then goes over
+Tor.
+
+## Unattended access
+
+Unattended access lets a device you paired connect to this computer without
+anyone here answering, for example to reach your own computer from elsewhere.
+It is off until you turn it on, and you give it to each device yourself, with a
+password, on this computer only.
+
+1. Pair with the device you will connect from, and hold one ordinary session
+   with it that you accept here. (The Headless box preset, or `tornect
+   unattended grant --waive-attended-check`, skips that, and the waiver is
+   logged.)
+2. On Linux, install polkit's policy file first ("The password dialog on
+   Linux" above). On Wayland, give the screen-sharing grant ahead (**Grant
+   screen sharing**): nobody will be here to answer the desktop's dialog.
+3. In the window, open Settings › Security › Unattended access, choose **Turn
+   on for a device…**, pick the device and a preset (My machines: control, with
+   3 s for someone here to press Block; Helping someone: view only, asks before
+   starting; Headless box: control, with no block window), and confirm with
+   your OS password. The window shows the device's password, five words, once:
+   write it down.
+
+On Linux the command line does the same: `tornect unattended on`, then
+`tornect unattended grant <device> [--preset my-machines|headless-box|helping-someone]`,
+which asks you to type the password twice; it is never taken from the command
+line. On Windows, give access in the window: the Windows command line cannot ask
+for a password yet. Turning unattended access on shows an **emergency stop
+code** once: write it down and keep it away from this computer. Given from
+another of your devices, it turns unattended access off here and removes every
+grant.
+
+From the other device, press **Connect without asking** on that computer's card
+on Home and type the password; once that has worked, the card's **Connect** does
+it, and **Knock** asks for an ordinary session. On Linux, `tornect connect
+--unattended <ID>` does the same from a terminal, without a picture; on Windows
+that command works only with a password remembered in the window. An unattended
+session shows the sharing banner and the "Tornect: sharing" window like any
+other, and Stop or `tornect panic` ends it. A Tornect started at sign-in serves
+unattended sessions only once its sharing indicator has been shown.
+
+`tornect unattended status` lists the grants and what is not ready, `tornect
+unattended revoke <device>` removes one, and `tornect unattended off` (or Turn
+off in Settings › Security) turns unattended access off and ends its sessions;
+the grants are kept. `tornect panic` pressed twice within 2 s turns it off too.
+An unattended session between two machines over Tor has not yet been run, only
+tests.
 
 ## Installing (optional)
 
 Tornect runs from the unpacked folder and needs no install. To keep a copy where
-it stays, close Tornect, open a terminal in the unpacked folder and run
-`./tornect install` (`.\tornect.exe install` on Windows): the copy that is not
-installed is not on your `PATH` yet. It asks for your OS password first, as
-`service install` below does, and at the end offers "Start Tornect when I sign
-in? [y/N]". `tornect uninstall` removes it again.
+it stays, and to make `tornect://` links open Tornect, close Tornect, open a
+terminal in the unpacked folder and run `./tornect install` (`start /wait
+tornect.exe install` on Windows): the copy that is not installed is not on your
+`PATH` yet. Like `service install`, it asks for your OS password first, and it is
+refused while a remote session is live or ended less than a minute ago. At the
+end it asks "Start Tornect when I sign in? [y/N]"; a yes asks for the password
+again. `tornect uninstall` removes the start at sign-in, the link registration,
+the menu entries and the copy; your pairings, grants and settings stay.
 
 - **Linux:** the program goes to `~/.local/bin/tornect`, with a menu entry and
-  the handler of `tornect://` links, and lyrebird, checked against the SHA-256
-  compiled into Tornect, to `~/.local/bin/pt/lyrebird`, where the installed
-  copy finds it. Install from the unpacked folder: a copy with no `pt/lyrebird`
-  beside it installs without lyrebird, says so, and its installed copy cannot
-  use obfs4 or Snowflake bridges.
+  the handler of `tornect://` links (`~/.config/mimeapps.list` is changed only
+  where no other program handles those links, and the install says what it
+  did), and lyrebird, checked against the SHA-256 compiled into Tornect, to
+  `~/.local/bin/pt/lyrebird`, where the installed copy finds it. Install from
+  the unpacked folder: a copy with no `pt/lyrebird` beside it installs without
+  lyrebird, says so, and its installed copy cannot use obfs4 or Snowflake
+  bridges. The password dialog needs polkit's policy file ("The password dialog
+  on Linux" above).
 - **Windows:** the program goes to `C:\Program Files\Tornect\tornect.exe`, with
-  a Start-menu entry and an Apps-and-features entry, through two Windows
-  administrator prompts. **This build's Windows install carries no lyrebird**:
-  the installed copy cannot use obfs4 or Snowflake bridges, and the install
-  says so. Where Tor is blocked, run `tornect.exe` from the unpacked folder,
-  which keeps `pt\lyrebird.exe` beside it.
+  a Start-menu entry and an Apps-and-features entry: your password, then two
+  Windows administrator prompts. It is refused with `--home` or
+  `TORNECT_HOME`, and over an earlier install. **This build's Windows install
+  carries no lyrebird**: the installed copy cannot use obfs4 or Snowflake
+  bridges, and the install says so. Where Tor is blocked, run `tornect.exe` from
+  the unpacked folder, which keeps `pt\lyrebird.exe` beside it. `tornect
+  uninstall` is refused while a device has administrator access; run from the
+  installed copy, or from Apps and features, it leaves the folder to be removed
+  at the next restart.
+
+To upgrade, run `tornect uninstall`, then `./tornect install` from the new
+release's folder (on Windows, after the restart the uninstall may ask for).
+Without installing, `tornect://` links do not open Tornect: paste the invitation
+into the Connect field instead. Not yet tried at a real Linux desktop or on
+Windows.
 
 ## Start at logon
 
@@ -251,11 +436,11 @@ no window or terminal to show one.
   in a folder only you (or root) can change: `service install` refuses a
   `tornect` another account could replace (under `/tmp` or a shared folder, or
   owned by another account) and a path with `$`, quotes or backslashes. The
-  password dialog is polkit's `org.tornect.autostart` action, so
-  `packaging/polkit/org.tornect.policy` must be installed. Remove it with
-  `tornect service uninstall` (or by deleting the file). Whether GNOME or KDE
-  minimise the window, and whether the entry runs inside your login session, is
-  not yet checked.
+  password dialog is polkit's `org.tornect.autostart` action, so polkit's
+  policy file must be installed first ("The password dialog on Linux" above).
+  Remove it with `tornect service uninstall` (or by deleting the file). Whether
+  GNOME or KDE minimise the window, and whether the entry runs inside your login
+  session, is not yet checked.
 - **Windows:** a Task Scheduler task `\Tornect` that runs
   `tornect.exe --background` when you log on: Tornect's window, minimised. The
   password dialog is Windows' secure credential prompt: choose your password,
@@ -289,11 +474,32 @@ directory must be inside your user folder (`C:\Users\<you>`), and Tornect
 refuses one elsewhere: it does not yet give its directories permissions of their
 own, and anywhere else other accounts on the PC could read and change its keys.
 
+## What has been tried, and where
+
+Everything in this build has unit and in-process tests (`docs/VERIFICATION.md`
+in the source lists each one). What has run live:
+
+- **Linux** (one machine: Ubuntu 26.04, GNOME on Wayland, a virtual GPU, in
+  September 2026): Tor directly and through obfs4 and Snowflake bridges;
+  pairing, an attended session and `tornect panic` from the command line over
+  real Tor between two Tornect homes on that machine; the Wayland desktop's
+  picture over Tor at about 3 pictures a second, and its pointer injection at
+  the console; a pairing between two windows over Tor and the first-run grant.
+  **Not yet:** a whole session in the window with a person at the screen, keys
+  over Tor, polkit's dialog, `tornect install` and the start at sign-in at a
+  real desktop, a real X11 desktop, KDE, and everything added since September:
+  invitations and `tornect://` links in a browser, the quality presets over
+  Tor, switching screens, chat, clipboard and files, unattended access between
+  two machines, and direct connections between two machines, through real
+  routers, over IPv6 or through a VPN.
+- **Windows:** **nothing has run on a real Windows machine yet**, only under
+  Wine, which is not Windows (the program starts, `doctor` accepts the bundled
+  lyrebird, part of the tests pass). The window, capture and input, the
+  console behaviour, the control channel, the firewall prompt, the install in
+  Program Files, Task Scheduler and the secure credential prompt are untested.
+
 ## Known limitations of this build
 
-- Tested on one Linux machine (GNOME on Wayland) only. **Nothing has run on a
-  real Windows machine yet**: only under Wine, which is not Windows. The window
-  has not yet been used by a person for a whole session between two machines.
 - Unless the two computers can reach each other directly, everything travels
   over Tor: at most about 16 pictures a second, and a few a second for a large
   desktop. Either way, Tor takes from
@@ -301,12 +507,23 @@ own, and anywhere else other accounts on the PC could read and change its keys.
 - Direct connections across the internet are new in this build and have run
   only in simulation: not yet between two real homes, through real routers or
   carrier NATs, over IPv6, through a VPN, or on Windows.
+- The quality presets' sizes and rates are provisional until measured over
+  real Tor and real direct paths. Video is software H.264 only (no GPU
+  encoding), and there is no sound.
+- A Wayland host shares the one screen picked in its dialog (no Screens menu),
+  and no clipboard (`[services] wayland_clipboard`, off until checked on
+  GNOME).
+- Over Tor, files and clipboard text move at about 200 KB/s.
+- An unattended session has not yet been run between two machines over Tor
+  (only in tests), and polkit's password dialog has not yet been tried.
 - On GNOME, the "Tornect: sharing" window cannot stay above other windows
   (Wayland does not let it); GNOME shows its own screen-sharing icon.
 - The zips and the programs are not signed.
 - The Windows install (`tornect install`) carries no lyrebird: the copy in
   `C:\Program Files\Tornect` cannot use obfs4 or Snowflake bridges. Where Tor
   is blocked, run the unpacked copy.
+- No tray icon: closing the window stops Tornect (minimise it to stay
+  reachable). Tornect does not update itself.
 - For a bug report, run with `--log debug`: without it this build writes only
   warnings and errors. Fields that name someone stay redacted unless
   `--log-identifiers` is given.
