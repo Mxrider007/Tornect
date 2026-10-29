@@ -1126,7 +1126,7 @@ fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 ///    control character (the copy keeps the name and takes the path quoted);
 ///    then the `lyrebird.exe` beside it held open as the image is and
 ///    checked against `lyrebird_pin`, this build's pin
-///    ([`lyrebird_to_install`]): one that passes goes with the copy, held
+///    (`lyrebird_to_install`): one that passes goes with the copy, held
 ///    until the install ends, and without one (none there, a link, or not
 ///    the pin) the install goes on without it and [`Installed::lyrebird`]
 ///    says why;
@@ -1927,7 +1927,7 @@ mod linux {
         /// uninstall: [`Association`]), then remove the menu entry, the link
         /// entry, the executable and lyrebird: regular files only, anything
         /// else at those names left and reported; lyrebird only where its
-        /// `pt` is a folder of its own ([`Self::pt_is_own_folder`]: an
+        /// `pt` is a folder of its own (`pt_is_own_folder`: an
         /// `lstat` of `pt/lyrebird` follows a `pt` that is a link, so its
         /// target's file would go), else left and reported; then the `pt`
         /// folder, only where it is such a folder and now empty. Removing
