@@ -362,12 +362,16 @@ Critical or High issue; every Medium was fixed.
 - **The final audit before this release** (2026-10-28): two major and seven minor findings, fixed in `66c03834`,
   `81c17944`, `9a64b5f9`, `0a503bd1` and `5a507b1f`; the Windows half of F1/F4 was ruled W4 (decision M1-88 (2)):
   the install's one elevated copy carries the pinned `lyrebird.exe` beside `tornect.exe`.
-- **The final pass's security review** (2026-10-29): eight minor findings, fixed in `2ed94086`, `4f4f9d58`,
-  `e3edcd15`, `36ca36db`, `6aa3fc8b` and `ce17dee3`.
+- **The final pass's security review** (2026-10-29), of the final audit's fixes and the documentation up to
+  `9f321b31`: eight minor findings, fixed in `2ed94086`, `4f4f9d58`, `e3edcd15`, `36ca36db`, `6aa3fc8b` and
+  `ce17dee3`.
 
-**Not reviewed:** the final audit's fixes above, the final pass's fixes and the Windows install's lyrebird (W4),
-the documentation since them, the closing gate's fix of `tornect config show` (`800e64bf`), the fixes of the
-documentation findings of 2026-10-29 (polkit's policy file in the Linux zip and dist's glibc check, decision M1-89;
-three `config.toml` keys nothing read no longer written, decision M1-90; the refusal that names the policy file;
-the help text and the router line), and the commits between the last review and `@@COMMIT@@` that the owner's
-release run adds.
+**Not reviewed:** every commit after `9f321b31`, the last one the final pass's security review read. They are the
+fixes of the documentation findings of 2026-10-29 (`86996906`, polkit's policy file in the Linux zip, and
+`80b39b1e`, dist's glibc check, decision M1-89; `6c2b2606`, the refusal that names the policy file; `7ccea43a`,
+three `config.toml` keys nothing read no longer written, decision M1-90; `d780b1da`, the help text and the router
+line; `9e005a1e`, comments) and their documentation (`e104375a`, `686db830`, `2444aa47`, `937a971c`); the security
+review's fixes (`2ed94086`, `4f4f9d58`, `e3edcd15`, `36ca36db`, `6aa3fc8b`, `ce17dee3`); the Windows install's
+lyrebird, W4 (`780758c3`, `af39a319`), and its documentation (`1449d822`, `2371f154`); the closing gate's fix of two
+doc comments (`9a7c7580`) and the commit that wrote this list; and the commits between it and `@@COMMIT@@` that the
+owner's release run adds.
