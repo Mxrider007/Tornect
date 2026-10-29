@@ -716,7 +716,7 @@ pub struct ConnectOpts {
     /// The host's screen to show, asked for once the host lists its
     /// screens: a monitor's id, or [`ALL_MONITORS`]; `None` asks nothing.
     pub screen: Option<u8>,
-    /// Connect without asking, on this device's unattended grant.
+    /// Connect with the password of this device's unattended grant.
     pub unattended: Option<UnattendedOpts>,
     /// This session's policy is `tor_only` (design `direct` §3.5): its media
     /// is relayed through Tor whatever the settings say.

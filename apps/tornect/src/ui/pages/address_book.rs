@@ -601,7 +601,7 @@ fn admin_row(
     widgets::caps_label(ui, "Unattended access there");
     if !computer.unattended.worked_before {
         // Before a first success: the way to try it (Knock stays first).
-        if Button::new(Kind::Ghost, "Connect without asking")
+        if Button::new(Kind::Ghost, super::home::CONNECT_WITH_PASSWORD)
             .small()
             .enabled(ready)
             .show(ui)

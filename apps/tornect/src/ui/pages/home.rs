@@ -1454,7 +1454,7 @@ pub(super) fn host_actions(
 pub(super) const KNOCK_HOVER: &str = "Ask to connect: the person at that computer allows control \
      or view only (the first time, you both compare a 6-digit code)";
 
-/// What a saved computer's own Connect, and its "Connect without asking",
+/// What a saved computer's own Connect, and its "Connect with password",
 /// do on hover. Whether someone there is asked is the grant's ("Ask before
 /// starting", on by default for Helping someone), disclosed only in its
 /// signed accept: the words promise neither that nobody is asked nor that
@@ -1462,7 +1462,13 @@ pub(super) const KNOCK_HOVER: &str = "Ask to connect: the person at that compute
 pub(super) const CONNECT_HOVER: &str = "Connect with your password for that computer; depending \
      on its setting, someone there is asked first or can block it";
 
-/// [`host_actions`], saying whether to offer "Connect without asking" here.
+/// The ghost button that tries unattended access before it first worked
+/// (Home and the address book). Its name says what it does and nothing
+/// about the host: with "Ask before starting" on, someone there is asked
+/// ([`CONNECT_HOVER`]).
+pub(super) const CONNECT_WITH_PASSWORD: &str = "Connect with password";
+
+/// [`host_actions`], saying whether to offer "Connect with password" here.
 pub(super) fn host_actions_with(
     ui: &mut Ui,
     model: &Model,
@@ -1509,7 +1515,7 @@ pub(super) fn host_actions_with(
         }
         if ask
             && paired
-            && Button::new(Kind::Ghost, "Connect without asking")
+            && Button::new(Kind::Ghost, CONNECT_WITH_PASSWORD)
                 .small()
                 .enabled(ready && !blocked)
                 .show(ui)

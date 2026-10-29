@@ -303,9 +303,10 @@ enum Command {
             conflicts_with_all = ["pair_only", "no_video"]
         )]
         screen: Option<u8>,
-        /// Connect without asking: this device's unattended access at the host
-        /// (a paired host whose owner gave it). The password is asked on this
-        /// terminal, never taken from the command line or the environment; one
+        /// Connect with this device's unattended access at the host (a paired
+        /// host whose owner gave it) and its password; depending on that
+        /// access's setting, someone there is asked first or can block it. The
+        /// password is asked on this terminal, never taken from the command line or the environment; one
         /// attempt per run, never repeated. A password remembered with
         /// --remember is used without asking.
         #[arg(long, conflicts_with_all = ["pair_only", "forget"])]

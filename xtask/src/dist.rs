@@ -2161,8 +2161,9 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             "tornect id --invitation",
             "tornect install",
             "tornect uninstall",
-            // Unattended access, end to end (§B.8).
-            "Connect without asking",
+            // Unattended access, end to end (§B.8); the button's name since
+            // the security review of W4.
+            "Connect with password",
             "tornect unattended grant",
             "tornect connect --unattended",
             "emergency stop code",
@@ -2185,6 +2186,8 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             // install carried none.
             "pt\\lyrebird.exe",
             "carries no lyrebird",
+            // The button's name before the security review of W4.
+            "Connect without asking",
         ] {
             assert!(
                 !readme.contains(stale),

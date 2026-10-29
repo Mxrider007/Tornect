@@ -375,9 +375,11 @@ code** once: write it down and keep it away from this computer. Given from
 another of your devices, it turns unattended access off here and removes every
 grant.
 
-From the other device, press **Connect without asking** on that computer's card
+From the other device, press **Connect with password** on that computer's card
 on Home and type the password; once that has worked, the card's **Connect** does
-it, and **Knock** asks for an ordinary session. On Linux, `tornect connect
+it, and **Knock** asks for an ordinary session. Depending on the access's
+setting ("Ask before starting", on for Helping someone), someone there is asked
+first or can block the session. On Linux, `tornect connect
 --unattended <ID>` does the same from a terminal, without a picture; on Windows
 that command works only with a password remembered in the window. An unattended
 session shows the sharing banner and the "Tornect: sharing" window like any

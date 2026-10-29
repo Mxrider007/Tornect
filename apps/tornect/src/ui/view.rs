@@ -866,7 +866,7 @@ fn password_prompt(
             }
             let ua = &mut form.ua;
             let heading = match prompt.admin {
-                None => format!("Connect to \"{}\" without asking", prompt.host),
+                None => format!("Connect to \"{}\" with your password", prompt.host),
                 Some(action) => format!("{}: \"{}\"", action.title(), prompt.host),
             };
             ui.add(

@@ -1485,10 +1485,7 @@ mod tests {
             let (at, disabled) = knock(&window);
             let connect = window.center("Connect");
             assert!(disabled, "{case}");
-            assert!(
-                window.node("Connect without asking").is_disabled(),
-                "{case}"
-            );
+            assert!(window.node("Connect with password").is_disabled(), "{case}");
             assert!(window.node("Connect").is_disabled(), "{case}");
             for at in [at, connect] {
                 assert!(window.click(at).is_empty(), "{case}");
@@ -1796,13 +1793,23 @@ mod tests {
             window
                 .ctx
                 .all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
-            let ask = window.center("Connect without asking");
+            let ask = window.center("Connect with password");
             assert_eq!(hovered(&mut window, ask), (false, true), "{page:?}");
+            // The security review of W4: the button's name no longer says
+            // that nobody there is asked, which "Ask before starting" can
+            // make false.
+            assert!(
+                !window
+                    .nodes
+                    .iter()
+                    .any(|n| n.label().is_some_and(|l| l.contains("without asking"))),
+                "{page:?}"
+            );
         }
         let mut window = Window::new(fresh, Page::AddressBook, egui::Theme::Dark, TALL);
         let knock = window.center("Knock");
         assert_eq!(window.click(knock), vec![Action::Connect(id)]);
-        let ask = window.center("Connect without asking");
+        let ask = window.center("Connect with password");
         assert_eq!(window.click(ask), vec![Action::AskPassword(id)]);
         assert!(
             !window
@@ -1871,7 +1878,14 @@ mod tests {
             "If \"Office PC\" lets your access use administrator access through Tornect, \
              the password is not remembered."
         ));
-        assert!(has_text(&window, "Connect to \"Office PC\" without asking"));
+        assert!(has_text(
+            &window,
+            "Connect to \"Office PC\" with your password"
+        ));
+        assert!(!has_text(
+            &window,
+            "Connect to \"Office PC\" without asking"
+        ));
         assert!(!window.form.ua.remember, "off by default");
 
         let mut none = model.clone();
