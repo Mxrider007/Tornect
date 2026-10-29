@@ -1,6 +1,6 @@
 [package]
 name = "tornect"
-description = "Tornect — remote desktop that finds and checks the other computer over Tor, then connects directly when it can: no servers, no accounts, no port forwarding"
+description = "Tornect — remote desktop that finds and checks the other computer over Tor, then connects directly when it can: no server of its own, no accounts, nothing to set up on the router"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

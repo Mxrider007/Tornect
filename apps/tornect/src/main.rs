@@ -258,8 +258,10 @@ enum Command {
     /// Connect to a host by Tornect ID (found and checked over Tor): pair with
     /// it if it is new (both screens show a code to compare), then ask for a
     /// session its user must accept, and receive the shared screen, directly
-    /// when the two computers can reach each other and over Tor otherwise (the
-    /// `ROUTE` line says which). Keep the session alive until Ctrl-C.
+    /// when the two computers can reach each other and over Tor otherwise, as
+    /// the configuration allows: with `lan_only` set, a session that cannot
+    /// connect directly ends instead (the `ROUTE` line says which). Keep the
+    /// session alive until Ctrl-C.
     ///
     /// This command shows no picture: it decodes and counts the pictures (the
     /// window, `tornect` without a subcommand, shows them). Uses this
@@ -1672,11 +1674,21 @@ mod tests {
         assert!(
             help.contains(
                 "Tornect — remote desktop that finds and checks the other computer over Tor, \
-                 then connects directly when it can: no servers, no accounts, no port forwarding"
+                 then connects directly when it can: no server of its own, no accounts, nothing \
+                 to set up on the router"
             ),
             "{help}"
         );
-        for stale in ["QUIC", "game streaming", "Milestone"] {
+        // The documentation pass's security review: with the defaults, the
+        // direct path asks a public STUN server and the router (UPnP,
+        // NAT-PMP, PCP opens a port), so neither claim may stand.
+        for stale in [
+            "QUIC",
+            "game streaming",
+            "Milestone",
+            "no servers,",
+            "no port forwarding",
+        ] {
             assert!(!help.contains(stale), "`{stale}` in:\n{help}");
         }
         let connect = super::Cli::command()
@@ -1688,7 +1700,9 @@ mod tests {
         assert!(!connect.contains("no viewer window"), "{connect}");
         assert!(
             connect.contains(
-                "directly when the two computers can reach each other and over Tor otherwise"
+                "directly when the two computers can reach each other and over Tor otherwise, as \
+                 the configuration allows: with `lan_only` set, a session that cannot connect \
+                 directly ends instead (the `ROUTE` line says which)"
             ),
             "{connect}"
         );

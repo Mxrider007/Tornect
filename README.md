@@ -1,7 +1,8 @@
 # Tornect
 
 **Remote desktop like AnyDesk, without servers.** See and control another computer, or let
-someone help you on yours, with no account, no server to run or trust and no port forwarding.
+someone help you on yours, with no account, no server to run or trust and nothing to set up on
+the router.
 
 Each computer's Tornect ID is its Tor onion address, which is also its public key. **Tor finds
 the other computer and checks that it is the one you paired with.** Once the person there

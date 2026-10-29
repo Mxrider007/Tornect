@@ -21,9 +21,9 @@ telemetry. Read `README-release.md` in the zip first.
 
 Tornect lets you see and control another computer, like AnyDesk, without any server of its own. A computer's
 Tornect ID is its Tor onion v3 address (Arti, embedded in the program): **Tor finds the other computer and checks
-that it is the one you paired with**, so there is no account, no server to trust and no port forwarding. After
-the other side accepts, **the two computers connect directly when they can reach each other** (QUIC with both
-keys pinned, on the same local network or across the internet), and otherwise the session stays on Tor.
+that it is the one you paired with**, so there is no account, no server to trust and nothing to set up on the
+router. After the other side accepts, **the two computers connect directly when they can reach each other** (QUIC
+with both keys pinned, on the same local network or across the internet), and otherwise the session stays on Tor.
 
 - **Pairing** shows the same 6-digit code on both screens; the two people compare it. The sharing side then
   answers each session with **Deny**, **View only** or **Allow control**, and nothing is captured before that

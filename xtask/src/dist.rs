@@ -2027,6 +2027,33 @@ tornect v0.1.0 (/w/apps/tornect) (*)
         }
     }
 
+    /// The documentation pass's security review: with direct connections
+    /// over the internet on, the defaults ask a public STUN server and the
+    /// router (UPnP, NAT-PMP or PCP opens a port), so the front page, the
+    /// zipped README and this pre-release's notes do not say "no port
+    /// forwarding" (the slice.1 notes, of a build whose sessions all went
+    /// over Tor, keep it).
+    #[test]
+    fn the_documents_of_this_build_do_not_claim_no_port_forwarding() {
+        let root = crate::workspace_root().unwrap();
+        let direct = fs::read_to_string(root.join("crates/tornect-session/src/direct.rs")).unwrap();
+        if !direct.contains("pub const INTERNET_DIRECT: bool = true;") {
+            return;
+        }
+        for name in [
+            "README.md",
+            README,
+            "packaging/release/NOTES-v0.1.0-slice.2.md",
+        ] {
+            let text = fs::read_to_string(root.join(name)).unwrap();
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !text.contains("no port forwarding"),
+                "{name} says `no port forwarding`"
+            );
+        }
+    }
+
     /// The text of `const NAME: &str = "…";` in Rust source: the literal
     /// with its line continuations (a backslash, the line break and the
     /// next line's leading white space) removed and `\"` read as `"`.
