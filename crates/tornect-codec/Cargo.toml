@@ -18,7 +18,8 @@ proptest.workspace = true
 
 [features]
 default = []
-# FFmpeg libavcodec hw contexts (NVENC/AMF/QSV/VAAPI/VideoToolbox); needs libav* dev headers + libclang (CI-verified)
+# Reserved and empty: no code behind it yet. Hardware codecs go through the OS codec APIs
+# instead of FFmpeg (decision M1-56).
 ffmpeg = []
 
 [lints]

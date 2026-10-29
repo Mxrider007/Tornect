@@ -13,7 +13,7 @@ tornect-core.workspace = true
 
 [features]
 default = []
-# Playback/capture via cpal (Linux needs libasound2-dev; CI-verified)
+# Reserved and empty: no code behind it yet (audio is M5).
 cpal = []
 
 [lints]

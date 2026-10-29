@@ -21,7 +21,8 @@ cannot, the session stays on Tor: slower, but it connects. Linux and Windows.
 - **Pairing by comparing a code:** the first connection shows the same 6-digit code on both
   screens, and each side keeps the other's key from then on.
 - **Always visible, always stoppable:** a banner and a small "Tornect: sharing" window with Stop
-  while your screen is shared, the panic key (Ctrl+Alt+End) and `tornect panic`.
+  while your screen is shared, `tornect panic`, and the panic key (Ctrl+Alt+End) where the desktop
+  lets Tornect bind it (Windows; Linux through the desktop's global-shortcuts portal).
 - **Easy to share:** Copy invitation, a QR code and `tornect://` links; a link fills the Connect
   field and never connects by itself.
 - **Direct connections:** on the same network or across the internet (STUN, UPnP/NAT-PMP/PCP,
@@ -39,7 +40,8 @@ cannot, the session stays on Tor: slower, but it connects. Linux and Windows.
   your own private bridge lines.
 - **A new ID when you want one:** Rotate ID makes a new Tornect ID; every pairing and unattended
   grant ends with the old one.
-- **Optional install and start at sign-in**, and a command line for everything.
+- **Optional install and start at sign-in**, and a command line that hosts, connects (without a
+  picture) and sets Tornect up.
 - **No telemetry.** Every pairing and session is written to a log on your own computer only.
 
 ## Quick start
@@ -58,8 +60,9 @@ cannot, the session stays on Tor: slower, but it connects. Linux and Windows.
 6. **The session question:** the other side chooses Deny, View only or Allow control. The picture
    opens in its own window; End session there, or Stop on the shared side, ends it.
 
-`README-release.md` in the zip covers the rest: the Wayland screen-sharing grant, the Windows
-console, unattended access, installing, start at sign-in and the command line.
+`README-release.md` in the zip covers the rest: the Wayland screen-sharing grant, polkit's policy
+file (in the Linux zip) for the password dialog on Linux, the Windows command line (`start
+/wait`), unattended access, installing, start at sign-in and the command line.
 
 ## Platforms and limits
 
@@ -127,9 +130,10 @@ Host                          Tor network                       Viewer
 - **Identity:** the onion v3 address is the host's ed25519 key. Each device has its own key,
   pinned at pairing. No certificate authorities, no registry.
 - **Consent:** a question on the host precedes every attended session, nothing is captured
-  before it, and the sharing banner, the "Tornect: sharing" window and the panic key show and
-  stop every session. Unattended access is opt-in per device and protected by a password the
-  host never stores (augmented PAKE).
+  before it, the sharing banner and the "Tornect: sharing" window show every session with Stop,
+  and `tornect panic` and the panic key (where the desktop lets Tornect bind it) end them all.
+  Unattended access is opt-in per device and protected by a password the host never stores
+  (augmented PAKE).
 - **Media:** software H.264 (OpenH264) with host-side scaling and three quality presets.
   Hardware encoding, audio and gaming mode are on the roadmap.
 
@@ -150,9 +154,10 @@ channel with zero infrastructure of your own.
 
 ## Building from source
 
-Requirements: Rust stable ≥ 1.90 (edition 2024), a C/C++ compiler, `cmake`,
-`pkg-config`. The default feature set is pure Rust plus vendored C sources and
-builds without any system media libraries.
+Requirements: Rust 1.95 or newer (edition 2024; `rust-toolchain.toml` pins 1.96.0, which rustup
+selects in this directory), a C/C++ compiler, `cmake`, `pkg-config`. The default feature set is
+pure Rust plus vendored C sources and builds without any system media libraries. `nasm` is
+optional for a plain build, where OpenH264 falls back to C++, and required by `cargo xtask dist`.
 
 ```bash
 git clone https://github.com/Mxrider007/Tornect.git
@@ -163,16 +168,14 @@ cargo run -p tornect -- doctor    # environment report
 cargo xtask verify                # fmt + clippy + tests + docs
 ```
 
-Optional backends (feature flags, see each crate's `Cargo.toml`):
+The default build is the whole program: there are no optional backends to turn on yet. On Linux
+the Wayland capture is part of it: at run time it loads the system's `libpipewire-0.3.so.0` (with
+xdg-desktop-portal) and needs no development headers. Hardware video encoding (through the
+operating system's codec APIs on Windows, decision M1-56) and audio (M5) are planned; the feature
+flags `tornect-codec/ffmpeg` and `tornect-audio/cpal` are reserved and empty, so they need no
+packages.
 
-| Feature | Needs (Debian/Ubuntu package names) |
-|---|---|
-| `tornect-codec/ffmpeg` (hardware codecs) | `libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libswscale-dev libclang-dev` |
-| `tornect-capture/pipewire` (Wayland capture) | `libpipewire-0.3-dev libspa-0.2-dev libclang-dev` |
-| `tornect-audio/cpal` (audio playback) | `libasound2-dev` |
-
-State lives in `~/.config/tornect` + `~/.local/share/tornect` (Linux),
-`~/Library/Application Support/Tornect` (macOS), `%APPDATA%\Tornect` +
+State lives in `~/.config/tornect` + `~/.local/share/tornect` (Linux) and `%APPDATA%\Tornect` +
 `%LOCALAPPDATA%\Tornect` (Windows). Set `TORNECT_HOME=<dir>` to keep everything in
 one directory — handy for running a host and a client on the same machine.
 Release zips are made with `cargo xtask dist` ([`docs/RELEASING.md`](docs/RELEASING.md)).
@@ -191,23 +194,25 @@ Release zips are made with `cargo xtask dist` ([`docs/RELEASING.md`](docs/RELEAS
 | M7 | Resilience & performance hardening (netem suite, ABR tuning, HDR) | |
 | M8 | Product polish, unattended-access UI, packaging, v0.1 release | |
 
-The vertical slice built parts of M3–M5 (capture, software video, the window, input, chat,
-clipboard text and files) ahead of the milestones, so that two machines hold a real session
-first; only `m0` is tagged so far.
+The vertical slice and the features after it built parts of M3–M5 ahead of their milestones
+(capture, software video and its quality presets, the window, input, switching screens, chat,
+clipboard text and files), so that two machines hold a real session first; only `m0` is tagged so
+far.
 
 ## Development
 
-`CLAUDE.md` holds the project's development instructions (the rules, the commands and the
-security invariants), and `.claude/` the helper definitions and workflow commands that go with
-them (`/milestone <n>`, `/verify`, `/research <topic>`); `docs/notes/` keeps the hand-off notes.
-Enable the pre-commit gate once per clone:
+[`docs/PLAN.md`](docs/PLAN.md) is the single source of truth: the research, the architecture, the
+protocol and the milestones. [`docs/VERIFICATION.md`](docs/VERIFICATION.md) is the acceptance
+ledger: each item there is verified (naming the tests or the live run that showed it), waiting for
+a device (with the exact recipe to run on it) or open. Decisions are recorded in
+[`docs/notes/decisions.md`](docs/notes/decisions.md), and `docs/notes/` keeps each milestone's
+hand-off notes. Every change passes `cargo xtask verify` before it is committed (formatting,
+clippy with warnings as errors, the tests, the docs and the dependency check). Enable the
+pre-commit gate (formatting and clippy) once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
-
-Recommended permissions and hooks for the development tools are in
-`.claude/settings.recommended.json` (copy to `.claude/settings.json` after review).
 
 ## License
 

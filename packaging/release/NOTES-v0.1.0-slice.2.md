@@ -29,8 +29,9 @@ keys pinned, on the same local network or across the internet), and otherwise th
 - **Pairing** shows the same 6-digit code on both screens; the two people compare it. The sharing side then
   answers each session with **Deny**, **View only** or **Allow control**, and nothing is captured before that
   answer.
-- **While a screen is shared**, a banner and a small "Tornect: sharing" window show it, each with Stop; the panic
-  key (Ctrl+Alt+End) and `tornect panic` end every session.
+- **While a screen is shared**, a banner and a small "Tornect: sharing" window show it, each with Stop;
+  `tornect panic` ends every session, and so does the panic key (Ctrl+Alt+End) where the desktop lets Tornect
+  bind it (Windows; Linux through the desktop's global-shortcuts portal; neither yet tried on a real desktop).
 - **Invitations:** Copy invitation, a QR code and `tornect://` links; a link fills the Connect field and never
   connects by itself.
 - **Direct connections** on the same network or across the internet (STUN, UPnP/NAT-PMP/PCP, UDP hole punching),
@@ -45,8 +46,8 @@ keys pinned, on the same local network or across the internet), and otherwise th
   whose SHA-256 it has compiled in.
 - **Rotate ID** (Settings › Security, or `tornect rotate-id`) makes a new Tornect ID, ending every pairing and
   unattended grant.
-- **The command line** does everything the window does, and `tornect install`, `service install` and the
-  `unattended` commands set Tornect up.
+- **The command line** hosts and connects (without a picture, and its host offers no chat, clipboard or files),
+  and `tornect install`, `service install` and the `unattended` commands set Tornect up.
 
 ## What is new since slice.1
 
@@ -68,7 +69,7 @@ a row and a recipe in `docs/VERIFICATION.md`.
 | Unattended access end to end (M-FEAT-4, M-FEAT-5, M-UI-5) | the grant wizard in Settings › Security, the window's Connect without asking, `tornect connect --unattended` (Linux), passwords remembered in the system keychain, the emergency stop code | VERIFIED (unit, and the real host over a pipe); a live unattended session over Tor is OPEN; polkit's dialog and Windows' secure prompt NEEDS-DEVICE |
 | The Windows control channel (M-FEAT-5, `53efbaf1`) | `tornect panic` and the `unattended` commands reach a Windows host through a named pipe only this account can open | VERIFIED (unit) for the rules that need no Windows, type-checked for Windows; NEEDS-DEVICE(windows) |
 | A Windows window without a console (`da36aba9`) | double-clicking opens no console; command-line runs use `start /wait` | type-checked only; NEEDS-DEVICE(windows) |
-| Install, uninstall and start at sign-in (M-FEAT-6, M1-58, M1-69, M1-88) | `tornect install` into `~/.local/bin` (with the pinned lyrebird) or `C:\Program Files\Tornect`; the start at sign-in runs the window in the background | VERIFIED (unit); NEEDS-DEVICE(linux-desktop) with polkit's policy file, NEEDS-DEVICE(windows). The Windows install carries no lyrebird (OPEN, decision M1-88) |
+| Install, uninstall and start at sign-in (M-FEAT-6, M1-58, M1-69, M1-88, M1-89) | `tornect install` into `~/.local/bin` (with the pinned lyrebird) or `C:\Program Files\Tornect`; the start at sign-in runs the window in the background; the Linux zip carries polkit's policy file (`polkit/org.tornect.policy`) | VERIFIED (unit); NEEDS-DEVICE(linux-desktop) with polkit's policy file, NEEDS-DEVICE(windows). The Windows install carries no lyrebird (OPEN, decision M1-88) |
 | The code audit of 2026-10-22 (findings B01 to B32) and the final audit before this release (F1 to F9) | each fixed with a test that fails without it, except the open items under *Known limitations* | VERIFIED (unit); the Windows and desktop halves NEEDS-DEVICE as their rows say |
 | Logs | a release build writes warnings and errors only; `--log debug` for a bug report | VERIFIED (unit); a release binary NEEDS-DEVICE(the build VM) |
 
@@ -124,7 +125,8 @@ over the real Tor network; no second machine was used.
   Debian 13 do not, and there the program stops at once with `version 'GLIBC_2.43' not found`. The window needs
   a Vulkan or OpenGL driver. To share the desktop: a Wayland session with xdg-desktop-portal 1.17 or newer and
   PipeWire (GNOME is the tested one), or an X11 session. Changes that widen access need polkit's policy file,
-  which is not in the zip (the zipped README's "The password dialog on Linux").
+  `polkit/org.tornect.policy` in the Linux zip, installed once as root (the zipped README's "The password
+  dialog on Linux").
 - **Windows:** Windows 10 (20H1 or later) or 11, 64-bit (x64).
 
 **How the glibc floor was measured.** A Linux executable needs the newest symbol version it was linked against,
@@ -138,8 +140,9 @@ owner's `dist` run on the build VM decides it. Its `BUILD-INFO.txt` says, for th
 
     @@NEWEST_VERSIONS_LINUX@@
 
-<!-- Copy BUILD-INFO.txt's "newest versions" line of the Linux zip here. If its GLIBC_ is not 2.43, change the
-     Requirements above, the zipped README's Linux section and README.md's platform table to match. -->
+<!-- Copy BUILD-INFO.txt's "newest versions" line of the Linux zip here. dist refuses a Linux build whose GLIBC_
+     differs from the floor the zipped README and README.md state (decision M1-89); the Requirements above
+     must state that same floor, with distributions that have it. -->
 
 ## Files and checks
 
@@ -205,9 +208,9 @@ ends it at once, without one. `start /wait tornect.exe panic` in a second consol
 host's named pipe (none of this yet tried on Windows).
 
 **Linux: polkit's policy file.** `tornect install`, `service install`, `unattended on`, `grant` and the other
-changes that widen access are refused until `packaging/polkit/org.tornect.policy`, taken from the source at the
-commit `BUILD-INFO.txt` names, is installed into `/usr/share/polkit-1/actions/` (the zipped README gives the two
-commands).
+changes that widen access are refused until the zip's `polkit/org.tornect.policy` is installed once as root,
+from the unpacked folder: `sudo install -m 0644 polkit/org.tornect.policy /usr/share/polkit-1/actions/`, then
+`sudo systemctl restart polkit`.
 
 ## Known limitations
 
@@ -362,5 +365,7 @@ Critical or High issue; every Medium was fixed.
   `81c17944`, `9a64b5f9`, `0a503bd1` and `5a507b1f`, except the Windows half of F1/F4 (decision M1-88, open).
 
 **Not reviewed:** the final audit's fixes above, the documentation since them, the closing gate's fix of
-`tornect config show` (`800e64bf`), and the commits between the last review and `@@COMMIT@@` that the owner's
-release run adds.
+`tornect config show` (`800e64bf`), the fixes of the documentation findings of 2026-10-29 (polkit's policy file
+in the Linux zip and dist's glibc check, decision M1-89; three `config.toml` keys nothing read no longer written,
+decision M1-90; the refusal that names the policy file; the help text and the router line), and the commits
+between the last review and `@@COMMIT@@` that the owner's release run adds.

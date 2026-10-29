@@ -155,7 +155,8 @@ there answers), and **Check if reachable** asks whether it answers.
 **Quality** (Best quality, Balanced, Best performance; Settings › Display and
 quality sets the default), **Screens** where the other computer has several and
 shares them (Windows and X11), **Chat**, **Files**, the **Clipboard** switch,
-Pause my input, Save a screenshot, Fullscreen and **End session**. Closing that
+**Send keys** (key combinations, in a control session), Pause my input, Save a
+screenshot, Fullscreen and **End session**. Closing that
 window ends the session too. The window says whether the picture comes
 directly (local network or internet) or is relayed through Tor.
 
@@ -219,8 +220,8 @@ offers none of these: its sessions carry the picture and input only.
 
 ## The command line
 
-The command line does the same as the window, one role per terminal (on
-Windows, `start /wait tornect.exe …` as above):
+The command line can host and connect too, one role per terminal (on Windows,
+`start /wait tornect.exe …` as above):
 
     ./tornect host              # share this desktop; answer pairing and session questions here
     ./tornect connect <ID>      # connect to a host; compare the code, then wait for its answer
@@ -481,7 +482,7 @@ no window or terminal to show one.
   Tornect's own confirmation (a copy not under `C:\Program Files` offers View
   only there). A `--home` or `TORNECT_HOME` directory is refused on Windows.
   Close a running Tornect (or press Ctrl-C in the console of a
-  `tornect.exe host`) before `tornect service uninstall`; `schtasks /Delete /TN
+  `start /wait tornect.exe host`) before `tornect service uninstall`; `schtasks /Delete /TN
   Tornect /F` also removes it. Not yet tried on Windows.
 
 ## Where Tornect keeps its state
