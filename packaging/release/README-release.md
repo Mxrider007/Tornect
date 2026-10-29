@@ -22,6 +22,7 @@ and where" below).
 | `tornect` (`tornect.exe` on Windows) | the program: the window, and the command line |
 | `pt/lyrebird` (`pt/lyrebird.exe`) | lyrebird 0.8.1, the Tor Project's pluggable transport for obfs4 and Snowflake bridges, unmodified from Tor Browser 15.0.23 |
 | `pt/lyrebird.txt` | lyrebird's licences |
+| `polkit/org.tornect.policy` (Linux only) | polkit's policy file, which the password dialog on Linux needs ("The password dialog on Linux" below) |
 | `LICENSE` | Tornect's licence, GPL-3.0-or-later |
 | `THIRD_PARTY_NOTICES.md` | what else Tornect's own source contains, and under which licences |
 | `THIRD_PARTY_LICENSES.txt` | every third-party part built into the program (each crate with its version and licence, the C libraries, the fonts, the Rust standard library) and their licence texts |
@@ -73,13 +74,10 @@ your password through polkit: `tornect install` and `uninstall`, `service
 install` and `uninstall`, unattended access (`unattended on`, `grant`,
 `set-password`, `enable`, `resume`, `unlock`, and the window's Unattended access
 section, including the acknowledgement of its banner) and `backup export` and
-`import`. polkit needs Tornect's policy file, which is **not in this zip**. Take
-`packaging/polkit/org.tornect.policy` from https://github.com/Mxrider007/Tornect
-at the commit that `BUILD-INFO.txt` names
-(`https://raw.githubusercontent.com/Mxrider007/Tornect/<commit>/packaging/polkit/org.tornect.policy`),
-and install it once as root:
+`import`. polkit needs Tornect's policy file, `polkit/org.tornect.policy` in
+this zip. Install it once as root, from the unpacked folder:
 
-    sudo install -m 0644 org.tornect.policy /usr/share/polkit-1/actions/org.tornect.policy
+    sudo install -m 0644 polkit/org.tornect.policy /usr/share/polkit-1/actions/
     sudo systemctl restart polkit
 
 Until it is installed, those changes are refused with "polkit action

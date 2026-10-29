@@ -8,11 +8,13 @@
   (docs/PLAN.md §B.8.6.2, §B.8.7.4, §B.8.8).
 
   Install to /usr/share/polkit-1/actions/org.tornect.policy (root-owned; there
-  is no user-writable action directory) and restart polkit:
+  is no user-writable action directory) and restart polkit. The Linux release
+  zip carries this file as polkit/org.tornect.policy; from the unpacked zip:
 
-      sudo install -m 0644 packaging/polkit/org.tornect.policy \
-           /usr/share/polkit-1/actions/org.tornect.policy
+      sudo install -m 0644 polkit/org.tornect.policy /usr/share/polkit-1/actions/
       sudo systemctl restart polkit
+
+  From the source tree, the same with packaging/polkit/org.tornect.policy.
 
   Until it is installed, `tornect` refuses every access-increasing operation
   with "polkit action ... is not registered" — fail-closed and loud, never a

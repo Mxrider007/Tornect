@@ -30,6 +30,12 @@ use crate::{licences, pt, sha256};
 /// Everything dist writes lives under this directory of the workspace.
 const OUT: &str = "target/dist";
 const README: &str = "packaging/release/README-release.md";
+/// polkit's actions for the Linux re-authentication (§B.8.8): every change
+/// that widens access is refused until root installs this file, so the
+/// Linux zip carries it (decision M1-89).
+const POLKIT_POLICY: &str = "packaging/polkit/org.tornect.policy";
+/// Where the Linux zip holds [`POLKIT_POLICY`].
+const POLKIT_IN_ZIP: &str = "polkit/org.tornect.policy";
 
 /// llvm-mingw as pinned in `docs/DEPENDENCIES.md` and `docs/research/slice.md` §1.
 const LLVM_MINGW_RELEASE: &str = "20260908";
@@ -691,6 +697,11 @@ fn package(
         None,
     )?;
     if !platform.is_windows() {
+        let policy = dir.join(POLKIT_IN_ZIP);
+        if let Some(parent) = policy.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        place(&root.join(POLKIT_POLICY), &policy, 0o644, None)?;
         let said = capture(Command::new(dir.join(platform.exe)).arg("--version"))?;
         ensure!(
             said == format!("tornect {version}"),
@@ -750,7 +761,7 @@ fn package(
 
 /// The files a zip holds besides BUILD-INFO.txt, which lists their hashes.
 fn zip_files(platform: Platform) -> Vec<String> {
-    vec![
+    let mut files = vec![
         platform.exe.to_owned(),
         format!("pt/{}", platform.bundle.file_name()),
         "pt/lyrebird.txt".to_owned(),
@@ -758,7 +769,11 @@ fn zip_files(platform: Platform) -> Vec<String> {
         "THIRD_PARTY_NOTICES.md".to_owned(),
         licences::FILE.to_owned(),
         "README-release.md".to_owned(),
-    ]
+    ];
+    if !platform.is_windows() {
+        files.push(POLKIT_IN_ZIP.to_owned());
+    }
+    files
 }
 
 /// THIRD_PARTY_LICENSES.txt for the platform, into the staging tree; what it
@@ -1602,6 +1617,28 @@ tornect v0.1.0 (/w/apps/tornect) (*)
         }
     }
 
+    /// Decision M1-89: the Linux zip carries polkit's policy file, without
+    /// which every change that widens access is refused there; the Windows
+    /// zip, whose re-authentication is Windows' own prompt, does not.
+    #[test]
+    fn the_linux_zip_alone_carries_the_polkit_policy() {
+        assert!(
+            zip_files(LINUX).iter().any(|f| f == POLKIT_IN_ZIP),
+            "the Linux zip lacks {POLKIT_IN_ZIP}"
+        );
+        assert!(
+            !zip_files(WINDOWS).iter().any(|f| f.contains("polkit")),
+            "the Windows zip carries a polkit file"
+        );
+        let root = crate::workspace_root().unwrap();
+        let policy = fs::read_to_string(root.join(POLKIT_POLICY)).unwrap();
+        assert!(
+            policy.contains("<action id=\"org.tornect.autostart\">"),
+            "{POLKIT_POLICY} is not Tornect's policy"
+        );
+        assert!(POLKIT_POLICY.ends_with(POLKIT_IN_ZIP));
+    }
+
     /// The README a zip carries says how to run what the zip holds.
     #[test]
     fn the_release_readme_names_what_the_zip_holds() {
@@ -1622,10 +1659,9 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             // Slice-F F2-1: what the Linux start-at-login host does.
             "the host answers pings only and refuses every session, because it has no window \
              or terminal to show one",
-            // polkit's policy file, which the zip does not carry (the final audit).
-            "org.tornect.policy",
-            "not in this zip",
-            "/usr/share/polkit-1/actions",
+            // polkit's policy file, in the Linux zip (decision M1-89).
+            "| `polkit/org.tornect.policy` (Linux only) |",
+            "sudo install -m 0644 polkit/org.tornect.policy /usr/share/polkit-1/actions/",
             "systemctl restart polkit",
             // A window-subsystem `tornect.exe` and its named pipe (the final audit).
             "start /wait tornect.exe host",
@@ -1650,6 +1686,9 @@ tornect v0.1.0 (/w/apps/tornect) (*)
         for stale in [
             "`tornect.exe` is a console program",
             "cannot reach a running Windows host",
+            // Before decision M1-89 the policy came from the source tree.
+            "not in this zip",
+            "packaging/polkit/",
         ] {
             assert!(
                 !readme.contains(stale),
