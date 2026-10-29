@@ -1898,11 +1898,13 @@ mod linux {
         /// Whether anything [`Self::install`] writes is at its name (an
         /// association left alone in `mimeapps.list` is not: GIO skips an
         /// entry that is not there; nor is a lyrebird in a `pt` that is not a
-        /// folder of its own, which the install never writes into).
+        /// folder of its own by `pt_is_own_folder`, a link or a folder that
+        /// fails the location rule, which the install never writes into and
+        /// the uninstall leaves).
         #[must_use]
         pub fn installed(&self) -> bool {
             let mut names = vec![self.menu_entry(), self.link_entry(), self.exe()];
-            if std::fs::symlink_metadata(self.pt_dir()).is_ok_and(|m| m.is_dir()) {
+            if matches!(self.pt_is_own_folder(), Ok(Some(true))) {
                 names.push(self.lyrebird());
             }
             names.iter().any(|p| std::fs::symlink_metadata(p).is_ok())
@@ -3081,6 +3083,14 @@ mod linux {
                 }
                 Ok(facts)
             });
+            // The security review of W4: `installed` counts lyrebird by the
+            // same rule as the uninstall, so a lyrebird it would leave does
+            // not make Tornect look installed.
+            assert!(
+                !shared.installed(),
+                "a lyrebird in a pt that fails the location rule is not ours"
+            );
+            assert!(install.installed(), "the same pt, passing the rule");
             let removal = shared.uninstall().unwrap();
             assert_eq!(removal.left_in_folder, [install.lyrebird()]);
             assert_eq!(std::fs::read(install.lyrebird()).unwrap(), LYREBIRD);
