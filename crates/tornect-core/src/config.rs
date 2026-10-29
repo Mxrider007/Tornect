@@ -93,14 +93,18 @@ pub struct Config {
     pub services: Services,
 }
 
-/// Naming and startup.
+/// Naming and the window's look.
+///
+/// A file that still holds the retired `autostart` key loads, and the key
+/// is ignored and no longer written (decision M1-90): starting at sign-in
+/// widens access, so only `tornect service install` or the window's setting
+/// makes that change, behind OS re-authentication (§B.8.6.2, §B.8.7.5),
+/// never a line of this file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
     /// Name shown to peers in consent popups and device lists.
     pub device_name: String,
-    /// Start the host service at login (needed for unattended access).
-    pub autostart: bool,
     /// The window's colours (the settings page's General section).
     pub theme: Theme,
     /// The window has shown its one-time notice that direct connections
@@ -449,15 +453,16 @@ pub struct Media {
 }
 
 /// Host-side safety controls.
+///
+/// A file that still holds the retired `view_only_default` or `crash_dumps`
+/// keys loads, and they are ignored and no longer written (decision M1-90):
+/// nothing ever read them. The host's question offers each answer it may,
+/// and Tornect writes no crash dumps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Security {
     /// Panic disconnect hotkey on the host.
     pub panic_key: String,
-    /// New sessions default to view-only unless the popup grants control.
-    pub view_only_default: bool,
-    /// Write crash dumps locally (never uploaded).
-    pub crash_dumps: bool,
 }
 
 impl Default for Config {
@@ -494,7 +499,6 @@ impl Default for General {
     fn default() -> Self {
         Self {
             device_name: default_device_name(),
-            autostart: false,
             theme: Theme::Dark,
             direct_notice_seen: false,
         }
@@ -584,8 +588,6 @@ impl Default for Security {
     fn default() -> Self {
         Self {
             panic_key: "Ctrl+Alt+End".to_owned(),
-            view_only_default: false,
-            crash_dumps: false,
         }
     }
 }
@@ -869,6 +871,32 @@ future_key = "ignored"
         assert!(text.contains("direct_notice_seen = true"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, seen);
+    }
+
+    /// Decision M1-90: the three keys nothing read (`general.autostart`,
+    /// `security.view_only_default`, `security.crash_dumps`) still load from
+    /// an older file, change nothing, and are no longer written.
+    #[test]
+    fn retired_keys_load_change_nothing_and_are_not_written() {
+        let old = r#"
+[general]
+autostart = true
+
+[security]
+panic_key = "Ctrl+Alt+End"
+view_only_default = true
+crash_dumps = true
+"#;
+        let cfg: Config = toml::from_str(old).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg, Config::default());
+        let written = Config::default().to_toml().unwrap();
+        for retired in ["autostart", "view_only_default", "crash_dumps"] {
+            assert!(
+                !written.contains(retired),
+                "`{retired}` written:\n{written}"
+            );
+        }
     }
 
     /// A8 (§B.8.15): policy never lives in `config.toml` — an `[unattended]` table is
