@@ -854,11 +854,15 @@ mod tests {
             read("docs/RELEASING.md").contains(&pinned_cargo_deny_dir()),
             "docs/RELEASING.md"
         );
-        assert!(
-            read("packaging/release/NOTES-v0.1.0-slice.1.md")
-                .contains(&format!("cargo-deny {CARGO_DENY_VERSION},")),
-            "the release notes"
-        );
+        for notes in [
+            "packaging/release/NOTES-v0.1.0-slice.1.md",
+            "packaging/release/NOTES-v0.1.0-slice.2.md",
+        ] {
+            assert!(
+                read(notes).contains(&format!("cargo-deny {CARGO_DENY_VERSION},")),
+                "{notes}"
+            );
+        }
     }
 
     /// Decision M1-73, Part E "Fake or altered invitations": the zipped
@@ -880,6 +884,7 @@ mod tests {
         for doc in [
             "packaging/release/README-release.md",
             "packaging/release/NOTES-v0.1.0-slice.1.md",
+            "packaging/release/NOTES-v0.1.0-slice.2.md",
             "README.md",
         ] {
             // Sentences wrap in the files; compare with every run of white space as one space.

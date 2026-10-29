@@ -105,7 +105,13 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
 6. Publish (the Git agent's step, with the operator's approval):
    `gh release create v<version>-slice.<N> --prerelease --title "Tornect <version> (slice <N>)"
    --notes-file <notes.md> target/dist/tornect-<version>-linux-x86_64.zip
-   target/dist/tornect-<version>-windows-x86_64.zip target/dist/SHA256SUMS`
+   target/dist/tornect-<version>-windows-x86_64.zip target/dist/SHA256SUMS`. `<notes.md>` is a
+   copy, outside the repository, of the release's template
+   `packaging/release/NOTES-v<version>-slice.<N>.md` with every `@@…@@` marker filled from this
+   run (`BUILD-INFO.txt`, `SHA256SUMS`, dist's last lines) and the checklist in its header comment
+   done; the committed template keeps the markers. The next one is
+   `packaging/release/NOTES-v0.1.0-slice.2.md`; `v0.1.0-slice.1` was never published, and its
+   notes stay in the tree as that slice's record only.
 7. Download the three assets from the release page into an empty directory and run
    `sha256sum -c SHA256SUMS` there.
 
