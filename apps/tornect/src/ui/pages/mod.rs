@@ -426,11 +426,13 @@ mod tests {
                 t.warn,
                 "Not reachable yet",
             ),
+            // The security review of the final pass: the chip agrees with
+            // the line that publishing failed (it said "Not reachable yet").
             (
                 published(OnionPhase::Broken, "Broken"),
                 home::PUBLISH_BROKEN_LINE,
                 t.danger_text,
-                "Not reachable yet",
+                "Publishing failed",
             ),
         ] {
             let (said, color) = home::hosting_line(t, &hosting, None);
@@ -1785,8 +1787,18 @@ mod tests {
         );
 
         // Without a success there: Knock first, and a paired computer may
-        // still connect without asking.
+        // still connect without asking. The security review of the final
+        // pass: that ghost button says on hover what Connect says, on Home
+        // and in the address book (it had no hover text).
         let fresh = with_book(false);
+        for page in [Page::Home, Page::AddressBook] {
+            let mut window = Window::new(fresh.clone(), page, egui::Theme::Dark, TALL);
+            window
+                .ctx
+                .all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+            let ask = window.center("Connect without asking");
+            assert_eq!(hovered(&mut window, ask), (false, true), "{page:?}");
+        }
         let mut window = Window::new(fresh, Page::AddressBook, egui::Theme::Dark, TALL);
         let knock = window.center("Knock");
         assert_eq!(window.click(knock), vec![Action::Connect(id)]);

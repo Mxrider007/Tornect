@@ -605,6 +605,7 @@ fn admin_row(
             .small()
             .enabled(ready)
             .show(ui)
+            .on_hover_text(super::home::CONNECT_HOVER)
             .clicked()
         {
             actions.push(Action::AskPassword(id));

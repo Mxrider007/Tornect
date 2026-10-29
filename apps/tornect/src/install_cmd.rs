@@ -96,6 +96,19 @@ pub(crate) fn no_bridges_line(why: &str) -> String {
     )
 }
 
+/// What an install that carried no lyrebird says when the installed copy's
+/// own lookup still finds one this build pins at `path` (an earlier
+/// install's `pt/lyrebird`, which the install leaves as it is): that copy
+/// can use bridges, and with that lyrebird.
+#[cfg(target_os = "linux")]
+pub(crate) fn kept_lyrebird_line(path: &std::path::Path) -> String {
+    format!(
+        "The installed copy uses the lyrebird already at {}, which this build pins, for obfs4 \
+         and Snowflake bridges.",
+        path.display()
+    )
+}
+
 /// What a Windows install says of lyrebird: the Program Files copy carries
 /// none yet (decision M1-88).
 #[cfg(any(windows, test))]
@@ -537,6 +550,9 @@ pub(crate) trait UserInstall {
     ) -> Result<tornect_platform::install::LinkHandler, InstallError>;
     /// Whether anything of an install is there.
     fn installed(&self) -> bool;
+    /// The lyrebird the installed copy's own lookup finds and accepts
+    /// (beside it or in its `pt`, this build's pin), if any.
+    fn installed_lyrebird(&self) -> Option<PathBuf>;
     /// Take the link entry out of `mimeapps.list`, remove the menu entry,
     /// the link entry and the copy.
     fn uninstall(&self) -> Result<tornect_platform::install::Removal, InstallError>;
@@ -573,6 +589,13 @@ impl UserInstall for tornect_platform::install::LinuxInstall {
         Self::installed(self)
     }
 
+    fn installed_lyrebird(&self) -> Option<PathBuf> {
+        let exe = Self::exe(self);
+        tornect_signal::tor::bundled_lyrebird_in(exe.parent(), tornect_signal::tor::LYREBIRD_SHA256)
+            .ok()
+            .map(|(path, _)| path)
+    }
+
     fn uninstall(&self) -> Result<tornect_platform::install::Removal, InstallError> {
         Self::uninstall(self)
     }
@@ -605,7 +628,12 @@ pub(crate) fn install_linux(
     deps.console
         .out(&linux_installed(&links, &files.mimeapps()));
     if let Err(why) = &lyrebird {
-        deps.console.out(&no_bridges_line(why));
+        // An earlier install's lyrebird is left where it is: said as what
+        // the installed copy will use, or not at all.
+        deps.console.out(&match files.installed_lyrebird() {
+            Some(kept) => kept_lyrebird_line(&kept),
+            None => no_bridges_line(why),
+        });
     }
     offer_sign_in(deps, paths, files.exe())
 }
@@ -1109,6 +1137,8 @@ mod tests {
         preflight_lyrebird: Mutex<Vec<bool>>,
         /// What the uninstall leaves in a `pt` that is not its own.
         left_in_folder: Vec<PathBuf>,
+        /// The lyrebird the installed copy's lookup finds after an install.
+        kept_lyrebird: Option<PathBuf>,
     }
 
     impl UserInstall for FakeFiles {
@@ -1151,6 +1181,10 @@ mod tests {
 
         fn installed(&self) -> bool {
             self.exe().exists()
+        }
+
+        fn installed_lyrebird(&self) -> Option<PathBuf> {
+            self.kept_lyrebird.clone()
         }
 
         fn uninstall(&self) -> Result<Removal, InstallError> {
@@ -1388,6 +1422,7 @@ mod tests {
                 lyrebirds: Mutex::new(Vec::new()),
                 preflight_lyrebird: Mutex::new(Vec::new()),
                 left_in_folder: Vec::new(),
+                kept_lyrebird: None,
             },
         }
     }
@@ -1533,6 +1568,44 @@ mod tests {
                 assert_eq!(script.lines[installed + 1], format!("out: {line}"));
             }
         }
+    }
+
+    /// The security review of the final pass: an install that carried no
+    /// lyrebird leaves an earlier install's `pt/lyrebird` where it is; when
+    /// the installed copy's lookup accepts it (this build's pin), the
+    /// install says that copy uses it, not that it has none.
+    #[test]
+    fn an_install_without_lyrebird_names_an_earlier_one_the_copy_still_uses() {
+        let mut env = linux_env(2);
+        let kept = env.files.dir.join("pt").join("lyrebird");
+        env.files.kept_lyrebird = Some(kept.clone());
+        let backends = Backends::default();
+        let make = |spec| backends.make(spec);
+        let mut script = Script::answering(&[Some("\n")]);
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut script,
+            host_running: false,
+            autostart_for: &make,
+        };
+        install_linux(
+            &mut deps,
+            &env.paths,
+            &env.files,
+            &mut std::io::Cursor::new(b"the program".to_vec()),
+            Err(NO_LYREBIRD_HERE.to_owned()),
+        )
+        .unwrap();
+        assert!(
+            script.said(&kept_lyrebird_line(&kept)),
+            "{:?}",
+            script.lines
+        );
+        assert!(
+            !script.said(&no_bridges_line(NO_LYREBIRD_HERE)),
+            "{:?}",
+            script.lines
+        );
     }
 
     /// The final audit before the release: what the install puts beside the

@@ -506,6 +506,12 @@ pub(super) fn reachability(hosting: &Hosting) -> (Tone, &'static str) {
             phase: OnionPhase::Starting,
             ..
         } => (Tone::Warn, "Publishing…"),
+        // Its line says that publishing failed; the chip says the same, not
+        // that it is still on its way.
+        Hosting::Published {
+            phase: OnionPhase::Broken,
+            ..
+        } => (Tone::Danger, "Publishing failed"),
         Hosting::Published { .. } => (Tone::Warn, "Not reachable yet"),
         Hosting::Publishing => (Tone::Warn, "Publishing…"),
         Hosting::Waiting => (Tone::Neutral, "Waiting for Tor"),
@@ -1448,11 +1454,13 @@ pub(super) fn host_actions(
 pub(super) const KNOCK_HOVER: &str = "Ask to connect: the person at that computer allows control \
      or view only (the first time, you both compare a 6-digit code)";
 
-/// What a saved computer's own Connect does, on hover. Whether someone
-/// there is asked is the grant's, disclosed only in its signed accept: the
-/// words do not promise that nobody is.
-pub(super) const CONNECT_HOVER: &str = "Connect without asking first: your password for that \
-     computer; someone there may still block it";
+/// What a saved computer's own Connect, and its "Connect without asking",
+/// do on hover. Whether someone there is asked is the grant's ("Ask before
+/// starting", on by default for Helping someone), disclosed only in its
+/// signed accept: the words promise neither that nobody is asked nor that
+/// someone is.
+pub(super) const CONNECT_HOVER: &str = "Connect with your password for that computer; depending \
+     on its setting, someone there is asked first or can block it";
 
 /// [`host_actions`], saying whether to offer "Connect without asking" here.
 pub(super) fn host_actions_with(
@@ -1505,6 +1513,7 @@ pub(super) fn host_actions_with(
                 .small()
                 .enabled(ready && !blocked)
                 .show(ui)
+                .on_hover_text(CONNECT_HOVER)
                 .clicked()
         {
             actions.push(Action::AskPassword(id));
