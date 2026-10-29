@@ -649,14 +649,22 @@ impl Config {
     /// otherwise leave it empty (every setting, the bridges included, silently back
     /// to its default) or unparseable (the window refuses to start).
     pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
+        let text = self.to_toml()?;
         if let Some(parent) = path.parent() {
             crate::keystore::create_private_dir(parent)?;
         }
-        let body = toml::to_string_pretty(self)?;
-        let text = format!("{}{body}", header());
         crate::keystore::write_private_file_atomic(path, text.as_bytes())?;
         Ok(())
+    }
+
+    /// The text [`Config::save`] writes: the header, then every setting as
+    /// TOML, after [`Config::validate`]. It holds the private bridge lines,
+    /// so whatever only shows it (`tornect config show`) renders it here
+    /// rather than through a file.
+    pub fn to_toml(&self) -> Result<String> {
+        self.validate()?;
+        let body = toml::to_string_pretty(self)?;
+        Ok(format!("{}{body}", header()))
     }
 
     /// Check ranges and formats.
@@ -893,6 +901,28 @@ panic_key = "Ctrl+Alt+End"
         assert_eq!(cfg2, cfg);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# Tornect configuration"));
+    }
+
+    /// `to_toml` is the text a save writes, byte for byte, and refuses what
+    /// a save refuses: `tornect config show` prints it without a file.
+    #[test]
+    fn to_toml_is_what_a_save_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.tor.bridge_lines = vec![
+            "obfs4 192.0.2.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=x iat-mode=0"
+                .to_owned(),
+        ];
+        cfg.save(&path).unwrap();
+        let text = cfg.to_toml().unwrap();
+        assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+        assert!(text.starts_with("# Tornect configuration"), "{text}");
+        assert!(text.contains("192.0.2.7:443"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
+
+        cfg.media.max_fps = 0;
+        assert!(cfg.to_toml().is_err(), "an invalid config is not rendered");
     }
 
     /// B14: a save replaces the file whole. Until the new text is complete and

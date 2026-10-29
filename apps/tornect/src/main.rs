@@ -1187,10 +1187,7 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> anyhow::Result<()> {
     let path = paths.config_file();
     match action {
         ConfigAction::Path => println!("{}", path.display()),
-        ConfigAction::Show => {
-            let cfg = Config::load(&path)?;
-            print!("{}", toml_pretty(&cfg)?);
-        }
+        ConfigAction::Show => print!("{}", config_show(paths)?),
         ConfigAction::Init { force } => {
             if path.exists() && !force {
                 anyhow::bail!(
@@ -1205,14 +1202,12 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn toml_pretty(cfg: &Config) -> anyhow::Result<String> {
-    // Reuse the same serializer the config file uses.
-    let dir = std::env::temp_dir().join(format!("tornect-config-show-{}", std::process::id()));
-    let file = dir.join("config.toml");
-    cfg.save(&file)?;
-    let text = std::fs::read_to_string(&file)?;
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(text)
+/// What `tornect config show` prints: the settings in effect, rendered in
+/// memory as `config.toml` would hold them. Nothing is written: the text
+/// holds the private bridge lines, and a file under the shared temporary
+/// directory is one another account can read or take the name of first.
+fn config_show(paths: &Paths) -> anyhow::Result<String> {
+    Ok(Config::load(&paths.config_file())?.to_toml()?)
 }
 
 fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
@@ -1324,6 +1319,36 @@ mod tests {
     use tornect_core::unattended::ipc::{IpcRequest, IpcResponse, ShownLink};
 
     const ID: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwd";
+
+    /// `tornect config show` renders the settings without writing them
+    /// anywhere (the closing gate). It saved them, private bridge lines
+    /// included, into `tornect-config-show-<pid>` under the shared temporary
+    /// directory: another account could take that name first and make the
+    /// command fail, or point it elsewhere. A file squatting the old name
+    /// now changes nothing, and the text is what `config.toml` holds.
+    #[test]
+    fn config_show_renders_without_a_file_in_the_temporary_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(home.path());
+        let mut cfg = tornect_core::Config::default();
+        cfg.tor.bridge_lines = vec![
+            "obfs4 192.0.2.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=x iat-mode=0"
+                .to_owned(),
+        ];
+        cfg.save(&paths.config_file()).unwrap();
+
+        let squatter =
+            std::env::temp_dir().join(format!("tornect-config-show-{}", std::process::id()));
+        std::fs::write(&squatter, "not Tornect's").unwrap();
+        let shown = super::config_show(&paths);
+        let left = std::fs::read_to_string(&squatter);
+        std::fs::remove_file(&squatter).unwrap();
+
+        let shown = shown.expect("config show does not touch the temporary directory");
+        assert_eq!(shown, std::fs::read_to_string(paths.config_file()).unwrap());
+        assert!(shown.contains("192.0.2.7:443"), "{shown}");
+        assert_eq!(left.unwrap(), "not Tornect's");
+    }
 
     /// The monitors design §2: `tornect connect <id> --screen N` takes a
     /// screen's number from 1 to 16, or `all` (the media stream's 0), and
