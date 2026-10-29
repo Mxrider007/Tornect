@@ -1893,4 +1893,82 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             );
         }
     }
+
+    /// The string literals between `const NAME` and the `];` that ends its
+    /// array, in order.
+    fn array_strs(src: &str, name: &str) -> Vec<String> {
+        let decl = format!("const {name}: ");
+        let start = src.find(&decl).unwrap_or_else(|| panic!("no `{name}`"));
+        let body = &src[start..];
+        let body = &body[..body
+            .find("];")
+            .unwrap_or_else(|| panic!("`{name}` never ends"))];
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn array_strs_reads_every_literal() {
+        let src =
+            "pub const M: [(K, &str); 2] = [\n    (K::A, \"One\"),\n    (K::B, \"Two\"),\n];\n";
+        assert_eq!(array_strs(src, "M"), ["One", "Two"]);
+    }
+
+    /// The release README's "Where Tor is blocked" and "A new Tornect ID"
+    /// name the ways to Tor, the private bridges and Rotate ID as the
+    /// window and the command line offer them (the closing gate's
+    /// completeness check: both were built and the README named neither).
+    #[test]
+    fn the_release_readme_names_the_ways_to_tor_and_rotate_id() {
+        let root = crate::workspace_root().unwrap();
+        let readme = fs::read_to_string(root.join(README)).unwrap();
+        let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+        let connection =
+            fs::read_to_string(root.join("apps/tornect/src/ui/pages/settings/connection.rs"))
+                .unwrap();
+        let security =
+            fs::read_to_string(root.join("apps/tornect/src/ui/pages/settings/security.rs"))
+                .unwrap();
+        let config = fs::read_to_string(root.join("crates/tornect-core/src/config.rs")).unwrap();
+        let main = fs::read_to_string(root.join("apps/tornect/src/main.rs")).unwrap();
+
+        let modes = array_strs(&connection, "MODES");
+        assert_eq!(modes.len(), 4, "the ways to Tor changed: {modes:?}");
+        let mut needed = modes;
+        assert!(
+            connection.contains("section_header(ui, \"Private bridges\")"),
+            "Settings › Connection no longer draws `Private bridges`"
+        );
+        needed.push("**Private bridges**".to_owned());
+        assert!(
+            config.contains("pub bridge_lines: Vec<String>,")
+                && config.contains("pub bridges: BridgeMode,"),
+            "`[tor]` no longer has `bridges` and `bridge_lines`"
+        );
+        needed.extend(
+            [
+                "bridge_lines",
+                "bridges = \"auto\"",
+                "--bridges auto|off|obfs4|snowflake",
+                "tornect tor-check",
+                "bridges.torproject.org",
+            ]
+            .map(str::to_owned),
+        );
+        needed.push(format!("**{}**", str_const(&security, "ROTATE")));
+        assert!(
+            main.contains("RotateId {"),
+            "the command line no longer has `rotate-id`"
+        );
+        needed.push("tornect rotate-id --yes".to_owned());
+        for needle in &needed {
+            assert!(
+                readme.contains(needle.as_str()),
+                "README-release.md lacks `{needle}`"
+            );
+        }
+    }
 }

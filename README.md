@@ -35,7 +35,10 @@ cannot, the session stays on Tor: slower, but it connects. Linux and Windows.
   emergency stop code.
 - **Saved computers:** the computers you paired with stay on Home, with Knock and Check if
   reachable; the list of recent connections is off by default.
-- **Works where Tor is blocked:** obfs4 and Snowflake bridges through the bundled lyrebird.
+- **Works where Tor is blocked:** obfs4 and Snowflake bridges through the bundled lyrebird, or
+  your own private bridge lines.
+- **A new ID when you want one:** Rotate ID makes a new Tornect ID; every pairing and unattended
+  grant ends with the old one.
 - **Optional install and start at sign-in**, and a command line for everything.
 - **No telemetry.** Every pairing and session is written to a log on your own computer only.
 

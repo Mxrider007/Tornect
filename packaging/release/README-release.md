@@ -292,7 +292,7 @@ notice with the switch; until you press OK there, it keeps unattended sessions
 on Tor.
 
 **Keeping sessions on Tor.** Switch off "Allow direct connections (faster;
-the other computer learns your IP address)" in Settings > Connection, or set
+the other computer learns your IP address)" in Settings › Connection, or set
 `paranoid = true` under `[network]` in `config.toml`: every session then goes
 over Tor, and computers you connect to never learn your IP address. `tornect
 connect --tor-only` does the same for one session, and "Pictures and input
@@ -320,6 +320,27 @@ session; `direct_port = <port>` under `[network]` (1024 or above) fixes it, for
 a firewall rule or a port forwarded by hand. Behind some routers and
 carrier-grade NATs no direct path can be found: the session then goes over
 Tor.
+
+## Where Tor is blocked
+
+Tornect finds its own way to Tor. By default (**Automatic** under "How to
+reach Tor" in Settings › Connection, `bridges = "auto"` under `[tor]` in
+`config.toml`) it tries Tor directly, then the built-in obfs4 bridges, then
+Snowflake, both through the bundled lyrebird, starting with whichever worked
+last time; once a bridge was needed, Tor directly is tried last. "Tor without
+bridges", "obfs4 bridges" and "Snowflake" use that one way only, and
+`--bridges auto|off|obfs4|snowflake` picks the way for one run. Where the
+built-in bridges are blocked too, get private bridge lines (obfs4, webtunnel or
+snowflake) from bridges.torproject.org and paste them under **Private
+bridges** in Settings › Connection (`bridge_lines` under `[tor]`): they replace
+the built-in bridges of their kind (obfs4 and webtunnel lines the obfs4 ones,
+snowflake lines the Snowflake ones), and Automatic no longer tries Tor
+directly. A line that does not parse is named by its line number only. Both
+choices apply the next time Tornect starts; `tornect tor-check` reports which
+way reached Tor. While Tor uses a bridge, direct connections are off ("Keeping
+sessions on Tor" above). The built-in bridges have reached Tor on the build
+machine, each one forced, but not yet on a network that really blocks Tor;
+private bridge lines have been tried only in tests.
 
 ## Unattended access
 
@@ -473,6 +494,18 @@ elsewhere, so two copies can run side by side on one machine. On Windows that
 directory must be inside your user folder (`C:\Users\<you>`), and Tornect
 refuses one elsewhere: it does not yet give its directories permissions of their
 own, and anywhere else other accounts on the PC could read and change its keys.
+
+## A new Tornect ID
+
+Settings › Security › **Rotate ID…** gives this computer a new Tornect ID and
+deletes the old one's keys. Every pairing stops working (each device pairs
+again, with the new ID), unattended access is removed for every device, and
+the unattended passwords this computer remembers for others are deleted. The
+dialog names the devices that lose access and asks you to type ROTATE; Tornect
+then ends every session, closes, and shows the new ID when you start it again.
+`tornect rotate-id --yes` does the same from a terminal while Tornect is
+closed. The command line's rotation ran on the build machine in August, on
+older code; Rotate ID in the window has run only in tests.
 
 ## What has been tried, and where
 

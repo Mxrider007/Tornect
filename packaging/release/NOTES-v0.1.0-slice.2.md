@@ -41,7 +41,10 @@ keys pinned, on the same local network or across the internet), and otherwise th
 - **Unattended access**, opt-in per device, with a password the host never stores (OPAQUE) and an emergency stop
   code.
 - **Where Tor is blocked**, obfs4 bridges, then Snowflake, through the bundled lyrebird 0.8.1 (unmodified from
-  Tor Browser 15.0.23); Tornect runs only the lyrebird whose SHA-256 it has compiled in.
+  Tor Browser 15.0.23), or private bridge lines pasted in Settings › Connection; Tornect runs only the lyrebird
+  whose SHA-256 it has compiled in.
+- **Rotate ID** (Settings › Security, or `tornect rotate-id`) makes a new Tornect ID, ending every pairing and
+  unattended grant.
 - **The command line** does everything the window does, and `tornect install`, `service install` and the
   `unattended` commands set Tornect up.
 
