@@ -198,6 +198,28 @@ On Windows, the first direct connection may make Windows ask whether Tornect
 may communicate on your networks: choose "Allow access". If you cancel, or
 this Windows account cannot change the firewall, sessions go over Tor.
 
+## Installing (optional)
+
+Tornect runs from the unpacked folder and needs no install. To keep a copy where
+it stays, close Tornect, open a terminal in the unpacked folder and run
+`./tornect install` (`.\tornect.exe install` on Windows): the copy that is not
+installed is not on your `PATH` yet. It asks for your OS password first, as
+`service install` below does, and at the end offers "Start Tornect when I sign
+in? [y/N]". `tornect uninstall` removes it again.
+
+- **Linux:** the program goes to `~/.local/bin/tornect`, with a menu entry and
+  the handler of `tornect://` links, and lyrebird, checked against the SHA-256
+  compiled into Tornect, to `~/.local/bin/pt/lyrebird`, where the installed
+  copy finds it. Install from the unpacked folder: a copy with no `pt/lyrebird`
+  beside it installs without lyrebird, says so, and its installed copy cannot
+  use obfs4 or Snowflake bridges.
+- **Windows:** the program goes to `C:\Program Files\Tornect\tornect.exe`, with
+  a Start-menu entry and an Apps-and-features entry, through two Windows
+  administrator prompts. **This build's Windows install carries no lyrebird**:
+  the installed copy cannot use obfs4 or Snowflake bridges, and the install
+  says so. Where Tor is blocked, run `tornect.exe` from the unpacked folder,
+  which keeps `pt\lyrebird.exe` beside it.
+
 ## Start at logon
 
 `tornect service install` registers Tornect (this executable) to start after
@@ -282,6 +304,12 @@ own, and anywhere else other accounts on the PC could read and change its keys.
 - On GNOME, the "Tornect: sharing" window cannot stay above other windows
   (Wayland does not let it); GNOME shows its own screen-sharing icon.
 - The zips and the programs are not signed.
+- The Windows install (`tornect install`) carries no lyrebird: the copy in
+  `C:\Program Files\Tornect` cannot use obfs4 or Snowflake bridges. Where Tor
+  is blocked, run the unpacked copy.
+- For a bug report, run with `--log debug`: without it this build writes only
+  warnings and errors. Fields that name someone stay redacted unless
+  `--log-identifiers` is given.
 
 ## Licences and source
 
