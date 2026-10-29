@@ -1,4 +1,7 @@
-<!-- Template: the final dist run fills the marked fields in a copy outside the repository; this committed file keeps the markers. -->
+<!-- Template: the final dist run fills the marked fields in a copy outside the repository; this committed file keeps the markers.
+     This file describes the vertical slice of September 2026 as prepared for `v0.1.0-slice.1`, which was never tagged
+     or published; its evidence tables are that slice's. A pre-release cut from a later commit uses its own notes,
+     `NOTES-v0.1.0-slice.2.md` for the next one (docs/RELEASING.md step 6), never this file. -->
 # Tornect 0.1.0, slice pre-release 1 (`v0.1.0-slice.1`)
 
 **A pre-release, for testing between two machines you control, one Linux and one Windows.** It is the first
@@ -13,8 +16,12 @@ address (Arti, embedded in the program), so there is no server, no account and n
 
 - **Pairing** shows the same code on both screens; the two people compare it. The sharing side then answers
   each session with **Deny**, **View only** or **Allow control**, and nothing is captured before that answer.
-- **Pictures and input travel over the Tor circuit:** software H.264 (OpenH264, built from source), with one
-  capture and one input backend per operating system.
+- **Pictures and input go directly** (QUIC, on the local network or across the internet) when the two computers
+  can reach each other, otherwise over the Tor circuit: software H.264 (OpenH264, built from source), with one
+  capture and one input backend per operating system. A direct connection shows the other computer this computer's
+  IP addresses, and one public STUN server per session this computer's IP address and when the session starts;
+  "Allow direct connections" in Settings, Connection, or `paranoid = true` under `[network]`, keeps every session on
+  Tor (the zipped README's "Direct connections").
 - **Where Tor is blocked**, Tornect tries obfs4 bridges, then Snowflake, through the bundled lyrebird 0.8.1
   (unmodified from Tor Browser 15.0.23), and runs only the lyrebird whose SHA-256 it has compiled in.
 - **The window:** this machine's ID and Tor status, a Connect field, the pairing and session questions, the
@@ -134,13 +141,19 @@ window's "Screen sharing on this desktop" card (**Grant screen sharing**); other
 viewer's picture starts, and someone at this screen must answer it within 30 s. `tornect doctor` names the file
 that holds the grant; **Revoke** in the window, or deleting that file, takes it back.
 
-**Windows: the console and Ctrl-C** (as the zipped README says it). Double-clicking `tornect.exe` opens the
-window **and a console window**: `tornect.exe` is a console program. Ctrl-C (or Ctrl-Break) in that console
-closes Tornect as the main window's close button does, ending every session with a goodbye to the other side;
-closing the console window itself ends Tornect at once, without it (neither yet tried on Windows). `tornect
-panic` cannot reach a running Windows host yet (its control channel is still to come) and says so. To end every
-session at once, press **Ctrl-C in the console where `tornect.exe host` runs**, or press Stop on the banner or
-the "Tornect: sharing" window when you use the window.
+**Windows: the window, the console and Ctrl-C** (as the zipped README says it). Double-clicking `tornect.exe`
+opens the window, with no console window (`tornect.exe` is a window program). Its close button ends every session
+with a goodbye to the other side. From a console in the folder (`cmd`), start each command with `start /wait`.
+Without it `cmd` gives its prompt back at once, and the questions of `tornect host` then share the console with
+`cmd`. In PowerShell, type `cmd` first and use the same lines. Ctrl-C in that console ends a `tornect.exe host`
+with a goodbye to the other side. Ctrl-Break, or closing the console window, ends it at once, without one (none of
+this yet tried on Windows). `tornect.exe doctor > doctor.txt` writes the report to a file.
+
+**Ending sessions on Windows.** `start /wait tornect.exe panic`, run in a second console, ends every session of
+the Tornect running for this home (the default one, or the one `--home` names). It goes through Tornect's control
+channel, a named pipe that only this Windows account can open (not yet tried on Windows). Stop on the banner or on
+the "Tornect: sharing" window, the window's close button, and Ctrl-C in the console where `start /wait tornect.exe
+host` runs end them too.
 
 ## Known limitations
 
@@ -159,8 +172,10 @@ By the identifiers of the security reviews that found them.
   `--home` or `TORNECT_HOME` directory only inside your user folder.
 - **E2-5:** the "Tornect: sharing" window can be minimised (also by a viewer with control) and is not brought
   back; it shows on the primary monitor only, while the whole desktop is shared.
-- **E2-6:** closing the console window, logging off or shutting down ends Tornect at once: keys the viewer held
-  may stay pressed, and `sessions.log` gets no end record. Use Stop, the window's close button, or Ctrl-C.
+- **E2-6:** closing the console window of a command-line `tornect.exe host` (started with `start /wait`),
+  Ctrl-Break in it, logging off or shutting down ends Tornect at once: keys the viewer held may stay pressed, and
+  `sessions.log` gets no end record. Use Stop, the window's close button, or Ctrl-C. The double-clicked window has
+  no console.
 - **E2-8:** a `tornect.exe` started as administrator while User Account Control is on refuses to accept
   connections: start it normally, administrator access is given per session. Where User Account Control is
   off, every program runs as administrator, so a session with control is administrator access: Tornect offers
@@ -213,9 +228,13 @@ By the identifiers of the security reviews that found them.
   `toolbar_hides`, a `[general] theme` or a `[tor] bridges` value that a later version wrote, or a typo) stops
   Tornect from starting, the host included, with "cannot parse configuration" and the file, line and setting.
   Correct that line or delete it: a deleted setting takes its default.
-- No client in this build asks for an unattended session, so an unattended grant cannot yet be used.
-- Everything travels over Tor: a few frames per second for a large desktop, and a connection takes from
-  seconds to minutes to set up. Direct QUIC with hole punching comes later.
+- Unattended access works through the window's "Connect without asking" and, on Linux, `tornect connect
+  --unattended`; it needs a grant set up locally on the host (Settings, Security, Unattended access, or `tornect
+  unattended grant`), and has not yet been run between two machines over Tor.
+- Unless the two computers can reach each other directly, everything travels over Tor: a few frames per second
+  for a large desktop, and a connection takes from seconds to minutes to set up.
+- Direct connections across the internet are new in this build and have run only in simulation: not yet between
+  two real homes, through real routers or carrier NATs, over IPv6, through a VPN, or on Windows.
 - On GNOME the "Tornect: sharing" window cannot stay above other windows (Wayland does not let it); GNOME shows
   its own screen-sharing icon.
 
