@@ -1429,6 +1429,10 @@ mod linux {
         /// Found at an install's name but not a regular file (a link, a
         /// folder): not what `install` wrote, so left as it is.
         pub left: Vec<PathBuf>,
+        /// Found at lyrebird's name in a `pt` that `install` never writes
+        /// into (a link, not a folder, or a folder that fails the location
+        /// rule): not what `install` wrote, so left as it is.
+        pub left_in_folder: Vec<PathBuf>,
         /// The association of `tornect:` links in `mimeapps.list`.
         pub association: Association,
     }
@@ -1567,8 +1571,12 @@ mod linux {
         /// Checks what [`Self::install`] would write, writing nothing: both
         /// folders are absolute, the `Exec` of the menu entry and of the link
         /// entry can be written, and the bin folder (while it does not exist,
-        /// the nearest folder above it that does) passes the location rule.
-        pub fn preflight(&self, home: Option<&Path>) -> Result<(), InstallError> {
+        /// the nearest folder above it that does) passes the location rule;
+        /// with `lyrebird` (it is to be installed too), a `pt` folder that
+        /// exists passes it and is a folder, not a link. So a `pt` that would
+        /// refuse lyrebird refuses the install before the executable is
+        /// replaced: on an upgrade, the earlier copy stays where it is.
+        pub fn preflight(&self, home: Option<&Path>, lyrebird: bool) -> Result<(), InstallError> {
             for dir in [&self.bin_dir, &self.apps_dir] {
                 if !dir.is_absolute() {
                     return Err(InstallError::Unavailable(format!(
@@ -1579,7 +1587,30 @@ mod linux {
             }
             self.menu_entry_text(home)?;
             self.link_entry_text(home)?;
-            self.location_ok(nearest_existing(&self.bin_dir))
+            self.location_ok(nearest_existing(&self.bin_dir))?;
+            if lyrebird {
+                let pt = self.pt_dir();
+                match std::fs::symlink_metadata(&pt) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(InstallError::Failed(format!(
+                            "reading {}: {e}",
+                            pt.display()
+                        )));
+                    }
+                    Ok(meta) => {
+                        self.location_ok(&pt)?;
+                        if !meta.is_dir() {
+                            return Err(InstallError::Refused(format!(
+                                "{} is not a folder, so lyrebird cannot go there and nothing \
+                                 was installed.",
+                                pt.display()
+                            )));
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
 
         /// [`Self::install_with`] without lyrebird.
@@ -1609,7 +1640,7 @@ mod linux {
             lyrebird: Option<PinnedHelper<'_>>,
             home: Option<&Path>,
         ) -> Result<LinkHandler, InstallError> {
-            self.preflight(home)?;
+            self.preflight(home, lyrebird.is_some())?;
             if lyrebird.is_some_and(|helper| !helper.matches()) {
                 return Err(InstallError::Refused(HELPER_NOT_PINNED.to_owned()));
             }
@@ -1689,36 +1720,55 @@ mod linux {
 
         /// Whether anything [`Self::install`] writes is at its name (an
         /// association left alone in `mimeapps.list` is not: GIO skips an
-        /// entry that is not there).
+        /// entry that is not there; nor is a lyrebird in a `pt` that is not a
+        /// folder of its own, which the install never writes into).
         #[must_use]
         pub fn installed(&self) -> bool {
-            [
-                self.menu_entry(),
-                self.link_entry(),
-                self.exe(),
-                self.lyrebird(),
-            ]
-            .iter()
-            .any(|p| std::fs::symlink_metadata(p).is_ok())
+            let mut names = vec![self.menu_entry(), self.link_entry(), self.exe()];
+            if std::fs::symlink_metadata(self.pt_dir()).is_ok_and(|m| m.is_dir()) {
+                names.push(self.lyrebird());
+            }
+            names.iter().any(|p| std::fs::symlink_metadata(p).is_ok())
+        }
+
+        /// Whether the `pt` folder is one [`Self::install`] may have written
+        /// lyrebird into: a folder, not a link (`lstat`), that passes the
+        /// location rule. `None` when there is no `pt`.
+        fn pt_is_own_folder(&self) -> Result<Option<bool>, InstallError> {
+            let pt = self.pt_dir();
+            match std::fs::symlink_metadata(&pt) {
+                Ok(meta) => Ok(Some(meta.is_dir() && self.location_ok(&pt).is_ok())),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(InstallError::Failed(format!(
+                    "reading {}: {e}",
+                    pt.display()
+                ))),
+            }
         }
 
         /// Take the link entry out of [`Self::mimeapps`] (never failing the
         /// uninstall: [`Association`]), then remove the menu entry, the link
         /// entry, the executable and lyrebird: regular files only, anything
-        /// else at those names left and reported; then the `pt` folder, only
-        /// where it is a folder (not a link) and now empty. Removing nothing
-        /// changes nothing.
+        /// else at those names left and reported; lyrebird only where its
+        /// `pt` is a folder of its own ([`Self::pt_is_own_folder`]: an
+        /// `lstat` of `pt/lyrebird` follows a `pt` that is a link, so its
+        /// target's file would go), else left and reported; then the `pt`
+        /// folder, only where it is such a folder and now empty. Removing
+        /// nothing changes nothing.
         pub fn uninstall(&self) -> Result<Removal, InstallError> {
+            let pt_own = self.pt_is_own_folder()?;
             let mut done = Removal {
                 association: self.dissociate(),
                 ..Removal::default()
             };
-            for path in [
-                self.menu_entry(),
-                self.link_entry(),
-                self.exe(),
-                self.lyrebird(),
-            ] {
+            if pt_own == Some(false) && std::fs::symlink_metadata(self.lyrebird()).is_ok() {
+                done.left_in_folder.push(self.lyrebird());
+            }
+            let lyrebird = (pt_own == Some(true)).then(|| self.lyrebird());
+            for path in [self.menu_entry(), self.link_entry(), self.exe()]
+                .into_iter()
+                .chain(lyrebird)
+            {
                 match std::fs::symlink_metadata(&path) {
                     Ok(m) if m.file_type().is_file() => {
                         std::fs::remove_file(&path).map_err(|e| {
@@ -1739,7 +1789,8 @@ mod linux {
             // A folder that still holds anything is not removed (and not an
             // error): only what the install wrote goes.
             let pt = self.pt_dir();
-            if std::fs::symlink_metadata(&pt).is_ok_and(|m| m.is_dir())
+            if pt_own == Some(true)
+                && std::fs::symlink_metadata(&pt).is_ok_and(|m| m.is_dir())
                 && std::fs::remove_dir(&pt).is_ok()
             {
                 done.removed.push(pt);
@@ -2283,7 +2334,7 @@ mod linux {
             refused(&install);
             assert!(tree.files().is_empty(), "{:?}", tree.files());
             assert!(matches!(
-                install.preflight(None),
+                install.preflight(None, false),
                 Err(InstallError::Refused(_))
             ));
         }
@@ -2667,8 +2718,8 @@ mod linux {
         }
 
         /// A `pt` that is a link to another place is never written through:
-        /// the install is refused by the location rule, and the copy written
-        /// before it goes again.
+        /// the install is refused by the location rule before anything is
+        /// written, the copy included.
         #[test]
         fn a_pt_folder_that_is_a_link_refuses_the_install() {
             let tree = Tree::new();
@@ -2695,6 +2746,75 @@ mod linux {
             }
             assert!(!install.exe().exists(), "the copy goes again");
             assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        }
+
+        /// The security review of the final pass: a `pt` that would refuse
+        /// lyrebird (here one other accounts can change, as a dotfile
+        /// manager may leave it) refuses an install over an earlier one
+        /// before the executable is replaced, so the earlier copy, which its
+        /// menu entry and link entry start, stays as it was. Before, the new
+        /// copy replaced it and the refusal's undo then removed it.
+        #[test]
+        fn a_bad_pt_folder_leaves_an_earlier_install_in_place() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let pin = lyrebird_pin();
+            let helper = PinnedHelper {
+                bytes: LYREBIRD,
+                sha256: &pin,
+            };
+            install
+                .install_with(&mut std::io::Cursor::new(PROGRAM), Some(helper), None)
+                .unwrap();
+            let before = tree.files();
+            let upgrade = tree.install().with_facts(UID, GID, |path| {
+                let mut facts = owned(path)?;
+                if path.file_name().is_some_and(|n| n == PT_DIR) {
+                    facts.mode = 0o40777;
+                }
+                Ok(facts)
+            });
+            match upgrade.install_with(
+                &mut std::io::Cursor::new(b"\x7fELF the next release".as_slice()),
+                Some(helper),
+                None,
+            ) {
+                Err(InstallError::Refused(why)) => {
+                    assert!(why.starts_with(FOLDER_OTHERS_CAN_CHANGE), "{why}");
+                }
+                other => panic!("installed beside a pt others can change: {other:?}"),
+            }
+            assert_eq!(tree.files(), before);
+            assert_eq!(std::fs::read(install.exe()).unwrap(), PROGRAM);
+            assert_eq!(std::fs::read(install.lyrebird()).unwrap(), LYREBIRD);
+
+            // A `pt` that is a file, not a folder, the same way; without
+            // lyrebird to install, `pt` is not looked at.
+            std::fs::remove_file(install.lyrebird()).unwrap();
+            std::fs::remove_dir(install.pt_dir()).unwrap();
+            std::fs::write(install.pt_dir(), b"not a folder").unwrap();
+            match install.install_with(
+                &mut std::io::Cursor::new(b"\x7fELF the next release".as_slice()),
+                Some(helper),
+                None,
+            ) {
+                Err(InstallError::Refused(why)) => {
+                    assert!(why.contains("is not a folder"), "{why}")
+                }
+                other => panic!("installed beside a pt that is a file: {other:?}"),
+            }
+            assert_eq!(std::fs::read(install.exe()).unwrap(), PROGRAM);
+            install
+                .install_with(
+                    &mut std::io::Cursor::new(b"\x7fELF the next release".as_slice()),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                std::fs::read(install.exe()).unwrap(),
+                b"\x7fELF the next release"
+            );
         }
 
         /// A menu entry that cannot be written removes lyrebird and its
@@ -2743,6 +2863,50 @@ mod linux {
             let removal = install.uninstall().unwrap();
             assert_eq!(removal.left, [install.lyrebird()]);
             assert!(install.pt_dir().is_dir());
+
+            // The security review of the final pass: a `pt` that is a link
+            // (to an unpacked release's `pt`, or a folder holding the user's
+            // own lyrebird) is never removed through, nor its target's
+            // lyrebird, which no install wrote: `lstat` of `pt/lyrebird`
+            // follows the link at `pt`. Both are left and reported.
+            std::fs::remove_file(install.lyrebird()).unwrap();
+            std::fs::remove_dir(install.pt_dir()).unwrap();
+            let elsewhere = tree.root.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join(LINUX_LYREBIRD), LYREBIRD).unwrap();
+            symlink(&elsewhere, install.pt_dir()).unwrap();
+            assert!(
+                !install.installed(),
+                "a lyrebird through a link is not ours"
+            );
+            let removal = install.uninstall().unwrap();
+            assert_eq!(removal.removed, Vec::<PathBuf>::new());
+            assert_eq!(removal.left_in_folder, [install.lyrebird()]);
+            assert_eq!(
+                std::fs::read(elsewhere.join(LINUX_LYREBIRD)).unwrap(),
+                LYREBIRD
+            );
+            assert!(
+                std::fs::symlink_metadata(install.pt_dir())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
+            // A `pt` folder that fails the location rule the same way.
+            std::fs::remove_file(install.pt_dir()).unwrap();
+            std::fs::create_dir(install.pt_dir()).unwrap();
+            std::fs::write(install.lyrebird(), LYREBIRD).unwrap();
+            let shared = tree.install().with_facts(UID, GID, |path| {
+                let mut facts = owned(path)?;
+                if path.file_name().is_some_and(|n| n == PT_DIR) {
+                    facts.mode = 0o40777;
+                }
+                Ok(facts)
+            });
+            let removal = shared.uninstall().unwrap();
+            assert_eq!(removal.left_in_folder, [install.lyrebird()]);
+            assert_eq!(std::fs::read(install.lyrebird()).unwrap(), LYREBIRD);
         }
 
         /// `mimeapps.list` after an install into an empty configuration

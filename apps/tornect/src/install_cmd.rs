@@ -103,6 +103,18 @@ pub(crate) const WINDOWS_NO_BRIDGES: &str = "The installed copy has no lyrebird,
      obfs4 or Snowflake bridges where Tor is blocked; there, run tornect.exe from the unpacked \
      release folder, which holds pt\\lyrebird.exe.";
 
+/// What a Linux uninstall says of a lyrebird it left because its `pt` is a
+/// link, not a folder, or a folder other accounts can change: the install
+/// never writes there, so the file is not its own.
+#[cfg(target_os = "linux")]
+fn left_in_folder_line(path: &std::path::Path) -> String {
+    format!(
+        "{} was left as it is: its folder is a link, not a folder, or can be changed by other \
+         accounts, so tornect install did not put it there.",
+        path.display()
+    )
+}
+
 /// What a Linux uninstall says about a `mimeapps.list` that still names the
 /// link entry and could not be changed (design `invite` §4.6).
 #[cfg(target_os = "linux")]
@@ -509,8 +521,11 @@ pub(crate) trait UserInstall {
     fn exe(&self) -> PathBuf;
     /// This user's `mimeapps.list`, named in what the commands say.
     fn mimeapps(&self) -> PathBuf;
-    /// What `install` checks before writing, writing nothing.
-    fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError>;
+    /// What `install` checks before writing, writing nothing; `lyrebird`:
+    /// whether lyrebird is to be installed too, so its `pt` folder is
+    /// checked as well.
+    fn preflight(&self, home: Option<&std::path::Path>, lyrebird: bool)
+    -> Result<(), InstallError>;
     /// Copy `source` and `lyrebird`, write the menu entry and the link
     /// entry, and name the link entry in `mimeapps.list`: what that last
     /// step did.
@@ -537,8 +552,12 @@ impl UserInstall for tornect_platform::install::LinuxInstall {
         Self::mimeapps(self)
     }
 
-    fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError> {
-        Self::preflight(self, home)
+    fn preflight(
+        &self,
+        home: Option<&std::path::Path>,
+        lyrebird: bool,
+    ) -> Result<(), InstallError> {
+        Self::preflight(self, home, lyrebird)
     }
 
     fn install(
@@ -574,7 +593,7 @@ pub(crate) fn install_linux(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!deps.host_running, CLOSE_FIRST);
     let home = unattended::launch_home(paths)?;
-    files.preflight(home.as_deref())?;
+    files.preflight(home.as_deref(), lyrebird.is_ok())?;
     authorize(paths, deps.ctx, &ExternalOp::Install)?;
     let links = match files.install(source, lyrebird.as_ref().ok().copied(), home.as_deref()) {
         Ok(links) => links,
@@ -633,6 +652,9 @@ pub(crate) fn uninstall_linux(
             "{} is not a regular file, so it was left as it is.",
             path.display()
         ));
+    }
+    for path in removal.left_in_folder {
+        deps.console.out(&left_in_folder_line(&path));
     }
     if let tornect_platform::install::Association::Left(why) = &removal.association {
         deps.console
@@ -1083,6 +1105,10 @@ mod tests {
         association: Association,
         /// The lyrebird each install was handed.
         lyrebirds: Mutex<Vec<Option<Vec<u8>>>>,
+        /// Whether each preflight was told lyrebird goes too.
+        preflight_lyrebird: Mutex<Vec<bool>>,
+        /// What the uninstall leaves in a `pt` that is not its own.
+        left_in_folder: Vec<PathBuf>,
     }
 
     impl UserInstall for FakeFiles {
@@ -1094,8 +1120,13 @@ mod tests {
             self.dir.join("config").join("mimeapps.list")
         }
 
-        fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError> {
+        fn preflight(
+            &self,
+            home: Option<&std::path::Path>,
+            lyrebird: bool,
+        ) -> Result<(), InstallError> {
             self.homes.lock().unwrap().push(home.map(PathBuf::from));
+            self.preflight_lyrebird.lock().unwrap().push(lyrebird);
             Ok(())
         }
 
@@ -1125,6 +1156,7 @@ mod tests {
         fn uninstall(&self) -> Result<Removal, InstallError> {
             let mut removal = Removal {
                 association: self.association.clone(),
+                left_in_folder: self.left_in_folder.clone(),
                 ..Removal::default()
             };
             if self.exe().exists() {
@@ -1354,6 +1386,8 @@ mod tests {
                 links: LinkHandler::Registered,
                 association: Association::NotThere,
                 lyrebirds: Mutex::new(Vec::new()),
+                preflight_lyrebird: Mutex::new(Vec::new()),
+                left_in_folder: Vec::new(),
             },
         }
     }
@@ -1476,6 +1510,9 @@ mod tests {
                 *env.files.lyrebirds.lock().unwrap(),
                 [with.then(|| BYTES.to_vec())]
             );
+            // The security review of the final pass: the checks before the
+            // dialog include lyrebird's `pt` folder whenever it goes too.
+            assert_eq!(*env.files.preflight_lyrebird.lock().unwrap(), [with]);
             let line = no_bridges_line(NO_LYREBIRD_HERE);
             assert_eq!(script.said(&line), !with, "{:?}", script.lines);
             assert!(
@@ -1623,6 +1660,23 @@ mod tests {
             assert!(script.said(&said), "{links:?}: {:?}", script.lines);
             assert!(env.files.installed(), "{links:?}");
         }
+    }
+
+    /// The security review of the final pass: a lyrebird the uninstall left
+    /// in a `pt` that is not its own (a link, or a folder others can change)
+    /// is named, with why.
+    #[test]
+    fn the_uninstall_names_a_lyrebird_it_left_in_a_folder_not_its_own() {
+        let mut env = linux_env(4);
+        let backends = Backends::default();
+        env.install(&[None], &backends).0.unwrap();
+        let left = env.files.dir.join("pt").join("lyrebird");
+        env.files.left_in_folder = vec![left.clone()];
+        let (done, script) = env.uninstall(&|spec| backends.make(spec));
+        done.unwrap();
+        let line = left_in_folder_line(&left);
+        assert!(line.starts_with(&format!("{} was left as it is", left.display())));
+        assert!(script.said(&line), "{:?}", script.lines);
     }
 
     /// Design `invite` §4.6: an uninstall that could not take the link entry
