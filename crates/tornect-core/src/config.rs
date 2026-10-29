@@ -76,7 +76,7 @@ pub const MAX_STUN_HOST_LEN: usize = 253;
 pub struct Config {
     /// Schema version (for migrations).
     pub version: u32,
-    /// Naming and startup.
+    /// Naming and the window's look.
     pub general: General,
     /// Connectivity and privacy mode (`docs/PLAN.md` §A.4, §B.6).
     pub network: Network,
@@ -99,7 +99,8 @@ pub struct Config {
 /// is ignored and no longer written (decision M1-90): starting at sign-in
 /// widens access, so only `tornect service install` or the window's setting
 /// makes that change, behind OS re-authentication (§B.8.6.2, §B.8.7.5),
-/// never a line of this file.
+/// never a line of this file. Set to `true`, it is named by a warning and
+/// by `tornect doctor` ([`retired_keys_set`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
@@ -457,7 +458,8 @@ pub struct Media {
 /// A file that still holds the retired `view_only_default` or `crash_dumps`
 /// keys loads, and they are ignored and no longer written (decision M1-90):
 /// nothing ever read them. The host's question offers each answer it may,
-/// and Tornect writes no crash dumps.
+/// and Tornect writes no crash dumps. Set to `true`, each is named by a
+/// warning and by `tornect doctor` ([`retired_keys_set`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Security {
@@ -613,10 +615,98 @@ pub fn default_device_name() -> String {
     NEUTRAL.to_owned()
 }
 
+/// A key an older Tornect wrote and nothing ever read (decision M1-90). It
+/// still loads and changes nothing, and the next save of the settings
+/// leaves it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredKey {
+    /// `table.key`, as `config.toml` names it.
+    pub name: &'static str,
+    /// What is true instead.
+    pub instead: &'static str,
+}
+
+impl RetiredKey {
+    /// The line `tornect doctor` prints, and the warning a load logs, for a
+    /// file that sets this key to `true`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "config: {} = true is retired and has no effect (decision M1-90): {}; the next \
+             settings save removes it",
+            self.name, self.instead
+        )
+    }
+}
+
+/// Every retired key ([`RetiredKey`]).
+pub const RETIRED_KEYS: [RetiredKey; 3] = [
+    RetiredKey {
+        name: "general.autostart",
+        instead: "Tornect starts at sign-in only after `tornect service install` or the \
+                  window's setting",
+    },
+    RetiredKey {
+        name: "security.view_only_default",
+        instead: "sessions are not view-only by default; the host's question offers view only, \
+                  and a grant's level sets it for an unattended device",
+    },
+    RetiredKey {
+        name: "security.crash_dumps",
+        instead: "Tornect writes no crash dumps",
+    },
+];
+
+/// The retired keys ([`RETIRED_KEYS`]) that `text`, a `config.toml`, sets
+/// to `true`: a person who set one expected something no Tornect did, so
+/// they are told rather than left believing it, before a save drops the key
+/// without a word. A file that does not parse names none; its load fails
+/// with its own message.
+#[must_use]
+pub fn retired_keys_set(text: &str) -> Vec<RetiredKey> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    RETIRED_KEYS
+        .into_iter()
+        .filter(|k| {
+            k.name.split_once('.').is_some_and(|(section, key)| {
+                table
+                    .get(section)
+                    .and_then(|t| t.get(key))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+            })
+        })
+        .collect()
+}
+
+/// Log each retired key `text` sets ([`retired_keys_set`]) as a warning,
+/// once per file and process: the window and a command load the file
+/// several times.
+fn warn_retired_keys(path: &Path, text: &str) {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let set = retired_keys_set(text);
+    if set.is_empty() {
+        return;
+    }
+    let first = WARNED
+        .lock()
+        .map(|mut warned| warned.insert(path.to_path_buf()))
+        .unwrap_or(true);
+    if first {
+        for key in set {
+            tracing::warn!(key = key.name, "{}", key.line());
+        }
+    }
+}
+
 impl Config {
     /// Load from `path`; a missing file yields the defaults. An earlier
     /// default the file still holds is read as today's
-    /// ([`Network::migrate_defaults`]).
+    /// ([`Network::migrate_defaults`]); a retired key set to `true` is
+    /// logged as a warning ([`retired_keys_set`]).
     pub fn load(path: &Path) -> Result<Self> {
         let text = match fs_err::read_to_string(path) {
             Ok(t) => t,
@@ -627,6 +717,7 @@ impl Config {
             path: path.to_path_buf(),
             source: Box::new(crate::error::TomlError::new(&text, &source)),
         })?;
+        warn_retired_keys(path, &text);
         cfg.network.migrate_defaults();
         cfg.validate()?;
         Ok(cfg)
@@ -897,6 +988,77 @@ crash_dumps = true
                 "`{retired}` written:\n{written}"
             );
         }
+    }
+
+    /// The documentation pass's security review: a file that sets a retired
+    /// key to `true` is told so, by the line `tornect doctor` prints and by
+    /// a warning when it loads (once per file), before the next save drops
+    /// the key; `false`, an absent key and an unparseable file name none.
+    #[test]
+    fn a_retired_key_set_to_true_is_named() {
+        use std::sync::{Arc, Mutex};
+
+        let old = "[general]\nautostart = true\n\n[security]\npanic_key = \"Ctrl+Alt+End\"\n\
+                   view_only_default = true\ncrash_dumps = false\n";
+        let set = retired_keys_set(old);
+        assert_eq!(
+            set.iter().map(|k| k.name).collect::<Vec<_>>(),
+            ["general.autostart", "security.view_only_default"]
+        );
+        assert_eq!(
+            set[1].line(),
+            "config: security.view_only_default = true is retired and has no effect (decision \
+             M1-90): sessions are not view-only by default; the host's question offers view \
+             only, and a grant's level sets it for an unattended device; the next settings save \
+             removes it"
+        );
+        assert!(retired_keys_set("[security]\ncrash_dumps = false\n").is_empty());
+        assert!(retired_keys_set("[general]\ndevice_name = \"Desk\"\n").is_empty());
+        assert!(retired_keys_set("not = [toml").is_empty());
+        assert_eq!(
+            retired_keys_set("[security]\ncrash_dumps = true\n")[0].name,
+            "security.crash_dumps"
+        );
+        for key in RETIRED_KEYS {
+            let (section, name) = key.name.split_once('.').unwrap();
+            assert_eq!(
+                retired_keys_set(&format!("[{section}]\n{name} = true\n")),
+                [key]
+            );
+        }
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, old).unwrap();
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(Config::load(&path).unwrap(), Config::default());
+            Config::load(&path).unwrap();
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged.matches("is retired and has no effect").count(),
+            2,
+            "{logged}"
+        );
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(logged.contains(&set[0].line()), "{logged}");
     }
 
     /// A8 (§B.8.15): policy never lives in `config.toml` — an `[unattended]` table is

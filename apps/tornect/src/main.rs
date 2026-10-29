@@ -1213,6 +1213,20 @@ fn config_show(paths: &Paths) -> anyhow::Result<String> {
     Ok(Config::load(&paths.config_file())?.to_toml()?)
 }
 
+/// `tornect doctor`'s lines for the retired keys `config.toml` sets to
+/// `true` (decision M1-90): each still loads and changes nothing, and the
+/// next settings save drops it, so doctor says so.
+fn retired_key_lines(cfg_path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(cfg_path)
+        .map(|text| {
+            tornect_core::config::retired_keys_set(&text)
+                .iter()
+                .map(tornect_core::config::RetiredKey::line)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
     println!(
         "tornect {} ({} {})",
@@ -1257,6 +1271,9 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
             cfg.network.lan_only
         ),
         Err(e) => println!("config: {} [ERROR: {e}]", cfg_path.display()),
+    }
+    for line in retired_key_lines(&cfg_path) {
+        println!("{line}");
     }
     let tor = Config::load(&cfg_path).map(|c| c.tor).unwrap_or_default();
     let lyrebird = tornect_signal::tor::find_lyrebird(tor.pt_path.as_deref());
@@ -1710,6 +1727,31 @@ mod tests {
             connect.contains("the window, `tornect` without a subcommand, shows them"),
             "{connect}"
         );
+    }
+
+    /// The documentation pass's security review: doctor names each retired
+    /// key the file sets to `true`, and nothing for a file without one or
+    /// no file at all.
+    #[test]
+    fn doctor_names_a_retired_key_set_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(super::retired_key_lines(&path).is_empty());
+        std::fs::write(
+            &path,
+            "[security]\nview_only_default = true\ncrash_dumps = false\n",
+        )
+        .unwrap();
+        let lines = super::retired_key_lines(&path);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "config: security.view_only_default = true is retired and has no effect"
+            ),
+            "{lines:?}"
+        );
+        std::fs::write(&path, "[general]\ndevice_name = \"Desk\"\n").unwrap();
+        assert!(super::retired_key_lines(&path).is_empty());
     }
 
     /// U3-L3: `--help` says that no log filter writes identifiers, and
