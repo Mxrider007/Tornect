@@ -555,6 +555,25 @@ fn verdict(action_id: &str, result: &AuthorizationResult) -> Result<(), ReAuthEr
     Err(ReAuthError::Denied)
 }
 
+/// What a failed `CheckAuthorization` call means for the operator.
+///
+/// An unregistered action is not a denial: the host has no policy file, so
+/// no dialog can ever be raised, and `Denied` would tell the operator they
+/// typed the wrong password. The message names where the file is: in the
+/// Linux release zip and in the source tree (decision M1-89).
+#[cfg(target_os = "linux")]
+fn call_error(action_id: &str, text: String) -> ReAuthError {
+    if text.contains("is not registered") {
+        ReAuthError::Unavailable(format!(
+            "polkit action `{action_id}` is not registered on this host — install \
+             org.tornect.policy (polkit/ in the Linux release zip, packaging/polkit/ in the \
+             source) into /usr/share/polkit-1/actions/ and restart polkit ({text})"
+        ))
+    } else {
+        ReAuthError::Failed(text)
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl Default for PolkitReAuth {
     fn default() -> Self {
@@ -716,21 +735,7 @@ impl PolkitReAuth {
             }
         };
 
-        let reply = reply.map_err(|e| {
-            let text = e.to_string();
-            if text.contains("is not registered") {
-                // Not a denial. The host has no policy file, so no dialog can
-                // ever be raised — reporting `Denied` would tell the operator
-                // they typed the wrong password.
-                ReAuthError::Unavailable(format!(
-                    "polkit action `{action_id}` is not registered on this host — install \
-                     packaging/polkit/org.tornect.policy into /usr/share/polkit-1/actions/ \
-                     and restart polkit ({text})"
-                ))
-            } else {
-                ReAuthError::Failed(text)
-            }
-        })?;
+        let reply = reply.map_err(|e| call_error(action_id, e.to_string()))?;
 
         let result: AuthorizationResult = reply
             .body()
@@ -885,6 +890,35 @@ mod tests {
         assert!(matches!(
             verdict("org.tornect.grant", &answer(false, false, false)),
             Err(ReAuthError::Denied)
+        ));
+    }
+
+    /// An action polkit does not know is Unavailable, never Denied, and the
+    /// message says where the policy file is: in the Linux release zip and in
+    /// the source tree (decision M1-89). Any other call error is Failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unregistered_action_names_where_the_policy_file_is() {
+        let text = "org.freedesktop.PolicyKit1.Error.Failed: Action org.tornect.grant is not \
+                    registered"
+            .to_owned();
+        match call_error("org.tornect.grant", text) {
+            ReAuthError::Unavailable(m) => {
+                for said in [
+                    "`org.tornect.grant` is not registered",
+                    "polkit/ in the Linux release zip",
+                    "packaging/polkit/ in the source",
+                    "/usr/share/polkit-1/actions/",
+                    "restart polkit",
+                ] {
+                    assert!(m.contains(said), "`{said}` not in: {m}");
+                }
+            }
+            other => panic!("an unregistered action must read as Unavailable, got {other:?}"),
+        }
+        assert!(matches!(
+            call_error("org.tornect.grant", "the bus went away".to_owned()),
+            ReAuthError::Failed(_)
         ));
     }
 
