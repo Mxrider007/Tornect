@@ -688,15 +688,20 @@ fn package(
         0o644,
         Some(platform.bundle.notice_sha256),
     )?;
-    place(&root.join("LICENSE"), &dir.join("LICENSE"), 0o644, None)?;
     place(
-        &root.join("THIRD_PARTY_NOTICES.md"),
+        &repo_file(root, "LICENSE")?,
+        &dir.join("LICENSE"),
+        0o644,
+        None,
+    )?;
+    place(
+        &repo_file(root, "THIRD_PARTY_NOTICES.md")?,
         &dir.join("THIRD_PARTY_NOTICES.md"),
         0o644,
         None,
     )?;
     place(
-        &root.join(README),
+        &repo_file(root, README)?,
         &dir.join("README-release.md"),
         0o644,
         None,
@@ -706,7 +711,7 @@ fn package(
         if let Some(parent) = policy.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        place(&root.join(POLKIT_POLICY), &policy, 0o644, None)?;
+        place(&repo_file(root, POLKIT_POLICY)?, &policy, 0o644, None)?;
         // The copy that goes into the zip, so a trial build of a dirty tree
         // is held to the rule as well.
         let staged =
@@ -1242,8 +1247,37 @@ fn strip(tools: &Tools, platform: Platform, from: &Path, to: &Path) -> anyhow::R
     Ok(record)
 }
 
-/// Copy a file into the staging tree with a fixed mode, re-checking a pinned one.
+/// A file of the repository that dist copies into a zip, by its path below
+/// `root`: no component below the root may be a link, and the file must be
+/// a regular file. A committed link (git mode 120000) passes the clean-tree
+/// check, and `fs::copy` follows it, so without this a link committed in
+/// place of the policy file or a README would put any file this machine can
+/// read into a public zip.
+fn repo_file(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    for part in Path::new(rel).components() {
+        path.push(part);
+        let meta =
+            fs::symlink_metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+        ensure!(
+            !meta.file_type().is_symlink(),
+            "{} is a link; dist copies only the repository's own files into a zip",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Copy a regular file (never through a link) into the staging tree with a
+/// fixed mode, re-checking a pinned one.
 fn place(from: &Path, to: &Path, mode: u32, pin: Option<&str>) -> anyhow::Result<()> {
+    let meta = fs::symlink_metadata(from).with_context(|| format!("reading {}", from.display()))?;
+    ensure!(
+        meta.file_type().is_file(),
+        "{} is not a regular file (a link, a folder or a device); dist copies only regular \
+         files into a zip",
+        from.display()
+    );
     fs::copy(from, to)
         .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
     pt::set_mode(to, mode)?;
@@ -1842,6 +1876,45 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             )),
             "the Windows install copies another name than the zip's lyrebird"
         );
+    }
+
+    /// The documentation pass's security review: a source that is a link,
+    /// or that sits below a link, is refused, so a link committed in place of
+    /// a file dist zips cannot pull another file of this machine into a zip;
+    /// a regular file is copied with its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_source_is_refused() {
+        let base = std::env::temp_dir().join(format!("xtask-place-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let secret = base.join("outside").join("secret");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, "not for a zip").unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join("packaging")).unwrap();
+        fs::write(repo.join("LICENSE"), "GPL").unwrap();
+        std::os::unix::fs::symlink(&secret, repo.join("README")).unwrap();
+        std::os::unix::fs::symlink(secret.parent().unwrap(), repo.join("packaging/polkit"))
+            .unwrap();
+        let out = base.join("stage");
+        fs::create_dir_all(&out).unwrap();
+
+        let staged = out.join("README");
+        let refused = place(&repo.join("README"), &staged, 0o644, None).unwrap_err();
+        assert!(
+            refused.to_string().contains("not a regular file"),
+            "{refused}"
+        );
+        assert!(!staged.exists());
+        assert!(repo_file(&repo, "README").is_err());
+        let refused = repo_file(&repo, "packaging/polkit/secret").unwrap_err();
+        assert!(refused.to_string().contains("is a link"), "{refused}");
+        assert!(place(&repo.join("packaging"), &out.join("p"), 0o644, None).is_err());
+
+        let license = repo_file(&repo, "LICENSE").unwrap();
+        place(&license, &out.join("LICENSE"), 0o644, None).unwrap();
+        assert_eq!(fs::read_to_string(out.join("LICENSE")).unwrap(), "GPL");
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// Decision M1-89: the Linux zip carries polkit's policy file, without
