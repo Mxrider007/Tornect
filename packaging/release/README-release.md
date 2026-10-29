@@ -150,7 +150,7 @@ The sharing side then asks "Deny", "View only" or "Allow control". Only a mouse
 click answers "Allow control", "View only" and the two "codes match" buttons,
 and only once the question has been on screen for a second: keys typed for
 another program never answer it. Deny also works from the keyboard. A computer
-you connected to stays on Home: **Knock** asks for a session again (the person
+you paired with stays on Home: **Knock** asks for a session again (the person
 there answers), and **Check if reachable** asks whether it answers.
 
 **The session.** The picture opens in its own window, with a toolbar:
