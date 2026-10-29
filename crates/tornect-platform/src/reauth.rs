@@ -704,7 +704,9 @@ impl PolkitReAuth {
         // authorization — upstream's source shows it guards only the root
         // bypass — so "a fresh dialog per operation" (§B.8.6.2) rests on the
         // policy file declaring `auth_self` rather than `auth_self_keep`. The
-        // shipped policy does; a packager who changes it silently weakens the
+        // shipped policy does, and `cargo xtask verify` and `cargo xtask dist`
+        // refuse a policy file that does not (`xtask/src/polkit.rs`); a
+        // packager who changes the installed copy still silently weakens the
         // guarantee, which is why the file carries a comment saying so.
         const FLAGS: u32 = 1 | 2;
         let empty: HashMap<&str, &str> = HashMap::new();
@@ -804,6 +806,76 @@ mod tests {
         }
     }
 
+    /// Every `op` string the guard passes to `ReAuth::reauthenticate`:
+    /// `access_increasing(..)` call sites plus `ExternalOp::name()`, and the
+    /// banner's acknowledgement.
+    #[cfg(target_os = "linux")]
+    const GUARD_OPS: [&str; 19] = [
+        "create_grant",
+        "set_password",
+        "reg_start",
+        "master_on",
+        "enable",
+        "resume",
+        "unlock",
+        "set_settings",
+        "set_options",
+        "service_install",
+        "service_install_elevated",
+        "service_uninstall",
+        "backup_export",
+        "backup_import",
+        "identity_view",
+        "settings_change",
+        "install",
+        "uninstall",
+        "acknowledge_banner",
+    ];
+
+    /// The shipped policy file, as the Linux zip carries it.
+    #[cfg(target_os = "linux")]
+    const POLICY: &str = include_str!("../../../packaging/polkit/org.tornect.policy");
+
+    /// The security review of the documentation pass: the action ids the
+    /// committed policy file declares are exactly the ones `action_for` can
+    /// return, for every operation the guard names and for one it does not
+    /// know. A class the client asks for that the file lacks would fail
+    /// closed ("is not registered"); an action the file declares that no
+    /// operation asks for is one nobody reviews. That every default of every
+    /// action is `auth_self` is `cargo xtask verify`'s check, and dist's on
+    /// the copy it stages (`xtask/src/polkit.rs`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_policy_file_declares_exactly_the_actions_the_client_asks_for() {
+        let mut text = POLICY.to_owned();
+        while let Some(start) = text.find("<!--") {
+            let end = start + text[start..].find("-->").expect("comment closed") + 3;
+            text.replace_range(start..end, "");
+        }
+        let mut declared = Vec::new();
+        for (at, open) in text.match_indices("<action ") {
+            let rest = &text[at + open.len()..];
+            let id = rest
+                .strip_prefix("id=\"")
+                .and_then(|r| r.split('"').next())
+                .unwrap_or_else(|| panic!("an <action> without a leading id: {rest:.60}"));
+            declared.push(id.to_owned());
+        }
+        let unique: std::collections::BTreeSet<String> = declared.iter().cloned().collect();
+        assert_eq!(unique.len(), declared.len(), "an action is declared twice");
+
+        let p = PolkitReAuth::new();
+        let asked: std::collections::BTreeSet<String> = GUARD_OPS
+            .iter()
+            .chain(&["an_operation_this_build_does_not_know"])
+            .map(|op| p.action_for(op))
+            .collect();
+        assert_eq!(
+            unique, asked,
+            "packaging/polkit/org.tornect.policy declares other actions than the client asks for"
+        );
+    }
+
     /// Every operation the mutation guard can name maps to one of the five
     /// registered action ids, and an unknown one lands on the most
     /// consequential wording rather than the mildest.
@@ -819,28 +891,7 @@ mod tests {
             "org.tornect.export",
             "org.tornect.settings",
         ];
-        // Every `op` string the guard passes to `ReAuth::reauthenticate`:
-        // `access_increasing(..)` call sites plus `ExternalOp::name()`.
-        for op in [
-            "create_grant",
-            "set_password",
-            "reg_start",
-            "master_on",
-            "enable",
-            "resume",
-            "unlock",
-            "set_settings",
-            "set_options",
-            "service_install",
-            "service_install_elevated",
-            "service_uninstall",
-            "backup_export",
-            "backup_import",
-            "identity_view",
-            "settings_change",
-            "install",
-            "uninstall",
-        ] {
+        for op in GUARD_OPS {
             let action = p.action_for(op);
             assert!(
                 registered.contains(&action.as_str()),

@@ -27,6 +27,9 @@
   does not override that — upstream's source shows it guards only the root
   bypass — so this file is the only thing holding that guarantee up. Changing
   `auth_self` to `auth_self_keep` silently weakens Tornect's security model.
+  `cargo xtask verify` and `cargo xtask dist` refuse this file unless every
+  default of every action is `auth_self`, the actions are exactly the five
+  below and nothing is annotated (xtask/src/polkit.rs).
 
   All three defaults are `auth_self`, including `allow_any` and
   `allow_inactive`: §B.8.8 names a text agent over SSH, and a host started as a

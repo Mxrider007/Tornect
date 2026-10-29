@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, bail, ensure};
 
-use crate::{licences, pt, sha256};
+use crate::{licences, polkit, pt, sha256};
 
 /// Everything dist writes lives under this directory of the workspace.
 const OUT: &str = "target/dist";
@@ -33,7 +33,8 @@ const README: &str = "packaging/release/README-release.md";
 /// polkit's actions for the Linux re-authentication (§B.8.8): every change
 /// that widens access is refused until root installs this file, so the
 /// Linux zip carries it (decision M1-89).
-const POLKIT_POLICY: &str = "packaging/polkit/org.tornect.policy";
+/// Dist stages it only after [`polkit::check`] passes on the staged copy.
+const POLKIT_POLICY: &str = polkit::SOURCE;
 /// Where the Linux zip holds [`POLKIT_POLICY`].
 const POLKIT_IN_ZIP: &str = "polkit/org.tornect.policy";
 
@@ -717,6 +718,11 @@ fn package(
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         place(&root.join(POLKIT_POLICY), &policy, 0o644, None)?;
+        // The copy that goes into the zip, so a trial build of a dirty tree
+        // is held to the rule as well.
+        let staged =
+            fs::read_to_string(&policy).with_context(|| format!("reading {}", policy.display()))?;
+        polkit::check(POLKIT_IN_ZIP, &staged)?;
         let said = capture(Command::new(dir.join(platform.exe)).arg("--version"))?;
         ensure!(
             said == format!("tornect {version}"),

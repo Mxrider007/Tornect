@@ -1,8 +1,8 @@
 //! `cargo xtask <command>` — repository automation (`docs/PLAN.md` §D.5).
 //!
-//! * `verify`      — plan sync, forbidden-dependency check, `cargo deny` (offline;
-//!   the gate fails without it), fmt check, clippy `-D warnings` on all targets,
-//!   tests, docs
+//! * `verify`      — plan sync, the polkit policy's `auth_self` check,
+//!   forbidden-dependency check, `cargo deny` (offline; the gate fails without
+//!   it), fmt check, clippy `-D warnings` on all targets, tests, docs
 //! * `lint-all`    — fmt check + clippy only
 //! * `pt-fetch`    — lyrebird from the Tor Project archive, checked against
 //!   `packaging/pt/SOURCES.md`, into `target/pt/<os>/`
@@ -17,6 +17,7 @@
 
 mod dist;
 mod licences;
+mod polkit;
 mod pt;
 mod sha256;
 
@@ -576,6 +577,7 @@ fn require_cargo_deny(found: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
     let no_tests = extra.iter().any(|a| a == "--no-tests");
     plan_sync(root)?;
+    polkit::check_committed(root)?;
     forbidden_deps(root)?;
     deny(root)?;
     lint_all(root)?;
