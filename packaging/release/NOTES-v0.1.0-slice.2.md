@@ -361,5 +361,6 @@ Critical or High issue; every Medium was fixed.
 - **The final audit before this release** (2026-10-28): two major and seven minor findings, fixed in `66c03834`,
   `81c17944`, `9a64b5f9`, `0a503bd1` and `5a507b1f`, except the Windows half of F1/F4 (decision M1-88, open).
 
-**Not reviewed:** the final audit's fixes above, the documentation since them, and the commits between the last
-review and `@@COMMIT@@` that the owner's release run adds.
+**Not reviewed:** the final audit's fixes above, the documentation since them, the closing gate's fix of
+`tornect config show` (`800e64bf`), and the commits between the last review and `@@COMMIT@@` that the owner's
+release run adds.
