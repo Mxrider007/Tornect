@@ -365,7 +365,35 @@ fn start_panic_key(
     tokio::spawn(async move {
         let state = tornect_platform::hotkey::bind(chord, pressed).await;
         tracing::info!(row = state.row(), "panic key");
+        if let Some(line) = panic_key_unbound_line(state, &text, WINDOW_HOST.load(Ordering::SeqCst))
+        {
+            eprintln!("{line}");
+        }
     });
+}
+
+/// What a terminal host prints when its panic key `chord` ended `state`
+/// without being bound: the terminal is where a terminal host says what it
+/// is, and a release build's default filter shows no INFO line, so without
+/// it nothing there would say that the key does nothing (§B.6: the panic key
+/// always works host-side, or the host says it does not). `None` while the
+/// key is bound, and for the window host, whose Settings > Security page and
+/// readiness row show the state.
+fn panic_key_unbound_line(
+    state: tornect_platform::hotkey::KeyState,
+    chord: &str,
+    window_host: bool,
+) -> Option<String> {
+    use tornect_platform::hotkey::KeyState;
+    match state {
+        KeyState::Bound | KeyState::NotTried => None,
+        KeyState::Unavailable if window_host => None,
+        KeyState::Unavailable => Some(format!(
+            "warning: the panic key is not bound: this desktop did not let Tornect watch {chord} \
+             (on Linux that needs the desktop's global-shortcuts portal), so pressing it does \
+             nothing; `tornect panic` or Ctrl-C in this terminal ends sessions"
+        )),
+    }
 }
 
 /// Whether this process is the window host, whose indicator is a window on
@@ -5093,6 +5121,36 @@ mod tests {
         );
         assert_eq!(host_task.await.unwrap(), Served::Session);
         assert_eq!(wiring.live.count(), 0);
+    }
+
+    /// A terminal host whose panic key could not be bound says so on its
+    /// terminal, whatever the log filter: a release build shows no INFO line,
+    /// and before this line the portal's INFO line was the only place that
+    /// said the key does nothing. Nothing is printed for a bound key, nor by
+    /// the window host, whose Settings > Security page shows the state.
+    #[test]
+    fn a_terminal_host_whose_panic_key_is_unbound_says_so() {
+        use tornect_platform::hotkey::KeyState;
+        let line = panic_key_unbound_line(KeyState::Unavailable, "Ctrl+Alt+End", false)
+            .expect("an unbound key is said");
+        assert!(
+            line.starts_with("warning: the panic key is not bound: "),
+            "{line}"
+        );
+        assert!(line.contains("Ctrl+Alt+End"), "{line}");
+        assert!(line.contains("`tornect panic`"), "{line}");
+        assert_eq!(
+            panic_key_unbound_line(KeyState::Bound, "Ctrl+Alt+End", false),
+            None
+        );
+        assert_eq!(
+            panic_key_unbound_line(KeyState::NotTried, "Ctrl+Alt+End", false),
+            None
+        );
+        assert_eq!(
+            panic_key_unbound_line(KeyState::Unavailable, "Ctrl+Alt+End", true),
+            None
+        );
     }
 
     /// §B.8.7.4: each press ends what the host serves, the kill first; a second
