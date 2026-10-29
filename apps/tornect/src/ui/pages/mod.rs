@@ -5350,11 +5350,14 @@ mod tests {
             connection::ROUTER_SWITCH,
             "Ask this network's router to open a port (UPnP, NAT-PMP, PCP)"
         );
+        // Only UPnP carries a description ("Tornect"); PCP and NAT-PMP have
+        // no field for one (`tornect-net` `mapping/upnp.rs` `DESCRIPTION`).
         assert_eq!(
             connection::ROUTER_LINE,
-            "The opening is for one session and shows as \"Tornect\" in the router's settings. \
-             Tornect closes it when the session ends; if Tornect stops first, most routers drop it \
-             within 10 minutes, and Tornect removes it at its next start."
+            "The opening is for one session. A UPnP opening shows as \"Tornect\" in the router's \
+             settings; a PCP or NAT-PMP one carries no name. Tornect closes it when the session \
+             ends; if Tornect stops first, most routers drop it within 10 minutes, and Tornect \
+             removes it at its next start."
         );
         assert_eq!(
             connection::PUBLIC_ANYWAY,

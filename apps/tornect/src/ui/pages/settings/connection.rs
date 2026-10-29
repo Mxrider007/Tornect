@@ -127,8 +127,9 @@ pub(in super::super) const ROUTER_SWITCH: &str = "Ask this network's router to o
                                                   (UPnP, NAT-PMP, PCP)";
 
 /// Under [`ROUTER_SWITCH`].
-pub(in super::super) const ROUTER_LINE: &str = "The opening is for one session and shows as \
-                                                \"Tornect\" in the router's settings. Tornect \
+pub(in super::super) const ROUTER_LINE: &str = "The opening is for one session. A UPnP opening \
+                                                shows as \"Tornect\" in the router's settings; a \
+                                                PCP or NAT-PMP one carries no name. Tornect \
                                                 closes it when the session ends; if Tornect stops \
                                                 first, most routers drop it within 10 minutes, \
                                                 and Tornect removes it at its next start.";

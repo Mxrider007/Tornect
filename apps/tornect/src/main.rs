@@ -255,10 +255,11 @@ enum Command {
         )]
         count: u32,
     },
-    /// Connect to a host by Tornect ID over Tor: pair with it if it is new
-    /// (both screens show a code to compare), then ask for a session its user
-    /// must accept, receive the shared screen, and keep the session alive until
-    /// Ctrl-C.
+    /// Connect to a host by Tornect ID (found and checked over Tor): pair with
+    /// it if it is new (both screens show a code to compare), then ask for a
+    /// session its user must accept, and receive the shared screen, directly
+    /// when the two computers can reach each other and over Tor otherwise (the
+    /// `ROUTE` line says which). Keep the session alive until Ctrl-C.
     ///
     /// This command shows no picture: it decodes and counts the pictures (the
     /// window, `tornect` without a subcommand, shows them). Uses this
@@ -1659,17 +1660,19 @@ mod tests {
         assert!(super::Cli::try_parse_from(["tornect", "remove-at-restart"]).is_err());
     }
 
-    /// B32: `--help` describes what this build does: a remote desktop whose
-    /// pictures travel over Tor, not the direct QUIC or the game streaming
+    /// B32: `--help` describes what this build does, not the game streaming
     /// that later milestones plan; and `connect` no longer says there is no
-    /// viewer window, which the window has.
+    /// viewer window, which the window has. Since the direct path is on
+    /// (`INTERNET_DIRECT`), the help names Tor for finding and checking the
+    /// other computer, and the direct connection when the two computers can
+    /// reach each other (the final audit's documentation findings).
     #[test]
     fn the_help_describes_this_build() {
         let help = super::Cli::command().render_help().to_string();
         assert!(
             help.contains(
-                "Tornect — remote desktop over Tor onion services: no servers, no accounts, no \
-                 port forwarding"
+                "Tornect — remote desktop that finds and checks the other computer over Tor, \
+                 then connects directly when it can: no servers, no accounts, no port forwarding"
             ),
             "{help}"
         );
@@ -1683,6 +1686,12 @@ mod tests {
             .to_string();
         let connect = connect.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(!connect.contains("no viewer window"), "{connect}");
+        assert!(
+            connect.contains(
+                "directly when the two computers can reach each other and over Tor otherwise"
+            ),
+            "{connect}"
+        );
         assert!(
             connect.contains("the window, `tornect` without a subcommand, shows them"),
             "{connect}"
