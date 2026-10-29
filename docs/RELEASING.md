@@ -1,8 +1,9 @@
 # Releasing
 
 Until M8 brings installers (MSI/winget, a notarized `.dmg`, AppImage/Flatpak; `docs/PLAN.md`), a
-release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release notes, all made by
-`cargo xtask dist` on a Linux x86_64 machine.
+release is a GitHub **pre-release** with two zips and `SHA256SUMS`, made by `cargo xtask dist` on
+a Linux x86_64 machine, and release notes written by hand from the release's template under
+`packaging/release/` (decision M1-52, item 8; step 4a).
 
 ## What must be true before a tag
 
@@ -15,8 +16,9 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    gate names its commit and date (review finding E3-3). The gate and `dist` refuse when
    `$CARGO_HOME/advisory-dbs/` holds more than one database copy, or one that is not RustSec's,
    since they could not say which one cargo-deny read (review finding L-2).
-2. Nothing the release claims is red. A `-slice.N` tag claims the vertical slice only; the `m<N>`
-   milestone tags keep their own rule (CLAUDE.md, ground rule 1).
+2. Nothing the release claims is red. A `-slice.N` tag claims the vertical slice only (item 9's
+   blockers still apply to it); the `m<N>` milestone tags keep their own rule (`docs/PLAN.md`
+   §D.1, ground rule 1).
 3. `docs/VERIFICATION.md` says, per platform, what was verified live and what is still
    NEEDS-DEVICE, and the release notes repeat that without upgrading anything.
 4. The notes name the latest security review and the commits after it that no review has read.
@@ -34,6 +36,21 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    M1-73; `docs/PLAN.md` Part E, "Fake or altered invitations"). The xtask test
    `the_release_docs_name_the_download_location` checks the committed files; a notes file written
    for a later release keeps the sentence.
+9. No release blocker recorded in a milestone's hand-off note (`docs/notes/m<N>-state.md`, section
+   *Blockers*) is open. For any commit at or after `c1ec5a15` (`INTERNET_DIRECT = true`: every
+   default-configured session asks a public STUN server), that means the three of
+   `docs/notes/m2-state.md`:
+   - the owner's call on the default STUN servers' published terms
+     (`docs/research/nat-traversal.md` §2.7; ledger rows "Step B1: the default STUN servers'
+     operators and published terms" and "Review of steps B12 and B13: the STUN list's checks block
+     the zips and the tag");
+   - `cargo test -p tornect-net --test live_stun -- --ignored --nocapture` run on the dev VM and
+     its output pasted: four lines, each `srflx` or `no-nat` (row "Step B12: the live STUN check");
+   - the Accept demo run on the dev VM and on two machines on one LAN, and its output pasted (row
+     "C2: the Accept demo on the dev VM").
+
+   While any is open, `cargo xtask dist` may run for checks, but steps 5 and 6 are not taken: no
+   tag, and no zip goes to users.
 
 ## Steps
 
@@ -67,6 +84,10 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    - refuses an executable that loads anything beyond glibc and the GCC runtime (Linux), or that
      imports a toolchain DLL (`lib*`, `vcruntime*`, `msvcp*`) or holds a link time in its PE header
      (Windows);
+   - on Linux, refuses an executable whose newest `GLIBC_` version is not the floor that
+     `packaging/release/README-release.md` and `README.md` state ("glibc X.Y or newer", "`GLIBC_X.Y'
+     not found"; decision M1-89): the build host's glibc decides the floor, so a build on another
+     host stops here until those texts, and the distributions they name, are corrected by hand;
    - strips the debug info (symbols stay);
    - writes `THIRD_PARTY_LICENSES.txt` (`xtask/src/licences.rs`), offline: every crates.io package
      of `cargo tree -p tornect --target <triple> -e normal,build` with its version, licence expression
@@ -74,7 +95,8 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
      `~/.cargo/registry/src` (identical texts once); for a crate that publishes none, the canonical
      texts in `packaging/licenses/`; the licences of the C code and fonts inside crates, the Rust
      standard library's notices, and on Windows llvm-mingw's runtime;
-   - stages the zip's files in `target/dist/stage/` with the commit's time and fixed modes, refuses
+   - stages the zip's files in `target/dist/stage/` (the Linux zip also carries polkit's policy
+     file as `polkit/org.tornect.policy`, decision M1-89) with the commit's time and fixed modes, refuses
      any file that holds a path of the build machine (the workspace, `CARGO_HOME`, `RUSTUP_HOME`,
      llvm-mingw or the home directory; the home directory, a generic path such as `/root/`, is not
      looked for in the two lyrebird files pinned by SHA-256; audit finding B28), and writes
@@ -84,11 +106,15 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    `advisories` line names the database the release was checked against, and its age; the
    `ignored` lines name each advisory `deny.toml` ignores, with its reason) and the first lines of
    both `THIRD_PARTY_LICENSES.txt`. dist's last lines repeat the database and the ignores for the
-   release notes.
+   release notes. The Linux `BUILD-INFO.txt`'s `newest versions` line names the oldest glibc the
+   program runs on: its `GLIBC_` version is the floor the READMEs state (dist checked it), and the
+   notes' *Requirements* must state the same ("glibc X.Y or newer" and `GLIBC_X.Y`), with
+   distributions that have it.
 4. Smoke tests, each in a fresh `--home` (under `target/tornect-test/` on Linux; under Wine, see
    below):
    - Linux, from the unpacked zip: `./tornect --version`, `./tornect --home <dir> id`,
-     `./tornect --home <dir> doctor`, whose `tor:` line must name the zip's `pt/lyrebird`.
+     `./tornect --home <dir> doctor`, whose `tor:` line must name the zip's `pt/lyrebird`; the zip
+     holds `polkit/org.tornect.policy`.
    - Windows: the same with `tornect.exe` under Wine (Wine is not Windows: this proves the
      executable starts, its imports resolve and it accepts the bundled `lyrebird.exe`), and on a
      Windows machine when one is at hand. Under Wine the `--home` goes inside the Wine user's
@@ -100,16 +126,31 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
      (`/v:on` and `!ERRORLEVEL!`: `%ERRORLEVEL%` would be read before `tornect.exe` runs; single quotes
      keep bash's `!` history expansion out). Checked this way on 2026-09-24 (`docs/VERIFICATION.md`,
      *Release tooling*).
+   - Both `doctor` runs, on a fresh home's default config, also show
+     `direct connections: on (local network and internet)`,
+     `public STUN servers: on, 4 in the list, one asked per session`,
+     `router port mapping: UPnP on, NAT-PMP on, PCP on` and a `network:` line that names kinds of
+     address only, never an address (ledger row "Step B13: the release zips").
+4a. The notes: copy the release's template, `packaging/release/NOTES-v<version>-slice.<N>.md`,
+   outside the repository, and drop its first-line template comment once its checklist is done.
+   Fill its markers from this run: `@@COMMIT@@` with the commit `BUILD-INFO.txt` names;
+   `@@SIZE_LINUX@@`/`@@SIZE_WINDOWS@@` and `@@SHA256_LINUX@@`/`@@SHA256_WINDOWS@@` with each zip's
+   bytes (`stat -c %s target/dist/*.zip`) and SHA-256 (they equal `SHA256SUMS`);
+   `@@NEWEST_VERSIONS_LINUX@@` with the Linux `BUILD-INFO.txt`'s `newest versions` line (step 3);
+   `@@ADVISORY_DB_LINE@@` with dist's "advisory check" line; `@@IGNORED_ADVISORIES@@` with its
+   "ignored by deny.toml" lines. Say so if `--allow-old-advisory-db` was used. Bring the body up to
+   this commit (what works, the evidence and the known limitations) from the zipped
+   `README-release.md`, `docs/PLAN.md` Part C and `docs/VERIFICATION.md`, upgrading nothing (items
+   3 and 4), and keep the download-location sentence (item 8). `grep '@@' <notes.md>` must print
+   nothing. Step 6 publishes this file; the committed template keeps the markers.
 5. Tag the commit that `BUILD-INFO.txt` names, then push the tag:
    `git tag -a v<version>-slice.<N> <commit> -m "Tornect <version>, slice pre-release <N>"`.
-6. Publish (the Git agent's step, with the operator's approval):
+6. Publish (the owner, or someone the owner has approved to publish):
    `gh release create v<version>-slice.<N> --prerelease --title "Tornect <version> (slice <N>)"
    --notes-file <notes.md> target/dist/tornect-<version>-linux-x86_64.zip
-   target/dist/tornect-<version>-windows-x86_64.zip target/dist/SHA256SUMS`. `<notes.md>` is a
-   copy, outside the repository, of the release's template
-   `packaging/release/NOTES-v<version>-slice.<N>.md` with every `@@…@@` marker filled from this
-   run (`BUILD-INFO.txt`, `SHA256SUMS`, dist's last lines) and the checklist in its header comment
-   done; the committed template keeps the markers. The next one is
+   target/dist/tornect-<version>-windows-x86_64.zip target/dist/SHA256SUMS`. `<notes.md>` is the
+   copy step 4a filled, outside the repository, of the release's template
+   `packaging/release/NOTES-v<version>-slice.<N>.md`. The next one is
    `packaging/release/NOTES-v0.1.0-slice.2.md`; `v0.1.0-slice.1` was never published, and its
    notes stay in the tree as that slice's record only.
 7. Download the three assets from the release page into an empty directory and run
