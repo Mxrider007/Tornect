@@ -14,7 +14,8 @@ use crate::error::Result;
 
 /// The development filter: the default of a debug build when neither
 /// `TORNECT_LOG`, `RUST_LOG` nor `--log` names one ([`default_filter`]),
-/// and always the file layer's.
+/// and always the file layer's, whatever filter the stderr layer has: each
+/// layer is filtered on its own ([`init`]).
 ///
 /// `zbus::proxy=error`: zbus warns five times at every Wayland portal start
 /// that it could not cache the properties of the portal's request objects,
@@ -195,11 +196,14 @@ pub fn init(opts: LogOptions) -> Result<LogGuard> {
 /// What [`init`] installs, its lines written through `stderr` and the
 /// environment read through `env`: the filter (`TORNECT_LOG`, else
 /// `RUST_LOG`, else [`LogOptions::filter`], else [`default_filter`]; an
-/// invalid one counts as unset) decides which events are written, never
-/// whether they name anyone: that takes [`LogOptions::identifiers`] or
-/// [`IDENTIFIERS_ENV`] = `1` (U3-L3). Without it, every stderr layer also
-/// drops the events and spans of [`QUIET_TARGETS`]; the file layer, which
-/// redacts its fields even with the opt-in, always drops them.
+/// invalid one counts as unset) decides which events the stderr layer
+/// writes, never whether they name anyone: that takes
+/// [`LogOptions::identifiers`] or [`IDENTIFIERS_ENV`] = `1` (U3-L3). It is
+/// that layer's own filter, not the subscriber's, so the file layer keeps
+/// [`DEFAULT_FILTER`] under a quieter one (a release build's default
+/// included). Without the opt-in, every stderr layer also drops the events
+/// and spans of [`QUIET_TARGETS`]; the file layer, which redacts its fields
+/// even with the opt-in, always drops them.
 fn subscriber<W>(
     opts: LogOptions,
     env: &dyn Fn(&str) -> Option<String>,
@@ -214,13 +218,17 @@ where
         .or(opts.filter)
         .filter(|f| EnvFilter::try_new(f).is_ok());
     let redact = !(opts.identifiers || env(IDENTIFIERS_ENV).as_deref() == Some("1"));
-    let filter = chosen.map_or_else(|| EnvFilter::new(default_filter()), EnvFilter::new);
+    let directive = chosen.unwrap_or_else(|| default_filter().to_owned());
+    // The stderr layer's own filter (one of the three below is built): a
+    // filter given to the subscriber would gate the file layer too.
+    let filter = || EnvFilter::new(&directive);
 
     let text_layer = (!opts.json && !redact).then(|| {
         tracing_subscriber::fmt::layer()
             .with_writer(stderr.clone())
             .with_ansi(ansi)
             .with_target(true)
+            .with_filter(filter())
     });
     let redacted_text_layer = (!opts.json && redact).then(|| {
         tracing_subscriber::fmt::layer()
@@ -228,6 +236,7 @@ where
             .with_writer(stderr.clone())
             .with_ansi(ansi)
             .with_target(true)
+            .with_filter(filter())
             .with_filter(tracing_subscriber::filter::filter_fn(|meta| !quiet(meta)))
     });
     let json_layer = opts.json.then(|| {
@@ -235,6 +244,7 @@ where
             .json()
             .with_writer(stderr)
             .with_target(true)
+            .with_filter(filter())
             .with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
                 !redact || (names_nobody(meta) && !quiet(meta))
             }))
@@ -261,7 +271,6 @@ where
     };
 
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
         .with(text_layer)
         .with(redacted_text_layer)
         .with(json_layer)
@@ -286,6 +295,73 @@ mod tests {
         let _g2 = init(LogOptions::default()).unwrap();
         tracing::info!("hello from the telemetry test");
         assert!(dir.path().join("logs").is_dir());
+    }
+
+    /// The security review of the final pass: the file layer keeps
+    /// [`DEFAULT_FILTER`] under a quieter stderr filter, here a release
+    /// build's default given as the filter (a test build's default is the
+    /// development one). Before, the stderr filter was the subscriber's and
+    /// gated every layer, so `tornect.log` held warnings only.
+    #[test]
+    fn the_file_layer_keeps_its_own_filter_under_a_quieter_stderr_one() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for filter in [Some(RELEASE_DEFAULT_FILTER), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let logs = dir.path().join("logs");
+            let stderr = Buffer::default();
+            let writer = stderr.clone();
+            let (subscriber, guard) = subscriber(
+                LogOptions {
+                    filter: filter.map(str::to_owned),
+                    file_dir: Some(logs.clone()),
+                    json: false,
+                    identifiers: false,
+                },
+                &|_| None,
+                move || writer.clone(),
+                false,
+            )
+            .unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "tornect_session::host", "a debug line");
+                tracing::info!(target: "tornect_signal::tor::node", "an info line");
+                tracing::warn!(target: "tornect_signal::tor::node", "a warning");
+                tracing::debug!(target: "some_other_crate", "another crate's debug line");
+            });
+            // Flushes the file's writer.
+            drop(guard);
+            let mut file = String::new();
+            for entry in std::fs::read_dir(&logs).unwrap() {
+                file.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+            }
+            for line in ["a debug line", "an info line", "a warning"] {
+                assert!(
+                    file.contains(line),
+                    "{filter:?}: \"{line}\" missing:\n{file}"
+                );
+            }
+            assert!(!file.contains("another crate's debug line"), "{file}");
+            let said = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
+            assert!(said.contains("a warning"), "{said}");
+            assert_eq!(
+                said.contains("an info line"),
+                filter.is_none(),
+                "{filter:?}: {said}"
+            );
+        }
     }
 
     /// The Wayland portal's zbus proxies print "Failed to populate properties
