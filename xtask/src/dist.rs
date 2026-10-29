@@ -657,7 +657,18 @@ fn package(
     let facts = if platform.is_windows() {
         windows_facts(&built)?
     } else {
-        linux_facts(&built)?
+        let facts = linux_facts(&built)?;
+        let needed = facts
+            .glibc
+            .as_deref()
+            .with_context(|| format!("{} names no GLIBC_ version", built.display()))?;
+        for name in [README, "README.md"] {
+            let path = root.join(name);
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            check_glibc_floor(name, &text, needed)?;
+        }
+        facts
     };
 
     let stem = format!("tornect-{version}-{}", platform.name);
@@ -935,6 +946,54 @@ fn rustflags_config(platform: Platform, flags: &[String]) -> String {
 /// What the executable needs from the system, checked and recorded.
 struct Facts {
     lines: Vec<String>,
+    /// Linux: the newest `GLIBC_` version the executable needs (`2.43`),
+    /// which the build host's glibc decides.
+    glibc: Option<String>,
+}
+
+/// Every glibc floor a README states, in either of the forms the release
+/// README uses: "glibc X.Y or newer" and the loader's "`GLIBC_X.Y' not
+/// found". White space must already be one space per run.
+fn glibc_claims(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (prefix, suffix) in [("glibc ", " or newer"), ("GLIBC_", "' not found")] {
+        for (at, _) in text.match_indices(prefix) {
+            let rest = &text[at + prefix.len()..];
+            let version: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !version.is_empty() && rest[version.len()..].starts_with(suffix) {
+                found.push(version);
+            }
+        }
+    }
+    found
+}
+
+/// The README's glibc floor must be the one the executable needs (decision
+/// M1-89): it follows the build host's glibc, so a build on another host
+/// would otherwise ship a README that names the wrong floor. `name` is the
+/// file's path, for the message.
+fn check_glibc_floor(name: &str, text: &str, needed: &str) -> anyhow::Result<()> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let claims = glibc_claims(&text);
+    ensure!(
+        !claims.is_empty(),
+        "{name} names no glibc floor (\"glibc X.Y or newer\"): the Linux executable needs \
+         GLIBC_{needed}"
+    );
+    for claimed in &claims {
+        ensure!(
+            claimed == needed,
+            "{name} says glibc {claimed}, but this Linux executable needs GLIBC_{needed} (the \
+             build host's glibc decides it): correct the version and the distributions named \
+             with it by hand, in {name} and wherever else the floor is stated (README.md, the \
+             release notes' Requirements), or build on a host with the README's glibc \
+             (docs/RELEASING.md step 3)"
+        );
+    }
+    Ok(())
 }
 
 fn linux_facts(exe: &Path) -> anyhow::Result<Facts> {
@@ -965,13 +1024,15 @@ fn linux_facts(exe: &Path) -> anyhow::Result<Facts> {
             .map(|(_, v)| format!("{prefix}{v}"))
             .unwrap_or_else(|| "(none)".to_owned())
     };
+    let glibc = newest("GLIBC_");
     Ok(Facts {
+        glibc: glibc.strip_prefix("GLIBC_").map(str::to_owned),
         lines: vec![
             format!("dynamic libraries  {}", needed.join(", ")),
             format!(
                 "newest versions    {}, {} and {}: it needs a glibc and a libstdc++ that \
                  have them",
-                newest("GLIBC_"),
+                glibc,
                 newest("GLIBCXX_"),
                 newest("CXXABI_")
             ),
@@ -1010,6 +1071,7 @@ fn windows_facts(exe: &Path) -> anyhow::Result<Facts> {
     let mut sorted = dlls.clone();
     sorted.sort_by_key(|d| d.to_ascii_lowercase());
     Ok(Facts {
+        glibc: None,
         lines: vec![
             format!(
                 "imported DLLs      {}, all Windows' own: {}",
@@ -1637,6 +1699,58 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             "{POLKIT_POLICY} is not Tornect's policy"
         );
         assert!(POLKIT_POLICY.ends_with(POLKIT_IN_ZIP));
+    }
+
+    #[test]
+    fn glibc_claims_reads_both_forms() {
+        let text = "with **glibc 2.43 or newer**: here it stops with \"version `GLIBC_2.43' not \
+                    found\"; the glibc and the GCC runtime; glibc 2.39. GLIBC_2.2.5 is old";
+        assert_eq!(glibc_claims(text), ["2.43", "2.43"]);
+        assert!(glibc_claims("no floor named here").is_empty());
+    }
+
+    /// Decision M1-89: dist refuses a README whose glibc floor is not the
+    /// one the executable needs, and one that names none.
+    #[test]
+    fn a_readme_with_another_glibc_floor_is_refused() {
+        let readme = "x86_64 Linux with **glibc 2.43 or newer**: there this build stops at once \
+                      with\n\"version `GLIBC_2.43' not found\"";
+        check_glibc_floor("R", readme, "2.43").unwrap();
+        let refused = check_glibc_floor("R", readme, "2.39")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("R says glibc 2.43"), "{refused}");
+        assert!(refused.contains("needs GLIBC_2.39"), "{refused}");
+        let half = "glibc 2.39 or newer; \"version `GLIBC_2.43' not found\"";
+        assert!(check_glibc_floor("R", half, "2.39").is_err());
+        assert!(check_glibc_floor("R", "no floor", "2.39").is_err());
+    }
+
+    /// The committed READMEs that dist checks state one glibc floor between
+    /// them, in every place they state it.
+    #[test]
+    fn the_readmes_name_one_glibc_floor() {
+        let root = crate::workspace_root().unwrap();
+        let mut floors = Vec::new();
+        for name in [README, "README.md"] {
+            let text = fs::read_to_string(root.join(name)).unwrap();
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let claims = glibc_claims(&text);
+            assert!(!claims.is_empty(), "{name} names no glibc floor");
+            floors.extend(claims);
+        }
+        floors.dedup();
+        assert_eq!(
+            floors.len(),
+            1,
+            "the READMEs name several floors: {floors:?}"
+        );
+        check_glibc_floor(
+            README,
+            &fs::read_to_string(root.join(README)).unwrap(),
+            &floors[0],
+        )
+        .unwrap();
     }
 
     /// The README a zip carries says how to run what the zip holds.
