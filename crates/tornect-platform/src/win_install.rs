@@ -1191,6 +1191,47 @@ mod tests {
         assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Command(long));
     }
 
+    /// The security review of W4: the restart step's delete reports a file
+    /// that is held open (as a running lyrebird.exe is) as in use, so the
+    /// step marks it for the restart, and deletes every other entry at once:
+    /// a file, and a folder with what it holds. A path that is not there is
+    /// an error.
+    #[test]
+    fn the_restart_steps_delete_reports_a_file_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let held_path = dir.path().join("lyrebird.exe");
+        let other = dir.path().join("left.log");
+        let folder = dir.path().join("pt");
+        for path in [&held_path, &other] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("inside"), b"x").unwrap();
+        let text = |p: &Path| p.to_str().unwrap().to_owned();
+        let windows = RealWindows::of_this_computer();
+        let held = windows.hold_file(&text(&held_path)).unwrap();
+        assert_eq!(
+            delete_in_folder(&text(&held_path)).unwrap(),
+            FolderEntry::InUse
+        );
+        assert!(held_path.exists());
+        assert_eq!(
+            delete_in_folder(&text(&other)).unwrap(),
+            FolderEntry::Deleted
+        );
+        assert_eq!(
+            delete_in_folder(&text(&folder)).unwrap(),
+            FolderEntry::Deleted
+        );
+        assert!(!other.exists() && !folder.exists());
+        drop(held);
+        assert_eq!(
+            delete_in_folder(&text(&held_path)).unwrap(),
+            FolderEntry::Deleted
+        );
+        assert!(delete_in_folder(&text(&held_path)).is_err());
+    }
+
     /// A file the install holds (the lyrebird beside the image, decision
     /// M1-88 (2)) cannot be written, renamed or deleted while it is held,
     /// so nothing can be swapped in before the elevated copy reads it;
