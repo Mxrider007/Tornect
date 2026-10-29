@@ -20,17 +20,17 @@ and where" below).
 | File | What it is |
 |---|---|
 | `tornect` (`tornect.exe` on Windows) | the program: the window, and the command line |
-| `pt/lyrebird` (`pt/lyrebird.exe`) | lyrebird 0.8.1, the Tor Project's pluggable transport for obfs4 and Snowflake bridges, unmodified from Tor Browser 15.0.23 |
-| `pt/lyrebird.txt` | lyrebird's licences |
+| `pt/lyrebird` (`lyrebird.exe` beside `tornect.exe` on Windows) | lyrebird 0.8.1, the Tor Project's pluggable transport for obfs4 and Snowflake bridges, unmodified from Tor Browser 15.0.23 |
+| `pt/lyrebird.txt` (`lyrebird.txt` on Windows) | lyrebird's licences |
 | `polkit/org.tornect.policy` (Linux only) | polkit's policy file, which the password dialog on Linux needs ("The password dialog on Linux" below) |
 | `LICENSE` | Tornect's licence, GPL-3.0-or-later |
 | `THIRD_PARTY_NOTICES.md` | what else Tornect's own source contains, and under which licences |
 | `THIRD_PARTY_LICENSES.txt` | every third-party part built into the program (each crate with its version and licence, the C libraries, the fonts, the Rust standard library) and their licence texts |
 | `BUILD-INFO.txt` | the commit, toolchain and flags of this build, the advisory database it was checked against, and each file's SHA-256 |
 
-Keep `pt/` next to the program. Tornect needs lyrebird only when Tor is blocked
-where you are, and it runs the copy in `pt/` only if its SHA-256 is the one
-compiled into Tornect.
+Keep `pt/` next to the program (on Windows, `lyrebird.exe` beside
+`tornect.exe`). Tornect needs lyrebird only when Tor is blocked where you are,
+and it runs that copy only if its SHA-256 is the one compiled into Tornect.
 
 ## Check the download first
 
@@ -100,8 +100,8 @@ dialog.
 ## Windows
 
 You need Windows 10 (version 20H1 or later) or 11, 64-bit. Right-click the zip,
-Extract All, and keep `pt\` beside `tornect.exe`. Windows may warn that the
-program is not recognised: it is not code-signed.
+Extract All, and keep `lyrebird.exe` beside `tornect.exe`. Windows may warn
+that the program is not recognised: it is not code-signed.
 
 Double-clicking `tornect.exe` opens the window, with no console window
 (`tornect.exe` is a window program). Its close button ends every session with a
@@ -120,7 +120,8 @@ In PowerShell, type `cmd` first and use the same lines. Ctrl-C in that console
 ends a `tornect.exe host` with a goodbye to the other side. Ctrl-Break, or
 closing the console window, ends it at once, without one (none of this yet
 tried on Windows). `tornect.exe doctor > doctor.txt` writes the report to a
-file.
+file; on its `tor:` line it names the lyrebird it found, which must be the
+`lyrebird.exe` beside `tornect.exe`.
 
 **Ending sessions on Windows.** `start /wait tornect.exe panic`, run in a
 second console, ends every session of the Tornect running for this home (the
@@ -413,14 +414,16 @@ the menu entries and the copy; your pairings, grants and settings stay.
   on Linux" above).
 - **Windows:** the program goes to `C:\Program Files\Tornect\tornect.exe`, with
   a Start-menu entry and an Apps-and-features entry: your password, then two
-  Windows administrator prompts. It is refused with `--home` or
-  `TORNECT_HOME`, and over an earlier install. **This build's Windows install
-  carries no lyrebird**: the installed copy cannot use obfs4 or Snowflake
-  bridges, and the install says so. Where Tor is blocked, run `tornect.exe` from
-  the unpacked folder, which keeps `pt\lyrebird.exe` beside it. `tornect
-  uninstall` is refused while a device has administrator access; run from the
-  installed copy, or from Apps and features, it leaves the folder to be removed
-  at the next restart.
+  Windows administrator prompts. The first copies `tornect.exe` and
+  `lyrebird.exe` together; lyrebird is checked against the SHA-256 compiled into
+  Tornect before that prompt and kept open, so that nothing can change it, until
+  the install ends, and the copy in Program Files is checked again before
+  anything points at it. Install from the unpacked folder: a copy with no
+  `lyrebird.exe` beside it installs without lyrebird, says so, and its installed
+  copy cannot use obfs4 or Snowflake bridges. It is refused with `--home` or
+  `TORNECT_HOME`, and over an earlier install. `tornect uninstall` is refused
+  while a device has administrator access; run from the installed copy, or from
+  Apps and features, it leaves the folder to be removed at the next restart.
 
 To upgrade, run `tornect uninstall`, then `./tornect install` from the new
 release's folder (on Windows, after the restart the uninstall may ask for).
@@ -557,9 +560,6 @@ in the source lists each one). What has run live:
 - On GNOME, the "Tornect: sharing" window cannot stay above other windows
   (Wayland does not let it); GNOME shows its own screen-sharing icon.
 - The zips and the programs are not signed.
-- The Windows install (`tornect install`) carries no lyrebird: the copy in
-  `C:\Program Files\Tornect` cannot use obfs4 or Snowflake bridges. Where Tor
-  is blocked, run the unpacked copy.
 - No tray icon: closing the window stops Tornect (minimise it to stay
   reachable). Tornect does not update itself.
 - For a bug report, run with `--log debug`: without it this build writes only

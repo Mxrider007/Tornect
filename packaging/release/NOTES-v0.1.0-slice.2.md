@@ -6,7 +6,6 @@
        Accept demo on the dev VM ("No zip from `cargo xtask dist` goes to users ... before all three");
      - the dist run at the commit the tag names, both platforms, with the smoke tests of docs/RELEASING.md step 4;
      - the console check of the window over real Tor, or the owner's decision to publish with it NOT PERFORMED;
-     - the owner's ruling on the Windows install's lyrebird (decision M1-88 (2));
      - GitHub's private vulnerability reporting turned on (SECURITY.md; ledger row "`SECURITY.md`: how to report a
        vulnerability privately", OPEN);
      - every @@…@@ marker filled from that run (BUILD-INFO.txt, SHA256SUMS, dist's last lines). -->
@@ -69,7 +68,7 @@ a row and a recipe in `docs/VERIFICATION.md`.
 | Unattended access end to end (M-FEAT-4, M-FEAT-5, M-UI-5) | the grant wizard in Settings › Security, the window's Connect without asking, `tornect connect --unattended` (Linux), passwords remembered in the system keychain, the emergency stop code | VERIFIED (unit, and the real host over a pipe); a live unattended session over Tor is OPEN; polkit's dialog and Windows' secure prompt NEEDS-DEVICE |
 | The Windows control channel (M-FEAT-5, `53efbaf1`) | `tornect panic` and the `unattended` commands reach a Windows host through a named pipe only this account can open | VERIFIED (unit) for the rules that need no Windows, type-checked for Windows; NEEDS-DEVICE(windows) |
 | A Windows window without a console (`da36aba9`) | double-clicking opens no console; command-line runs use `start /wait` | type-checked only; NEEDS-DEVICE(windows) |
-| Install, uninstall and start at sign-in (M-FEAT-6, M1-58, M1-69, M1-88, M1-89) | `tornect install` into `~/.local/bin` (with the pinned lyrebird) or `C:\Program Files\Tornect`; the start at sign-in runs the window in the background; the Linux zip carries polkit's policy file (`polkit/org.tornect.policy`) | VERIFIED (unit); NEEDS-DEVICE(linux-desktop) with polkit's policy file, NEEDS-DEVICE(windows). The Windows install carries no lyrebird (OPEN, decision M1-88) |
+| Install, uninstall and start at sign-in (M-FEAT-6, M1-58, M1-69, M1-88, M1-89) | `tornect install` into `~/.local/bin` (with the pinned lyrebird) or `C:\Program Files\Tornect`; the start at sign-in runs the window in the background; the Linux zip carries polkit's policy file (`polkit/org.tornect.policy`) | VERIFIED (unit); NEEDS-DEVICE(linux-desktop) with polkit's policy file, NEEDS-DEVICE(windows). The Windows install carries the pinned `lyrebird.exe` in the same elevated copy as `tornect.exe` (decision M1-88 (2), W4): VERIFIED (unit), NEEDS-DEVICE(windows) |
 | The code audit of 2026-10-22 (findings B01 to B32) and the final audit before this release (F1 to F9) | each fixed with a test that fails without it, except the open items under *Known limitations* | VERIFIED (unit); the Windows and desktop halves NEEDS-DEVICE as their rows say |
 | Logs | a release build writes warnings and errors only; `--log debug` for a bug report | VERIFIED (unit); a release binary NEEDS-DEVICE(the build VM) |
 
@@ -96,7 +95,7 @@ over the real Tor network; no second machine was used.
 | What | Evidence |
 |---|---|
 | Cross-built with llvm-mingw 20260908; `tornect.exe` imports only DLLs Windows ships | read from the import table by `dist` |
-| This zip, unpacked: `tornect.exe --version`, `id` and `doctor` (it accepts the bundled `pt\lyrebird.exe`); a `--home` outside the user folder refused | **under Wine only**, which is not Windows: the release run (`docs/RELEASING.md` step 4) |
+| This zip, unpacked: `tornect.exe --version`, `id` and `doctor` (it accepts the bundled `lyrebird.exe` beside `tornect.exe`); a `--home` outside the user folder refused | **under Wine only**, which is not Windows: the release run (`docs/RELEASING.md` step 4) |
 | Parts of the workspace's tests (the Windows logic of capture, input, the session's services, monitor switching) | under Wine 9.0 and 10.0 |
 | The window, GDI capture, `SendInput`, Arti and the onion service, the named pipe, the "Tornect: sharing" window, the firewall prompt, the install in Program Files, Task Scheduler, the secure credential prompt, UAC, the restricted DLL search | NEEDS-DEVICE: **never run on a Windows machine** |
 
@@ -178,7 +177,8 @@ Advisories that `deny.toml` ignores, each with its reason:
 **Licences:** each zip carries `THIRD_PARTY_LICENSES.txt`, generated offline from the locally pinned sources:
 every crate built into the program with its version, licence and licence texts, the C libraries, the fonts, the
 Rust standard library's notices, and on Windows llvm-mingw's runtime. It carries the texts; nobody has reviewed
-it legally. Tornect itself is GPL-3.0-or-later (`LICENSE`); lyrebird's licences are in `pt/lyrebird.txt`.
+it legally. Tornect itself is GPL-3.0-or-later (`LICENSE`); lyrebird's licences are in `pt/lyrebird.txt`
+(`lyrebird.txt` in the Windows zip).
 
 ## Things to know first
 
@@ -227,8 +227,6 @@ from the unpacked folder: `sudo install -m 0644 polkit/org.tornect.policy /usr/s
 - An unattended session has not yet been run between two machines over Tor. The Windows command line cannot ask
   for an unattended password: give grants in the window there, and `connect --unattended` uses only a password
   remembered in the window.
-- The Windows install (`tornect install`) carries no lyrebird: the copy in `C:\Program Files\Tornect` cannot use
-  obfs4 or Snowflake bridges (decision M1-88, open). Where Tor is blocked, run the unpacked copy.
 - **B01:** a Windows host that locks keeps its sessions, the picture standing still, for up to a minute before
   capture ends, instead of ending them at once.
 - A `config.toml` setting whose value this build does not know (a later version's value, or a typo) stops
@@ -362,10 +360,14 @@ Critical or High issue; every Medium was fixed.
   no code defect, one coverage gap closed) and a final security and correctness review of `cc918b56..1aeaea49`:
   three minor findings, fixed in `0ac8dd03`, `625aabdc` and `03cbfc95`.
 - **The final audit before this release** (2026-10-28): two major and seven minor findings, fixed in `66c03834`,
-  `81c17944`, `9a64b5f9`, `0a503bd1` and `5a507b1f`, except the Windows half of F1/F4 (decision M1-88, open).
+  `81c17944`, `9a64b5f9`, `0a503bd1` and `5a507b1f`; the Windows half of F1/F4 was ruled W4 (decision M1-88 (2)):
+  the install's one elevated copy carries the pinned `lyrebird.exe` beside `tornect.exe`.
+- **The final pass's security review** (2026-10-29): eight minor findings, fixed in `2ed94086`, `4f4f9d58`,
+  `e3edcd15`, `36ca36db`, `6aa3fc8b` and `ce17dee3`.
 
-**Not reviewed:** the final audit's fixes above, the documentation since them, the closing gate's fix of
-`tornect config show` (`800e64bf`), the fixes of the documentation findings of 2026-10-29 (polkit's policy file
-in the Linux zip and dist's glibc check, decision M1-89; three `config.toml` keys nothing read no longer written,
-decision M1-90; the refusal that names the policy file; the help text and the router line), and the commits
-between the last review and `@@COMMIT@@` that the owner's release run adds.
+**Not reviewed:** the final audit's fixes above, the final pass's fixes and the Windows install's lyrebird (W4),
+the documentation since them, the closing gate's fix of `tornect config show` (`800e64bf`), the fixes of the
+documentation findings of 2026-10-29 (polkit's policy file in the Linux zip and dist's glibc check, decision M1-89;
+three `config.toml` keys nothing read no longer written, decision M1-90; the refusal that names the policy file;
+the help text and the router line), and the commits between the last review and `@@COMMIT@@` that the owner's
+release run adds.

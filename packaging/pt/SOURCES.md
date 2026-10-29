@@ -5,13 +5,15 @@ Tornect reaches Tor through bridges when direct Tor is blocked (decision M1-38,
 **Snowflake** — and webtunnel: **lyrebird**, taken unmodified from the Tor Project's signed
 tor-expert-bundle. It is not committed to git. `cargo xtask pt-fetch` downloads it and runs the
 checks below (section *`cargo xtask pt-fetch`*); `cargo xtask dist` runs the same checks and ships
-it as `pt/lyrebird[.exe]` in each release zip (`docs/RELEASING.md`).
+it as `pt/lyrebird` in the Linux zip and as `lyrebird.exe` beside `tornect.exe` in the Windows zip,
+where the install's one elevated copy carries it (decision M1-88 (2); `docs/RELEASING.md`).
 
 **Enforced at run time** (decision M1-40): Tornect hashes the `lyrebird` it is about to launch and
 refuses one that does not match the member SHA-256 below, compiled into
-`crates/tornect-signal/src/tor/bridges.rs` (`LYREBIRD_SHA256`). It looks next to the executable (or
-in its `pt/` directory), then in `$TORNECT_PT_DIR`; never on `PATH`, never at a relative path. Only
-an explicit `tor.pt_path` may run another build, and that is logged.
+`crates/tornect-signal/src/tor/bridges.rs` (`LYREBIRD_SHA256`). It looks next to the executable,
+then in its `pt/` directory, then in `$TORNECT_PT_DIR`, and runs the first that passes the check, so
+a stray copy earlier in that order does not hide the pinned one; never on `PATH`, never at a
+relative path. Only an explicit `tor.pt_path` may run another build, and that is logged.
 
 | field | value |
 |---|---|
@@ -22,7 +24,7 @@ an explicit `tor.pt_path` may run another build, and that is logged.
 | windows sha256 | `231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e` |
 | member (linux) | `tor/pluggable_transports/lyrebird` — sha256 `ee13ec155cf9b131a3e1b87bd6d697a10c42d04f2eaaeab6b1590c9971d41421` |
 | member (windows) | `tor/pluggable_transports/lyrebird.exe` — sha256 `6e218e85f9a7ae2481f5402ded822471a9a9d0c7e66b05db3842b93fa5c1f02e` |
-| licence notice | `docs/lyrebird.txt` from the same tarball (shipped alongside the binary as `pt/lyrebird.txt`; the same file in both tarballs) — sha256 `2331e6517a15ce87e2a1d2838c314ca1b8f3c7a347ac28d370a7fccdb5964f40` |
+| licence notice | `docs/lyrebird.txt` from the same tarball (shipped alongside the binary: `pt/lyrebird.txt` in the Linux zip, `lyrebird.txt` in the Windows zip; the same file in both tarballs) — sha256 `2331e6517a15ce87e2a1d2838c314ca1b8f3c7a347ac28d370a7fccdb5964f40` |
 | signing key | Tor Browser Developers, primary `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290`; the key is `packaging/pt/tor-browser-developers.asc` (from the WKD on 2026-09-21, `--export-options export-minimal`) |
 
 ## How the pins were established (2026-09-21, the build VM)

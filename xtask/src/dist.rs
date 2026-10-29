@@ -677,11 +677,15 @@ fn package(
     if dir.exists() {
         fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
-    fs::create_dir_all(dir.join("pt")).with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let strip_tool = strip(tools, platform, &built, &dir.join(platform.exe))?;
     pt::set_mode(&dir.join(platform.exe), 0o755)?;
-    let lyrebird = format!("pt/{}", platform.bundle.file_name());
+    let lyrebird = lyrebird_in_zip(platform);
+    let notice = notice_in_zip(platform);
+    if let Some(folder) = dir.join(&lyrebird).parent() {
+        fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
+    }
     place(
         &fetched.lyrebird,
         &dir.join(&lyrebird),
@@ -690,7 +694,7 @@ fn package(
     )?;
     place(
         &fetched.notice,
-        &dir.join("pt/lyrebird.txt"),
+        &dir.join(notice),
         0o644,
         Some(platform.bundle.notice_sha256),
     )?;
@@ -750,7 +754,7 @@ fn package(
     for file in &files {
         let path = dir.join(file);
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let third_party = *file == lyrebird || file == "pt/lyrebird.txt";
+        let third_party = *file == lyrebird || file == notice;
         if let Some((local, at)) = find_local_path(&bytes, &tools.local_paths, third_party) {
             bail!(
                 "{} holds the path of {} ({}) at byte {at}; a zip must not carry a path of the \
@@ -770,12 +774,34 @@ fn package(
     Ok(zip)
 }
 
+/// Where a zip holds lyrebird: on Linux `pt/lyrebird`, as since the first
+/// release; on Windows `lyrebird.exe` beside `tornect.exe` (decision M1-88
+/// (2), W4), where the running copy's lookup finds it first and where the
+/// install's one robocopy, which copies files of the image's own folder,
+/// takes it from.
+fn lyrebird_in_zip(platform: Platform) -> String {
+    if platform.is_windows() {
+        platform.bundle.file_name().to_owned()
+    } else {
+        format!("pt/{}", platform.bundle.file_name())
+    }
+}
+
+/// lyrebird's licence notice, beside it ([`lyrebird_in_zip`]).
+fn notice_in_zip(platform: Platform) -> &'static str {
+    if platform.is_windows() {
+        "lyrebird.txt"
+    } else {
+        "pt/lyrebird.txt"
+    }
+}
+
 /// The files a zip holds besides BUILD-INFO.txt, which lists their hashes.
 fn zip_files(platform: Platform) -> Vec<String> {
     let mut files = vec![
         platform.exe.to_owned(),
-        format!("pt/{}", platform.bundle.file_name()),
-        "pt/lyrebird.txt".to_owned(),
+        lyrebird_in_zip(platform),
+        notice_in_zip(platform).to_owned(),
         "LICENSE".to_owned(),
         "THIRD_PARTY_NOTICES.md".to_owned(),
         licences::FILE.to_owned(),
@@ -1291,7 +1317,7 @@ fn build_info(b: &BuildInfo<'_>) -> anyhow::Result<String> {
     }
     let _ = writeln!(s, "\nLicences");
     let _ = writeln!(s, "  {}  {}", licences::FILE, b.licences);
-    let _ = writeln!(s, "\nlyrebird (pt/)");
+    let _ = writeln!(s, "\nlyrebird ({})", lyrebird_in_zip(p));
     let _ = writeln!(
         s,
         "  source        lyrebird {} from Tor Browser {}'s {} (sha256 {})",
@@ -1668,7 +1694,7 @@ tornect v0.1.0 (/w/apps/tornect) (*)
                 licences::FILE,
                 "LICENSE",
                 "THIRD_PARTY_NOTICES.md",
-                "pt/lyrebird.txt",
+                notice_in_zip(platform),
             ] {
                 assert!(
                     files.iter().any(|f| f == needed),
@@ -1677,6 +1703,36 @@ tornect v0.1.0 (/w/apps/tornect) (*)
                 );
             }
         }
+    }
+
+    /// Decision M1-88 (2), W4: the Windows zip holds `lyrebird.exe` and its
+    /// notice beside `tornect.exe`, where the running copy's lookup finds it
+    /// first and the install's one robocopy (which names `tornect.exe` and
+    /// `lyrebird.exe` of the image's own folder) takes it from, and nothing
+    /// under `pt\`; the Linux zip keeps `pt/lyrebird`, where the Linux
+    /// install reads it as well.
+    #[test]
+    fn the_windows_zip_puts_lyrebird_beside_tornect_exe() {
+        let windows = zip_files(WINDOWS);
+        for needed in ["tornect.exe", "lyrebird.exe", "lyrebird.txt"] {
+            assert!(windows.iter().any(|f| f == needed), "{needed}: {windows:?}");
+        }
+        assert!(!windows.iter().any(|f| f.starts_with("pt/")), "{windows:?}");
+        let linux = zip_files(LINUX);
+        for needed in ["tornect", "pt/lyrebird", "pt/lyrebird.txt"] {
+            assert!(linux.iter().any(|f| f == needed), "{needed}: {linux:?}");
+        }
+        // The install's robocopy names this very file.
+        let root = crate::workspace_root().unwrap();
+        let install =
+            fs::read_to_string(root.join("crates/tornect-platform/src/install.rs")).unwrap();
+        assert!(
+            install.contains(&format!(
+                "pub const WINDOWS_LYREBIRD: &str = \"{}\";",
+                lyrebird_in_zip(WINDOWS)
+            )),
+            "the Windows install copies another name than the zip's lyrebird"
+        );
     }
 
     /// Decision M1-89: the Linux zip carries polkit's policy file, without
@@ -1790,6 +1846,8 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             "tornect unattended grant",
             "tornect connect --unattended",
             "emergency stop code",
+            // The Windows zip's lyrebird and its install (decision M1-88 (2), W4).
+            "`lyrebird.exe` beside `tornect.exe`",
         ] {
             assert!(
                 readme.contains(needle),
@@ -1803,6 +1861,10 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             // Before decision M1-89 the policy came from the source tree.
             "not in this zip",
             "packaging/polkit/",
+            // Before W4 the Windows zip held `pt\lyrebird.exe` and its
+            // install carried none.
+            "pt\\lyrebird.exe",
+            "carries no lyrebird",
         ] {
             assert!(
                 !readme.contains(stale),
@@ -1928,7 +1990,8 @@ tornect v0.1.0 (/w/apps/tornect) (*)
     /// No release notes say what this build no longer does (the final
     /// audit: the slice's notes said every session went over Tor and no
     /// client asked for an unattended session, and described a console
-    /// `tornect.exe` that could not reach its host's control channel).
+    /// `tornect.exe` that could not reach its host's control channel; the
+    /// slice.2 notes said the Windows install carried no lyrebird).
     #[test]
     fn no_release_notes_say_what_this_build_no_longer_does() {
         let root = crate::workspace_root().unwrap();
@@ -1942,6 +2005,8 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             "No client in this build asks for an unattended session",
             "`tornect.exe` is a console program",
             "cannot reach a running Windows host",
+            // Before decision M1-88 (2), W4.
+            "carries no lyrebird",
         ];
         if direct.contains("pub const INTERNET_DIRECT: bool = true;") {
             stale.extend([

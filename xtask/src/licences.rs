@@ -18,7 +18,8 @@
 //!   sources and fonts inside some crates (`BUNDLED`), the fonts and the icon
 //!   font in Tornect's own tree that the window embeds (`EMBEDDED`), the Rust
 //!   standard library, and on Windows llvm-mingw's runtime; and pointers to
-//!   lyrebird's notices (`pt/lyrebird.txt`) and to Tornect's own
+//!   lyrebird's notices (`pt/lyrebird.txt`; `lyrebird.txt` in the Windows
+//!   zip) and to Tornect's own
 //!   (`THIRD_PARTY_NOTICES.md`).
 //!
 //! Identical texts are written once and numbered; each package's line gives
@@ -722,7 +723,8 @@ pub struct Heading<'a> {
     pub title: &'a str,
     pub triple: &'a str,
     pub exe: &'a str,
-    /// The zip's name for lyrebird: `pt/lyrebird` or `pt/lyrebird.exe`.
+    /// The zip's name for lyrebird: `pt/lyrebird`, or on Windows
+    /// `lyrebird.exe`, beside `tornect.exe`.
     pub lyrebird: &'a str,
 }
 

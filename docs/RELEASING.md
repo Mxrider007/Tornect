@@ -27,7 +27,8 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
    used, and its lyrebird `signature` line says "good" (not "NOT CHECKED").
 6. The smoke tests below passed on the unpacked zips.
 7. The zips carry the licence texts and notices that the bundled dependencies require of a binary
-   distribution: `LICENSE`, `THIRD_PARTY_NOTICES.md`, lyrebird's notice (`pt/lyrebird.txt`) and
+   distribution: `LICENSE`, `THIRD_PARTY_NOTICES.md`, lyrebird's notice (`pt/lyrebird.txt`;
+   `lyrebird.txt` beside `tornect.exe` in the Windows zip) and
    `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `594711b`,
    `docs/VERIFICATION.md`, *Release tooling*).
 8. The release notes and the zipped `README-release.md` name the one download location,
@@ -116,7 +117,8 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
      `./tornect --home <dir> doctor`, whose `tor:` line must name the zip's `pt/lyrebird`; the zip
      holds `polkit/org.tornect.policy`.
    - Windows: the same with `tornect.exe` under Wine (Wine is not Windows: this proves the
-     executable starts, its imports resolve and it accepts the bundled `lyrebird.exe`), and on a
+     executable starts, its imports resolve and it accepts the bundled `lyrebird.exe`, which the
+     Windows zip holds beside `tornect.exe`, decision M1-88 (2)), and on a
      Windows machine when one is at hand. Under Wine the `--home` goes inside the Wine user's
      profile folder, `C:\users\<user>\…`, not under `target/tornect-test/` (which Wine sees as
      `Z:\…`): since `b09d919`, `tornect.exe` refuses a `--home` or `TORNECT_HOME` outside the profile
