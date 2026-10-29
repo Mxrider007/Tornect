@@ -26,8 +26,10 @@
 //!   them (never over another program's; the install's line says what links
 //!   do, design `invite` §4.6), and an uninstall that, run from the
 //!   installed copy, has that copy mark itself and its folder for removal at
-//!   the next restart. The Program Files copy carries no lyrebird yet
-//!   (decision M1-88), and the install says so.
+//!   the next restart. The pinned `lyrebird.exe` beside this program, checked
+//!   before the dialog, goes into Program Files with the copy, named by the
+//!   same robocopy (decision M1-88 (2), W4); without one, a line says that
+//!   the installed copy cannot use obfs4 or Snowflake bridges, and why.
 //!
 //! `tornect uninstall` removes the start at sign-in, whatever copy it runs,
 //! then the link entry's line in `mimeapps.list`, the menu entry, the link
@@ -109,12 +111,18 @@ pub(crate) fn kept_lyrebird_line(path: &std::path::Path) -> String {
     )
 }
 
-/// What a Windows install says of lyrebird: the Program Files copy carries
-/// none yet (decision M1-88).
+/// What a Windows install says when it carried no lyrebird (`why`): the
+/// installed copy cannot use obfs4 or Snowflake bridges (decision M1-88
+/// (2)). An install over an install is refused, so having them takes an
+/// uninstall first.
 #[cfg(any(windows, test))]
-pub(crate) const WINDOWS_NO_BRIDGES: &str = "The installed copy has no lyrebird, so it cannot use \
-     obfs4 or Snowflake bridges where Tor is blocked; there, run tornect.exe from the unpacked \
-     release folder, which holds pt\\lyrebird.exe.";
+pub(crate) fn windows_no_bridges_line(why: &str) -> String {
+    format!(
+        "The installed copy has no lyrebird ({why}), so it cannot use obfs4 or Snowflake bridges \
+         where Tor is blocked. To have them, run tornect uninstall, then tornect.exe install from \
+         the unpacked release folder, which holds lyrebird.exe beside tornect.exe."
+    )
+}
 
 /// What a Linux uninstall says of a lyrebird it left because its `pt` is a
 /// link, not a folder, or a folder other accounts can change: the install
@@ -472,7 +480,13 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
                 host_running,
                 autostart_for: &tornect_platform::autostart::for_this_os,
             };
-            install_windows(&mut deps, paths, &*sys, custom_home)
+            install_windows(
+                &mut deps,
+                paths,
+                &*sys,
+                custom_home,
+                tornect_signal::tor::LYREBIRD_SHA256,
+            )
         })
     }
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -709,15 +723,18 @@ fn windows_install_home_refusal() -> String {
 /// `tornect install` on Windows: refused with a custom home, beside a
 /// running host and while a start at sign-in may run an earlier install's
 /// copy; then the Program Files steps with the guard's operation between
-/// the held, hashed source and the first change, the line that says what
-/// `tornect:` links open, and the offer to start at sign-in for the
-/// installed copy.
+/// the held, hashed source and the first change, the `lyrebird.exe` beside
+/// it checked against `lyrebird_pin` (this build's) and carried with the
+/// copy, the line that says what `tornect:` links open, the line that says
+/// why no lyrebird went with it if none did, and the offer to start at
+/// sign-in for the installed copy.
 #[cfg(any(windows, test))]
 pub(crate) fn install_windows(
     deps: &mut Deps<'_>,
     paths: &Paths,
     sys: &dyn tornect_platform::install::WindowsSystem,
     custom_home: bool,
+    lyrebird_pin: Option<&str>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!custom_home, windows_install_home_refusal());
     anyhow::ensure!(!deps.host_running, CLOSE_FIRST);
@@ -740,7 +757,7 @@ pub(crate) fn install_windows(
     let guard = Arc::clone(&deps.ctx.guard);
     let refused = std::cell::RefCell::new(None);
     let authorized = std::cell::Cell::new(false);
-    let done = tornect_platform::install::install_in_program_files(sys, &mut || {
+    let done = tornect_platform::install::install_in_program_files(sys, lyrebird_pin, &mut || {
         guard_step(&guard, &ExternalOp::Install, &refused, &authorized)
     });
     if let Some(e) = refused.take() {
@@ -757,7 +774,9 @@ pub(crate) fn install_windows(
     };
     deps.console
         .out(&windows_installed(&installed.folder, installed.links));
-    deps.console.out(WINDOWS_NO_BRIDGES);
+    if let Err(why) = &installed.lyrebird {
+        deps.console.out(&windows_no_bridges_line(why));
+    }
     offer_sign_in(deps, paths, PathBuf::from(installed.exe))
 }
 
@@ -1226,6 +1245,9 @@ mod tests {
         fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
             panic!("read a file")
         }
+        fn hold_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            panic!("held a file")
+        }
         fn security(
             &self,
             _: &str,
@@ -1295,6 +1317,9 @@ mod tests {
         }
         fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
             panic!("read a file")
+        }
+        fn hold_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            panic!("held a file")
         }
         fn security(
             &self,
@@ -2072,7 +2097,7 @@ mod tests {
                 Err(NO_LYREBIRD_HERE.to_owned()),
             ),
             uninstall_linux(&mut deps, &env.paths, &env.files),
-            install_windows(&mut deps, &env.paths, &Untouched, false),
+            install_windows(&mut deps, &env.paths, &Untouched, false, None),
             uninstall_windows(&mut deps, &env.paths, &Untouched),
         ];
         for done in results {
@@ -2099,7 +2124,7 @@ mod tests {
             host_running: false,
             autostart_for: &make,
         };
-        let err = install_windows(&mut deps, &env.paths, &Untouched, true).unwrap_err();
+        let err = install_windows(&mut deps, &env.paths, &Untouched, true, None).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -2374,7 +2399,7 @@ mod tests {
                 host_running: false,
                 autostart_for: &make,
             };
-            let err = install_windows(&mut deps, &env.paths, &Bare, false)
+            let err = install_windows(&mut deps, &env.paths, &Bare, false, None)
                 .unwrap_err()
                 .to_string();
             if refused {
@@ -2542,6 +2567,9 @@ mod tests {
         fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
             panic!("read a file")
         }
+        fn hold_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            panic!("held a file")
+        }
         fn security(
             &self,
             _: &str,
@@ -2663,6 +2691,8 @@ mod tests {
     struct Fresh {
         url: Mutex<UrlKey>,
         copied: Mutex<bool>,
+        /// The lyrebird.exe beside the image, and then the installed one.
+        lyrebird: Option<&'static [u8]>,
     }
 
     impl Fresh {
@@ -2670,6 +2700,7 @@ mod tests {
             Self {
                 url: Mutex::new(url),
                 copied: Mutex::new(false),
+                lyrebird: None,
             }
         }
 
@@ -2700,8 +2731,16 @@ mod tests {
         fn is_reparse_point(&self, _: &str) -> Result<bool, InstallError> {
             Ok(false)
         }
-        fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
-            Ok(Box::new(std::io::Cursor::new(FRESH_PROGRAM)))
+        fn read_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            match self.lyrebird {
+                Some(bytes) if path.ends_with("\\lyrebird.exe") => {
+                    Ok(Box::new(std::io::Cursor::new(bytes)))
+                }
+                _ => Ok(Box::new(std::io::Cursor::new(FRESH_PROGRAM))),
+            }
+        }
+        fn hold_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            self.read_file(path)
         }
         fn security(
             &self,
@@ -2722,8 +2761,8 @@ mod tests {
         fn uninstall_entry_exists(&self, _: &str) -> Result<bool, InstallError> {
             Ok(false)
         }
-        fn file_exists(&self, _: &str) -> Result<bool, InstallError> {
-            Ok(false)
+        fn file_exists(&self, path: &str) -> Result<bool, InstallError> {
+            Ok(self.lyrebird.is_some() && path.ends_with("\\lyrebird.exe"))
         }
         fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
             Ok(Vec::new())
@@ -2786,11 +2825,17 @@ mod tests {
                 host_running: false,
                 autostart_for: &make,
             };
-            install_windows(&mut deps, &env.paths, &sys, false).unwrap();
+            install_windows(&mut deps, &env.paths, &sys, false, None).unwrap();
             assert!(script.said(line), "{found:?}: {:?}", script.lines);
-            // The final audit before the release: the Program Files copy
-            // carries no lyrebird yet (decision M1-88), and says so.
-            assert!(script.said(WINDOWS_NO_BRIDGES), "{:?}", script.lines);
+            // Decision M1-88 (2): a build that pins no lyrebird carries
+            // none, and says so.
+            assert!(
+                script.said(&windows_no_bridges_line(
+                    "this build pins no lyrebird for Windows"
+                )),
+                "{:?}",
+                script.lines
+            );
             assert!(
                 !script
                     .lines
@@ -2801,6 +2846,44 @@ mod tests {
             );
             assert_eq!(sys.url(), after, "{found:?}");
             assert_eq!(env.dialogs.asked(), ["install"], "{found:?}");
+        }
+    }
+
+    /// Decision M1-88 (2), W4: a Windows install whose `lyrebird.exe` beside
+    /// it is the build's pin carries it with the copy, in the one robocopy,
+    /// and says nothing more; one that is not the pin is not carried, and
+    /// the install says that the installed copy cannot use bridges, and why.
+    #[test]
+    fn the_windows_install_carries_the_pinned_lyrebird_or_says_why_not() {
+        const LYREBIRD_EXE: &[u8] = b"MZ the bridge helper";
+        let pin = tornect_platform::install::sha256_hex(LYREBIRD_EXE);
+        let wrong = "0".repeat(64);
+        for (pin, carried) in [(pin.as_str(), true), (wrong.as_str(), false)] {
+            let mut env = env(windows_admin(), 1);
+            let backends = Backends::default();
+            let make = |spec| backends.make(spec);
+            let mut sys = Fresh::with(UrlKey::Absent);
+            sys.lyrebird = Some(LYREBIRD_EXE);
+            let mut script = Script::answering(&[]);
+            let mut deps = Deps {
+                ctx: &mut env.ctx,
+                console: &mut script,
+                host_running: false,
+                autostart_for: &make,
+            };
+            install_windows(&mut deps, &env.paths, &sys, false, Some(pin)).unwrap();
+            let none = script.lines.iter().find(|l| l.contains("has no lyrebird"));
+            if carried {
+                assert_eq!(none, None, "{:?}", script.lines);
+            } else {
+                let line = none.expect("the install says why no lyrebird went");
+                assert!(
+                    line.contains("is not the pinned lyrebird 0.8.1 (SHA-256 mismatch)"),
+                    "{line}"
+                );
+                assert!(line.contains("tornect uninstall"), "{line}");
+            }
+            assert_eq!(env.dialogs.asked(), ["install"]);
         }
     }
 

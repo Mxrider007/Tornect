@@ -51,7 +51,13 @@
 //! the copy (elevated) the folder and the copy are checked for reparse
 //! points, then the copy is hashed and compared with the held image, then
 //! checked with the administrator helper task's ACL rule ([`admin_only`]),
-//! all before anything points at it; then this user's Start-menu entry,
+//! all before anything points at it; the pinned lyrebird beside the held
+//! image (`lyrebird.exe`, where the release zip puts it and the installed
+//! copy's lookup finds it), held open with share mode read only and checked
+//! against the build's pin before the dialog, goes with the copy, named by
+//! the same robocopy, and is checked the same way after it (decision M1-88
+//! (2), W4); then this user's
+//! Start-menu entry,
 //! then this user's registration of `tornect:` links
 //! (`HKEY_CURRENT_USER\Software\Classes\tornect`, no elevation; design
 //! `invite` §4.5), written only where no such key was there before the
@@ -148,6 +154,20 @@ pub const WINDOWS_FOLDER: &str = "Tornect";
 
 /// The installed executable's file name.
 pub const WINDOWS_EXE: &str = "tornect.exe";
+
+/// lyrebird's file name on Windows: beside `tornect.exe` in the release zip
+/// and in the install folder, where the installed copy's lyrebird lookup
+/// looks first (decision M1-88 (2), W4).
+pub const WINDOWS_LYREBIRD: &str = "lyrebird.exe";
+
+/// The largest lyrebird the Windows install reads (lyrebird 0.8.1 is about
+/// 10 MB).
+const LYREBIRD_MAX: u64 = 64 * 1024 * 1024;
+
+/// The installed lyrebird is not the pinned one, or not there, after the
+/// copy.
+pub const LYREBIRD_SWAPPED: &str = "Something else replaced lyrebird.exe while it was being \
+     copied, so nothing was installed.";
 
 /// The Start-menu entry's file name, in this user's Start-menu programs
 /// folder.
@@ -251,12 +271,15 @@ pub const COPY_NOT_ADMIN_ONLY: &str = "The installed copy could be changed by ac
 /// (UAC), each only through its own program ([`elevated_command`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Elevated {
-    /// Copy the held image at `from` to `to`, creating the folder.
+    /// Copy the held image at `from` to `to`, creating the folder, and
+    /// with `lyrebird` the [`WINDOWS_LYREBIRD`] beside it too.
     Copy {
         /// The held image's path.
         from: String,
         /// The installed executable.
         to: String,
+        /// Whether the checked lyrebird beside the held image goes too.
+        lyrebird: bool,
     },
     /// Write the uninstall entry.
     WriteEntry(UninstallEntry),
@@ -326,6 +349,12 @@ pub trait WindowsSystem {
     /// The file at `path`, for reading; a reparse point at `path` is never
     /// followed.
     fn read_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError>;
+    /// The file at `path`, opened for reading with share mode read only, as
+    /// [`Self::open_own_image`] holds the image: while the handle is held
+    /// nobody can write, rename or delete the file, so an elevated step that
+    /// reads it reads what was checked. A reparse point at `path` is opened
+    /// itself, never followed.
+    fn hold_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError>;
     /// The owner and the DACL of `path` itself, a file or a folder; a
     /// reparse point at `path` is read itself, never followed.
     fn security(&self, path: &str) -> Result<Security, InstallError>;
@@ -390,11 +419,14 @@ const CMD: &str = "cmd.exe";
 /// M1-65).
 ///
 /// - The copy: the system folder's `robocopy.exe`, from the held image's
-///   folder into `<Program Files>\Tornect`, the file `tornect.exe` only, with
-///   no retry and no option that copies owners or ACLs, moves or mirrors
-///   (robocopy keeps the file's name, so the source is named `tornect.exe`);
-///   its data, attributes and times only (`/COPY:DATX`), never an alternate
-///   data stream such as a download's mark, which every account could read
+///   folder into `<Program Files>\Tornect`, the file `tornect.exe` and, when
+///   the lyrebird beside it passed its checks, the file `lyrebird.exe`
+///   (decision M1-88 (2), W4: the same one robocopy names both, so this step
+///   runs nothing else and the copy's checks cover both), with no retry and
+///   no option that copies owners or ACLs, moves or mirrors (robocopy keeps
+///   the files' names, so the source is named `tornect.exe`); their data,
+///   attributes and times only (`/COPY:DATX`), never an alternate data
+///   stream such as a download's mark, which every account could read
 ///   there.
 /// - The entry's delete: the system folder's `reg.exe`, in the 64-bit view.
 /// - The folder's removal: the system folder's `cmd.exe`, with `/d` (no
@@ -409,12 +441,17 @@ const CMD: &str = "cmd.exe";
 pub fn elevated_command(step: &Elevated, target: &WindowsTarget) -> (String, String) {
     let system = |name: &str| windows_join(&target.system_directory, name);
     match step {
-        Elevated::Copy { from, to } => (
+        Elevated::Copy { from, to, lyrebird } => (
             system(ROBOCOPY),
             format!(
-                "\"{}\" \"{}\" {WINDOWS_EXE} /R:0 /W:0 /COPY:DATX",
+                "\"{}\" \"{}\" {WINDOWS_EXE}{} /R:0 /W:0 /COPY:DATX",
                 quotable_folder(parent_of(from)),
                 quotable_folder(parent_of(to)),
+                if *lyrebird {
+                    format!(" {WINDOWS_LYREBIRD}")
+                } else {
+                    String::new()
+                },
             ),
         ),
         Elevated::DeleteEntry { key } => (
@@ -430,9 +467,12 @@ pub fn elevated_command(step: &Elevated, target: &WindowsTarget) -> (String, Str
     }
 }
 
-/// Whether `step`'s program ended as a success: robocopy only with 1 (the
+/// Whether `step`'s program ended as a success: robocopy only with 1 (every
 /// file was copied; with 0 nothing was, and since the folder holds no other
-/// file, 2 to 7 do not mean success either), every other one only with 0.
+/// file, 2 to 7 do not mean success either, nor 8 and above, a file that
+/// could not be copied), every other one only with 0. A named file missing
+/// from the source does not change robocopy's code: the checks after the
+/// copy find it missing.
 #[must_use]
 pub fn step_succeeded(step: &Elevated, exit_code: u32) -> bool {
     match step {
@@ -548,6 +588,8 @@ pub struct WindowsTarget {
     pub folder: String,
     /// `<Program Files>\Tornect\tornect.exe`.
     pub exe: String,
+    /// `<Program Files>\Tornect\lyrebird.exe`.
+    pub lyrebird: String,
     /// `<Start-menu programs>\Tornect.lnk`.
     pub start_menu_entry: String,
     /// The uninstall entry.
@@ -579,6 +621,7 @@ impl WindowsTarget {
         let program_files = sys.program_files()?;
         let folder = windows_join(&program_files, WINDOWS_FOLDER);
         let exe = windows_join(&folder, WINDOWS_EXE);
+        let lyrebird = windows_join(&folder, WINDOWS_LYREBIRD);
         let entry = UninstallEntry {
             key: UNINSTALL_KEY.to_owned(),
             display_name: ENTRY_NAME.to_owned(),
@@ -590,6 +633,7 @@ impl WindowsTarget {
             system_directory: String::new(),
             folder,
             exe,
+            lyrebird,
             start_menu_entry: String::new(),
             entry,
             url_command: String::new(),
@@ -615,8 +659,15 @@ impl WindowsTarget {
     /// The ACL check of §B.1.1 (the helper task's, H6): the executable and
     /// every folder above it up to Program Files carry no write, delete or
     /// owner-change entry for anyone but administrators. `with_exe`: whether
-    /// the executable is there to check.
-    fn admin_only(&self, sys: &dyn WindowsSystem, with_exe: bool) -> Result<(), String> {
+    /// the executable is there to check; `with_lyrebird`: whether the
+    /// installed lyrebird is too, checked the same way (decision M1-88 (2):
+    /// the installed copy runs it).
+    fn admin_only(
+        &self,
+        sys: &dyn WindowsSystem,
+        with_exe: bool,
+        with_lyrebird: bool,
+    ) -> Result<(), String> {
         let install = HelperInstall {
             exe: self.exe.clone(),
             folder: self.folder.clone(),
@@ -625,7 +676,11 @@ impl WindowsTarget {
             sid: String::new(),
         };
         let paths = guarded_paths(&install).map_err(|e| e.to_string())?;
-        for path in paths.iter().skip(usize::from(!with_exe)) {
+        let lyrebird = with_lyrebird.then_some(&self.lyrebird);
+        for path in lyrebird
+            .into_iter()
+            .chain(paths.iter().skip(usize::from(!with_exe)))
+        {
             admin_only(path, &sys.security(path).map_err(|e| e.to_string())?)?;
         }
         Ok(())
@@ -634,17 +689,103 @@ impl WindowsTarget {
 
 /// The SHA-256 of what `read` yields.
 fn sha256_of<R: std::io::Read + ?Sized>(read: &mut R) -> std::io::Result<[u8; 32]> {
+    sha256_upto(read, u64::MAX).map(|(hash, _)| hash)
+}
+
+/// The SHA-256 of at most `max` bytes of what `read` yields, and whether
+/// there was more.
+fn sha256_upto<R: std::io::Read + ?Sized>(
+    read: &mut R,
+    max: u64,
+) -> std::io::Result<([u8; 32], bool)> {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     let mut buf = [0u8; 64 * 1024];
+    let mut left = max;
     loop {
-        match read.read(&mut buf) {
-            Ok(0) => return Ok(hasher.finalize().into()),
-            Ok(n) => hasher.update(&buf[..n]),
+        let room = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        if room == 0 {
+            // One byte more says whether there was more.
+            let mut one = [0u8; 1];
+            let more = loop {
+                match read.read(&mut one) {
+                    Ok(n) => break n > 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+            return Ok((hasher.finalize().into(), more));
+        }
+        match read.read(&mut buf[..room]) {
+            Ok(0) => return Ok((hasher.finalize().into(), false)),
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                left -= n as u64;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Whether `file`, the lyrebird at `path`, is `pin`'s: at most 64 MiB, its
+/// SHA-256 `pin` (lowercase hex). The reason when it is not.
+fn lyrebird_matches(file: &mut dyn std::io::Read, path: &str, pin: &str) -> Result<(), String> {
+    let (hash, more) =
+        sha256_upto(file, LYREBIRD_MAX).map_err(|e| format!("reading {path}: {e}"))?;
+    if more {
+        return Err(format!("{path} is larger than 64 MiB"));
+    }
+    if data_encoding::HEXLOWER.encode(&hash) != pin {
+        return Err(format!(
+            "{path} is not the pinned lyrebird 0.8.1 (SHA-256 mismatch)"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the lyrebird at `path` is `pin`'s: not a reparse point (a link is
+/// never copied or run through), a file that can be read, and
+/// [`lyrebird_matches`]. The reason when it is not.
+fn lyrebird_pinned(sys: &dyn WindowsSystem, path: &str, pin: &str) -> Result<(), String> {
+    if sys.is_reparse_point(path).map_err(|e| e.to_string())? {
+        return Err(format!("{path} is a link to another place"));
+    }
+    let mut file = sys.read_file(path).map_err(|e| e.to_string())?;
+    lyrebird_matches(&mut *file, path, pin)
+}
+
+/// The lyrebird to install beside the copy (decision M1-88 (2), W4): the
+/// [`WINDOWS_LYREBIRD`] beside the held image at `image`, where the release
+/// zip puts it and the running copy's lookup finds it first, while this
+/// build pins one (`pin`); held ([`WindowsSystem::hold_file`]) by this
+/// unelevated process before the guard's dialog, then found not to be a
+/// reparse point and to pass [`lyrebird_matches`] on the held handle. The
+/// handle is kept until the install ends, so the file the elevated copy
+/// reads is the one checked: nothing can swap in a link to a file this
+/// account cannot read, which the elevated copy would otherwise put where
+/// every account can read it. `Err` says why there is none to install, and
+/// the install goes on without it: a lyrebird that is not the pin is never
+/// copied.
+fn lyrebird_to_install<'a>(
+    sys: &'a dyn WindowsSystem,
+    image: &str,
+    pin: Option<&str>,
+) -> Result<Box<dyn std::io::Read + 'a>, String> {
+    let Some(pin) = pin else {
+        return Err("this build pins no lyrebird for Windows".to_owned());
+    };
+    let path = windows_join(parent_of(image), WINDOWS_LYREBIRD);
+    if !sys.file_exists(&path).map_err(|e| e.to_string())? {
+        return Err(format!("no {WINDOWS_LYREBIRD} beside this tornect.exe"));
+    }
+    let mut held = sys.hold_file(&path).map_err(|e| e.to_string())?;
+    // Asked after the hold: while it is held the path stays what it is.
+    if sys.is_reparse_point(&path).map_err(|e| e.to_string())? {
+        return Err(format!("{path} is a link to another place"));
+    }
+    lyrebird_matches(&mut *held, &path, pin)?;
+    Ok(held)
 }
 
 /// This program, held open from before the guard's dialog until the
@@ -693,7 +834,7 @@ fn own_copy_ok(
             )));
         }
     }
-    target.admin_only(sys, true).map_err(|why| {
+    target.admin_only(sys, true, false).map_err(|why| {
         InstallError::Refused(format!(
             "the installed copy could be changed by accounts other than administrators \
              ({why}), so it changes nothing"
@@ -768,6 +909,9 @@ pub struct Installed {
     pub exe: String,
     /// What `tornect:` links open here.
     pub links: WindowsLinks,
+    /// Whether the pinned lyrebird went with the copy; why not, when it
+    /// did not (decision M1-88 (2)).
+    pub lyrebird: Result<(), String>,
 }
 
 /// What an install did so far, undone in reverse on a failure.
@@ -908,7 +1052,7 @@ fn existing_folder_ok(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
             target.exe
         )));
     }
-    target.admin_only(sys, with_exe).map_err(|why| {
+    target.admin_only(sys, with_exe, false).map_err(|why| {
         InstallError::Refused(format!(
             "{folder} could be changed by accounts other than administrators, so Tornect was \
              not installed there ({why})."
@@ -980,6 +1124,12 @@ fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 ///    that handle, before anything else and until the end; refused when its
 ///    file is not named `tornect.exe` or its path holds `%`, `"` or a
 ///    control character (the copy keeps the name and takes the path quoted);
+///    then the `lyrebird.exe` beside it held open as the image is and
+///    checked against `lyrebird_pin`, this build's pin
+///    ([`lyrebird_to_install`]): one that passes goes with the copy, held
+///    until the install ends, and without one (none there, a link, or not
+///    the pin) the install goes on without it and [`Installed::lyrebird`]
+///    says why;
 /// 2. the target from the known folders; refused when its path cannot be
 ///    quoted into the uninstall command, when `<Program Files>\Tornect`
 ///    exists and fails `existing_folder_ok` (anything but `tornect.exe` in
@@ -999,9 +1149,10 @@ fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 ///    then the folder checked again, as the dialog may have stayed open for
 ///    long;
 /// 4. the copy (elevated);
-/// 5. the folder and the copy checked for reparse points, then the copy
-///    hashed and compared with the held image, then the ACL check, all
-///    before anything points at the copy;
+/// 5. the folder and the copy (and the installed lyrebird) checked for
+///    reparse points, then the copy hashed and compared with the held image
+///    and the installed lyrebird with the pin ([`LYREBIRD_SWAPPED`]), then
+///    the ACL check of both, all before anything points at the copy;
 /// 6. this user's Start-menu entry, then (6b) the link registration, where
 ///    step 2 found none (no elevation; a key that appeared meanwhile is never
 ///    written over: [`URL_KEY_APPEARED`]);
@@ -1014,15 +1165,20 @@ fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 /// the refusal says so. A cancelled prompt is [`InstallError::Cancelled`].
 pub fn install_in_program_files(
     sys: &dyn WindowsSystem,
+    lyrebird_pin: Option<&str>,
     authorize: &mut dyn FnMut() -> Result<(), InstallError>,
 ) -> Result<Installed, InstallError> {
     let source = HeldSource::hold(sys)?;
     source_ok(source.path())?;
     let target = WindowsTarget::of(sys)?;
     existing_folder_ok(sys, &target)?;
+    // Held from here until the install ends (see `lyrebird_to_install`).
+    let held_lyrebird = lyrebird_to_install(sys, source.path(), lyrebird_pin);
+    let carried = held_lyrebird.is_ok();
     let copy = Elevated::Copy {
         from: source.path().to_owned(),
         to: target.exe.clone(),
+        lyrebird: carried,
     };
     let write = Elevated::WriteEntry(target.entry.clone());
     let remove = Elevated::RemoveFolder {
@@ -1049,7 +1205,11 @@ pub fn install_in_program_files(
     let mut done = vec![Done::Copied];
     // The copy is read where it was written, not through a link put there
     // during the copy.
-    for path in [&target.folder, &target.exe] {
+    let lyrebird_path = carried.then_some(&target.lyrebird);
+    for path in [&target.folder, &target.exe]
+        .into_iter()
+        .chain(lyrebird_path)
+    {
         match sys.is_reparse_point(path) {
             Ok(false) => {}
             Ok(true) => {
@@ -1082,7 +1242,20 @@ pub fn install_in_program_files(
         }
         Err(e) => return Err(undo(sys, &target, &done, e)),
     }
-    if let Err(why) = target.admin_only(sys, true) {
+    // The lyrebird beside the image was held through the copy; what the
+    // copy wrote is checked against the pin all the same.
+    if let (true, Some(pin)) = (carried, lyrebird_pin)
+        && let Err(why) = lyrebird_pinned(sys, &target.lyrebird, pin)
+    {
+        tracing::warn!(%why, "the installed lyrebird is not the pinned one");
+        return Err(undo(
+            sys,
+            &target,
+            &done,
+            InstallError::Refused(LYREBIRD_SWAPPED.to_owned()),
+        ));
+    }
+    if let Err(why) = target.admin_only(sys, true, carried) {
         tracing::warn!(%why, "the installed copy failed the ACL check");
         // Not deleted as administrator: an account that can change the
         // folder could have turned it into a link to another place first.
@@ -1117,6 +1290,7 @@ pub fn install_in_program_files(
         folder: target.folder,
         exe: target.exe,
         links,
+        lyrebird: held_lyrebird.map(|_released_here| ()),
     })
 }
 
@@ -1160,7 +1334,10 @@ fn removable_folder(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<b
         )));
     }
     let with_exe = entries.iter().any(|e| e.eq_ignore_ascii_case(WINDOWS_EXE));
-    target.admin_only(sys, with_exe).map_err(|why| {
+    // lyrebird.exe is not looked at: `rmdir /s` and the restart step's
+    // delete remove a file, or a link as a link, wherever it points, and
+    // the folder that holds it is checked.
+    target.admin_only(sys, with_exe, false).map_err(|why| {
         InstallError::Refused(format!(
             "{} could be changed by accounts other than administrators, so Tornect did not \
              remove it as administrator ({why}).",
@@ -3379,6 +3556,10 @@ mod windows_tests {
         OpenImage,
         ReadImage,
         CloseImage,
+        /// A file held with share mode read only, by path.
+        Hold(String),
+        /// That hold's end.
+        Release(String),
         Authorize,
         Elevated(Elevated),
         WriteShortcut(String),
@@ -3426,6 +3607,11 @@ mod windows_tests {
         image: Vec<u8>,
         /// What a copy writes instead of the held image (a swap).
         copy_writes: Option<Vec<u8>>,
+        /// This build's lyrebird pin, as the install is handed it.
+        pin: Option<String>,
+        /// What a copy writes as lyrebird.exe instead of the one beside the
+        /// held image (a swap).
+        copy_writes_lyrebird: Option<Vec<u8>>,
         files: RefCell<BTreeMap<String, Vec<u8>>>,
         folders: RefCell<BTreeSet<String>>,
         reparse: BTreeSet<String>,
@@ -3468,6 +3654,17 @@ mod windows_tests {
         url_during_prompt: RefCell<Option<(&'static str, UrlKey)>>,
     }
 
+    /// The tests' lyrebird.exe; the fake's pin is its SHA-256.
+    const LYREBIRD_EXE: &[u8] = b"MZ the bridge helper";
+
+    /// The install as the command runs it, handed the fake's pin.
+    fn install(
+        fake: &Fake,
+        authorize: &mut dyn FnMut() -> Result<(), InstallError>,
+    ) -> Result<Installed, InstallError> {
+        install_in_program_files(fake, fake.pin.as_deref(), authorize)
+    }
+
     fn kind(step: &Elevated) -> &'static str {
         match step {
             Elevated::Copy { .. } => "copy",
@@ -3490,6 +3687,8 @@ mod windows_tests {
                 image_path: IMAGE.to_owned(),
                 image: PROGRAM.to_vec(),
                 copy_writes: None,
+                pin: Some(sha256_hex(LYREBIRD_EXE)),
+                copy_writes_lyrebird: None,
                 files: RefCell::new(BTreeMap::new()),
                 folders: RefCell::new(BTreeSet::new()),
                 reparse: BTreeSet::new(),
@@ -3519,6 +3718,18 @@ mod windows_tests {
 
         fn exe(&self) -> String {
             format!("{}\\Tornect\\tornect.exe", self.program_files)
+        }
+
+        fn lyrebird(&self) -> String {
+            format!("{}\\Tornect\\lyrebird.exe", self.program_files)
+        }
+
+        /// The release folder's lyrebird.exe beside the held image, as
+        /// `bytes`; its path.
+        fn beside(&self, bytes: &[u8]) -> String {
+            let path = windows_join(parent_of(IMAGE), WINDOWS_LYREBIRD);
+            self.files.borrow_mut().insert(key(&path), bytes.to_vec());
+            path
         }
 
         fn link() -> String {
@@ -3623,6 +3834,26 @@ mod windows_tests {
         }
     }
 
+    /// A file held as `hold_file` holds it: its bytes when held, and the
+    /// hold's end recorded when dropped.
+    struct FakeHeld<'a> {
+        fake: &'a Fake,
+        path: String,
+        bytes: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl std::io::Read for FakeHeld<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.bytes.read(buf)
+        }
+    }
+
+    impl Drop for FakeHeld<'_> {
+        fn drop(&mut self) {
+            self.fake.record(Ev::Release(self.path.clone()));
+        }
+    }
+
     impl WindowsSystem for Fake {
         fn program_files(&self) -> Result<String, InstallError> {
             Ok(self.program_files.clone())
@@ -3673,6 +3904,21 @@ mod windows_tests {
             Ok(Box::new(std::io::Cursor::new(bytes)))
         }
 
+        fn hold_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            let bytes = self
+                .files
+                .borrow()
+                .get(&key(path))
+                .cloned()
+                .ok_or_else(|| InstallError::Failed(format!("{path}: not found")))?;
+            self.record(Ev::Hold(key(path)));
+            Ok(Box::new(FakeHeld {
+                fake: self,
+                path: key(path),
+                bytes: std::io::Cursor::new(bytes),
+            }))
+        }
+
         fn security(&self, path: &str) -> Result<Security, InstallError> {
             self.record(Ev::Security(path.to_owned()));
             let mut security = admin_only_security();
@@ -3720,7 +3966,7 @@ mod windows_tests {
                 return Err(InstallError::Failed(format!("{} failed", kind(step))));
             }
             match step {
-                Elevated::Copy { to, .. } => {
+                Elevated::Copy { from, to, lyrebird } => {
                     let folder = to.rsplit_once('\\').unwrap().0;
                     self.folders.borrow_mut().insert(key(folder));
                     let bytes = self
@@ -3728,6 +3974,16 @@ mod windows_tests {
                         .clone()
                         .unwrap_or_else(|| self.image.clone());
                     self.files.borrow_mut().insert(key(to), bytes);
+                    // As robocopy: a named file the source folder lacks is
+                    // not copied, and the step still succeeds.
+                    let source = windows_join(parent_of(from), WINDOWS_LYREBIRD);
+                    let beside = self.files.borrow().get(&key(&source)).cloned();
+                    if *lyrebird && let Some(bytes) = beside {
+                        let bytes = self.copy_writes_lyrebird.clone().unwrap_or(bytes);
+                        self.files
+                            .borrow_mut()
+                            .insert(key(&windows_join(folder, WINDOWS_LYREBIRD)), bytes);
+                    }
                     if let Some(link) = &self.on_copy_link {
                         self.reparse_now.borrow_mut().insert(key(link));
                     }
@@ -3839,7 +4095,7 @@ mod windows_tests {
     #[test]
     fn the_source_is_held_and_hashed_before_the_reauth() {
         let fake = Fake::new();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         let events = fake.events();
         let open = position(&events, |e| *e == Ev::OpenImage);
         let authorize = position(&events, |e| *e == Ev::Authorize);
@@ -3874,12 +4130,12 @@ mod windows_tests {
     fn program_files_comes_from_the_known_folder_never_the_environment() {
         let mut fake = Fake::new();
         fake.program_files = "K:\\Known Apps".to_owned();
-        let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        let installed = install(&fake, &mut allow(&fake)).unwrap();
         assert_eq!(installed.folder, "K:\\Known Apps\\Tornect");
         assert_eq!(installed.exe, "K:\\Known Apps\\Tornect\\tornect.exe");
         for ev in fake.events() {
             match ev {
-                Ev::Elevated(Elevated::Copy { from, to }) => {
+                Ev::Elevated(Elevated::Copy { from, to, .. }) => {
                     assert_eq!(from, IMAGE);
                     assert_eq!(to, installed.exe);
                 }
@@ -3907,7 +4163,7 @@ mod windows_tests {
     fn a_swapped_source_is_detected_and_nothing_points_at_it() {
         let mut fake = Fake::new();
         fake.copy_writes = Some(b"MZ another program".to_vec());
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Refused(why)) => assert_eq!(why, SOURCE_SWAPPED),
             other => panic!("not refused as a swapped source: {other:?}"),
         }
@@ -3943,7 +4199,7 @@ mod windows_tests {
                 .borrow_mut()
                 .insert(key(&format!("{}\\{name}", fake.folder())), b"x".to_vec());
         }
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Refused(why)) => assert_eq!(
                 why,
                 "C:\\Program Files\\Tornect already holds other files, so Tornect was not \
@@ -3964,7 +4220,7 @@ mod windows_tests {
         junction.folders.borrow_mut().insert(folder.clone());
         junction.reparse.insert(folder);
         assert!(matches!(
-            install_in_program_files(&junction, &mut allow(&junction)),
+            install(&junction, &mut allow(&junction)),
             Err(InstallError::Refused(why)) if why.contains("is a link to another place")
         ));
         assert!(junction.elevated().is_empty());
@@ -3974,7 +4230,7 @@ mod windows_tests {
             .files
             .borrow_mut()
             .insert(key(&earlier.exe()), b"old".to_vec());
-        match install_in_program_files(&earlier, &mut allow(&earlier)) {
+        match install(&earlier, &mut allow(&earlier)) {
             Err(InstallError::Refused(why)) => assert_eq!(why, ALREADY_INSTALLED),
             other => panic!("installed over an earlier install: {other:?}"),
         }
@@ -3998,7 +4254,7 @@ mod windows_tests {
     fn a_write_entry_after_the_copy_undoes_the_install() {
         let mut fake = Fake::new();
         fake.fail = vec!["write"];
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Failed(why)) => assert_eq!(why, "write failed"),
             other => panic!("{other:?}"),
         }
@@ -4026,7 +4282,7 @@ mod windows_tests {
     #[test]
     fn the_uninstall_command_is_quoted_with_its_fixed_argument() {
         let fake = Fake::new();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         let entries = fake.entries.borrow();
         let entry = entries.get(UNINSTALL_KEY).unwrap();
         assert_eq!(
@@ -4059,7 +4315,7 @@ mod windows_tests {
         ] {
             let mut fake = Fake::new();
             fake.program_files = bad.to_owned();
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Unavailable(why)) => {
                     assert!(why.contains("uninstall entry"), "{bad:?}: {why}");
                 }
@@ -4091,7 +4347,7 @@ mod windows_tests {
         for at in ["copy", "write"] {
             let fake = Fake::new();
             fake.cancel.borrow_mut().push(at);
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Cancelled(why)) => {
                     assert_eq!(why, INSTALL_NEEDS_APPROVAL, "{at}");
                 }
@@ -4111,7 +4367,7 @@ mod windows_tests {
         let fake = Fake::new();
         fake.cancel.borrow_mut().extend(["write", "remove"]);
         let folder = fake.folder();
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Cancelled(why)) => assert_eq!(
                 why,
                 format!(
@@ -4130,7 +4386,7 @@ mod windows_tests {
     #[test]
     fn uninstall_reverses_every_step() {
         let fake = Fake::new();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         fake.events.borrow_mut().clear();
         let removed = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
         assert_eq!(
@@ -4236,7 +4492,7 @@ mod windows_tests {
         let mut fake = Fake::new();
         fake.runner.insert("copy", IMAGE.to_owned());
         assert!(matches!(
-            install_in_program_files(&fake, &mut allow(&fake)),
+            install(&fake, &mut allow(&fake)),
             Err(InstallError::Unavailable(_))
         ));
         assert!(fake.elevated().is_empty());
@@ -4284,7 +4540,7 @@ mod windows_tests {
                     fake.reparse.insert(key(&fake.exe()));
                 }
             }
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => assert!(
                     why.contains("could be changed by accounts other than administrators")
                         || (broken == "exe link" && why.contains("is a link to another place")),
@@ -4322,7 +4578,7 @@ mod windows_tests {
                 fake.writable_now.borrow_mut().insert(folder.clone());
                 Ok(())
             };
-            match install_in_program_files(&fake, &mut turn_into_a_link) {
+            match install(&fake, &mut turn_into_a_link) {
                 Err(InstallError::Refused(why)) => {
                     assert!(
                         why.contains("is a link to another place"),
@@ -4356,7 +4612,7 @@ mod windows_tests {
             } else {
                 fake.exe()
             });
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => {
                     assert!(why.contains("link to another place"), "{at}: {why}");
                     assert!(
@@ -4384,7 +4640,7 @@ mod windows_tests {
     fn an_install_never_deletes_as_administrator_a_folder_found_unsafe() {
         let mut fake = Fake::new();
         fake.writable_by_users.insert(key(&fake.folder()));
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Refused(why)) => assert_eq!(why, COPY_NOT_ADMIN_ONLY),
             other => panic!("{other:?}"),
         }
@@ -4398,7 +4654,7 @@ mod windows_tests {
         let mut fake = Fake::new();
         fake.fail = vec!["write"];
         fake.on_shortcut_link = Some(fake.folder());
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Failed(why)) => {
                 assert!(why.starts_with("write failed"), "{why}");
                 assert!(why.contains("did not remove it as administrator"), "{why}");
@@ -4441,7 +4697,7 @@ mod windows_tests {
                     fake.owned_by_users.insert(key(&fake.exe()));
                 }
             }
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => {
                     assert_eq!(why, COPY_NOT_ADMIN_ONLY, "{broken}");
                 }
@@ -4471,7 +4727,7 @@ mod windows_tests {
     #[test]
     fn the_acl_check_runs_after_the_copy_and_before_any_entry() {
         let fake = Fake::new();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         let events = fake.events();
         let copy = position(&events, |e| {
             matches!(e, Ev::Elevated(Elevated::Copy { .. }))
@@ -4502,6 +4758,220 @@ mod windows_tests {
             reads.iter().all(|(at, _)| copy < *at && *at < first_entry),
             "{events:?}"
         );
+    }
+
+    /// Decision M1-88 (2), W4: the pinned `lyrebird.exe` beside the held
+    /// image, checked before the dialog, goes with the copy, named by the
+    /// same robocopy: still two prompts, the copy's and the entry's, and no
+    /// other program elevated. After the copy it is checked for a reparse
+    /// point, against the pin and with the ACL rule, before anything points
+    /// at the copy; uninstalling removes it with the folder.
+    #[test]
+    fn the_pinned_lyrebird_beside_the_image_goes_with_the_one_copy() {
+        let fake = Fake::new();
+        fake.beside(LYREBIRD_EXE);
+        let installed = install(&fake, &mut allow(&fake)).unwrap();
+        assert_eq!(installed.lyrebird, Ok(()));
+        assert_eq!(
+            fake.elevated(),
+            [
+                Elevated::Copy {
+                    from: IMAGE.to_owned(),
+                    to: fake.exe(),
+                    lyrebird: true,
+                },
+                Elevated::WriteEntry(WindowsTarget::of(&fake).unwrap().entry),
+            ]
+        );
+        assert_eq!(
+            fake.files.borrow().get(&key(&fake.lyrebird())),
+            Some(&LYREBIRD_EXE.to_vec())
+        );
+        let events = fake.events();
+        let copy = position(&events, |e| {
+            matches!(e, Ev::Elevated(Elevated::Copy { .. }))
+        });
+        let shortcut = position(&events, |e| matches!(e, Ev::WriteShortcut(_)));
+        let read = position(&events, |e| *e == Ev::Security(fake.lyrebird()));
+        assert!(copy < read && read < shortcut, "{events:?}");
+
+        // Uninstalling removes the folder, lyrebird.exe with it.
+        uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+        fake.assert_nothing_installed();
+        // And the restart step deletes it at once, as anything but the copy.
+        let fake = Fake::new();
+        copied(&fake);
+        fake.files
+            .borrow_mut()
+            .insert(key(&fake.lyrebird()), LYREBIRD_EXE.to_vec());
+        let done = RefCell::new(Vec::new());
+        let deleted = |path: &str| {
+            done.borrow_mut().push(format!("delete {}", key(path)));
+            Ok(())
+        };
+        let marked = |path: &str| {
+            done.borrow_mut().push(format!("mark {}", key(path)));
+            Ok(())
+        };
+        mark_own_folder_for_restart(&fake, &fake.exe(), &deleted, &marked).unwrap();
+        assert_eq!(
+            done.borrow()[0],
+            format!("delete {}", key(&fake.lyrebird()))
+        );
+    }
+
+    /// The lyrebird beside the image is held, as the image is, from before
+    /// the dialog until the install ends: the elevated copy reads the file
+    /// that was checked, never a link to a file this account cannot read
+    /// put there during the prompt (which the copy would otherwise write
+    /// where every account can read it). It is checked on the held handle;
+    /// one that fails is let go before the dialog.
+    #[test]
+    fn the_lyrebird_beside_the_image_is_held_from_before_the_dialog_until_the_install_ends() {
+        let fake = Fake::new();
+        let source = fake.beside(LYREBIRD_EXE);
+        install(&fake, &mut allow(&fake)).unwrap();
+        let events = fake.events();
+        let holds: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Ev::Hold(_) | Ev::Release(_)))
+            .collect();
+        assert_eq!(
+            holds,
+            [&Ev::Hold(key(&source)), &Ev::Release(key(&source))],
+            "{events:?}"
+        );
+        let hold = position(&events, |e| *e == Ev::Hold(key(&source)));
+        let release = position(&events, |e| *e == Ev::Release(key(&source)));
+        let authorize = position(&events, |e| *e == Ev::Authorize);
+        let last_elevated = events
+            .iter()
+            .rposition(|e| matches!(e, Ev::Elevated(_)))
+            .unwrap();
+        let acl = position(&events, |e| *e == Ev::Security(fake.lyrebird()));
+        assert!(
+            hold < authorize && authorize < acl && acl < last_elevated && last_elevated < release,
+            "{events:?}"
+        );
+
+        let not_pin = Fake::new();
+        not_pin.beside(b"MZ another build");
+        let mut link = Fake::new();
+        let source = link.beside(LYREBIRD_EXE);
+        link.reparse.insert(key(&source));
+        for (case, fake) in [("not the pin", not_pin), ("a link", link)] {
+            install(&fake, &mut allow(&fake)).unwrap();
+            let events = fake.events();
+            let release = position(&events, |e| *e == Ev::Release(key(&source)));
+            let authorize = position(&events, |e| *e == Ev::Authorize);
+            assert!(release < authorize, "{case}: {events:?}");
+        }
+    }
+
+    /// Decision M1-88 (2): without a pinned lyrebird to carry, the install
+    /// goes on without it, names only `tornect.exe` to robocopy and says
+    /// why: none beside the image, a build that pins none, one that is a
+    /// link, or one that is not the pin, which is never copied.
+    #[test]
+    fn without_a_pinned_lyrebird_beside_it_the_install_goes_on_without_one() {
+        let other: &[u8] = b"MZ another build";
+        let big = vec![0u8; usize::try_from(LYREBIRD_MAX).unwrap() + 1];
+        for (case, why) in [
+            ("none", "no lyrebird.exe beside this tornect.exe"),
+            ("unpinned", "pins no lyrebird"),
+            ("link", "is a link to another place"),
+            (
+                "other",
+                "is not the pinned lyrebird 0.8.1 (SHA-256 mismatch)",
+            ),
+            ("big", "is larger than 64 MiB"),
+        ] {
+            let mut fake = Fake::new();
+            match case {
+                "unpinned" => {
+                    fake.beside(LYREBIRD_EXE);
+                    fake.pin = None;
+                }
+                "link" => {
+                    let source = fake.beside(LYREBIRD_EXE);
+                    fake.reparse.insert(key(&source));
+                }
+                "other" => {
+                    fake.beside(other);
+                }
+                "big" => {
+                    fake.beside(&big);
+                }
+                _ => {}
+            }
+            let installed = install(&fake, &mut allow(&fake)).unwrap();
+            match &installed.lyrebird {
+                Err(said) => assert!(said.contains(why), "{case}: {said}"),
+                Ok(()) => panic!("{case}: carried a lyrebird"),
+            }
+            assert!(
+                matches!(
+                    fake.elevated().as_slice(),
+                    [
+                        Elevated::Copy {
+                            lyrebird: false,
+                            ..
+                        },
+                        Elevated::WriteEntry(_)
+                    ]
+                ),
+                "{case}: {:?}",
+                fake.elevated()
+            );
+            assert!(
+                !fake.files.borrow().contains_key(&key(&fake.lyrebird())),
+                "{case}"
+            );
+        }
+    }
+
+    /// The lyrebird beside the image is held through the copy, which on
+    /// Windows keeps it from being changed; what the copy wrote is checked
+    /// against the pin all the same: a lyrebird.exe replaced, or removed,
+    /// between the check and the copy (as the fake lets happen) undoes the
+    /// install, with nothing pointing at it. One that others can change
+    /// after the copy fails the ACL check as the copy would.
+    #[test]
+    fn a_lyrebird_changed_before_the_copy_or_open_to_others_installs_nothing() {
+        let mut fake = Fake::new();
+        fake.beside(LYREBIRD_EXE);
+        fake.copy_writes_lyrebird = Some(b"MZ swapped in".to_vec());
+        match install(&fake, &mut allow(&fake)) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, LYREBIRD_SWAPPED),
+            other => panic!("installed a swapped lyrebird: {other:?}"),
+        }
+        fake.assert_nothing_installed();
+
+        let fake = Fake::new();
+        fake.beside(LYREBIRD_EXE);
+        let mut removed_meanwhile = || {
+            fake.record(Ev::Authorize);
+            fake.files
+                .borrow_mut()
+                .remove(&key(&windows_join(parent_of(IMAGE), WINDOWS_LYREBIRD)));
+            Ok(())
+        };
+        match install(&fake, &mut removed_meanwhile) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, LYREBIRD_SWAPPED),
+            other => panic!("installed without the lyrebird it named: {other:?}"),
+        }
+        fake.assert_nothing_installed();
+
+        let mut fake = Fake::new();
+        fake.beside(LYREBIRD_EXE);
+        fake.writable_by_users.insert(key(&fake.lyrebird()));
+        match install(&fake, &mut allow(&fake)) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, COPY_NOT_ADMIN_ONLY),
+            other => panic!("installed a lyrebird others can change: {other:?}"),
+        }
+        assert!(fake.shortcuts.borrow().is_empty());
+        assert!(fake.entries.borrow().is_empty());
+        assert_ne!(fake.url(), UrlKey::Command(fake.url_command()));
     }
 
     /// Each elevated step runs only through its own program (decision
@@ -4537,7 +5007,7 @@ mod windows_tests {
                 }
                 fake.runner.insert(step, runner.clone());
                 let done = if *step == "copy" {
-                    install_in_program_files(&fake, &mut allow(&fake)).map(drop)
+                    install(&fake, &mut allow(&fake)).map(drop)
                 } else {
                     uninstall_from_program_files(&fake, &mut allow(&fake)).map(drop)
                 };
@@ -4571,7 +5041,7 @@ mod windows_tests {
         ] {
             let mut fake = Fake::new();
             fake.runner.insert("write", runner.clone());
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Unavailable(why)) => {
                     assert!(why.contains(&runner), "{runner}: {why}");
                     assert!(why.contains(&fake.exe()), "{runner}: {why}");
@@ -4583,7 +5053,7 @@ mod windows_tests {
             fake.assert_nothing_installed();
         }
         let fake = Fake::new();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         assert!(fake.entries.borrow().contains_key(UNINSTALL_KEY));
     }
 
@@ -4605,7 +5075,7 @@ mod windows_tests {
                     fake.owned_by_users.insert(key(&fake.exe()));
                 }
             }
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => assert_eq!(why, COPY_NOT_ADMIN_ONLY, "{broken}"),
                 other => panic!("{broken}: {other:?}"),
             }
@@ -4632,10 +5102,18 @@ mod windows_tests {
         let copy = Elevated::Copy {
             from: IMAGE.to_owned(),
             to: target.exe.clone(),
+            lyrebird: false,
         };
         let root = Elevated::Copy {
             from: "D:\\tornect.exe".to_owned(),
             to: target.exe.clone(),
+            lyrebird: false,
+        };
+        // Decision M1-88 (2), W4: the same robocopy names lyrebird.exe too.
+        let both = Elevated::Copy {
+            from: IMAGE.to_owned(),
+            to: target.exe.clone(),
+            lyrebird: true,
         };
         let delete = Elevated::DeleteEntry {
             key: UNINSTALL_KEY.to_owned(),
@@ -4658,6 +5136,12 @@ mod windows_tests {
                 &root,
                 "C:\\Windows\\System32\\robocopy.exe",
                 "\"D:\\.\" \"C:\\Program Files\\Tornect\" tornect.exe /R:0 /W:0 /COPY:DATX",
+            ),
+            (
+                &both,
+                "C:\\Windows\\System32\\robocopy.exe",
+                "\"C:\\Users\\u\\Downloads\\tornect\" \"C:\\Program Files\\Tornect\" tornect.exe \
+                 lyrebird.exe /R:0 /W:0 /COPY:DATX",
             ),
             (
                 &delete,
@@ -4702,6 +5186,7 @@ mod windows_tests {
         let copy = Elevated::Copy {
             from: IMAGE.to_owned(),
             to: target.exe.clone(),
+            lyrebird: true,
         };
         assert!(step_succeeded(&copy, 1));
         for code in [0, 2, 3, 4, 5, 6, 7, 8, 16, u32::MAX] {
@@ -4748,7 +5233,7 @@ mod windows_tests {
         ] {
             let mut fake = Fake::new();
             fake.image_path = path.to_owned();
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => {
                     assert_eq!(why, SOURCE_NOT_NAMED_TORNECT_EXE, "{path}");
                 }
@@ -4763,7 +5248,7 @@ mod windows_tests {
         ] {
             let mut fake = Fake::new();
             fake.image_path = path.to_owned();
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => assert_eq!(
                     why,
                     format!(
@@ -4778,7 +5263,7 @@ mod windows_tests {
         }
         let mut fake = Fake::new();
         fake.image_path = "C:\\Users\\u\\Downloads\\TORNECT.EXE".to_owned();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
     }
 
     /// One guard operation covers both prompts: the dialog comes once,
@@ -4786,7 +5271,7 @@ mod windows_tests {
     #[test]
     fn one_guard_operation_covers_both_prompts() {
         let fake = Fake::new();
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         let events = fake.events();
         assert_eq!(
             events.iter().filter(|e| **e == Ev::Authorize).count(),
@@ -4847,7 +5332,7 @@ mod windows_tests {
                     .borrow_mut()
                     .insert(key(&Fake::link()), fake.exe());
             }
-            match install_in_program_files(&fake, &mut allow(&fake)) {
+            match install(&fake, &mut allow(&fake)) {
                 Err(InstallError::Refused(why)) => assert_eq!(why, ALREADY_INSTALLED, "{found}"),
                 other => panic!("{found}: installed over it: {other:?}"),
             }
@@ -4880,7 +5365,7 @@ mod windows_tests {
                 }
                 *fake.pending.borrow_mut() = Ok(list.clone());
                 let what = format!("{list:?}, folder {folder}");
-                match install_in_program_files(&fake, &mut allow(&fake)) {
+                match install(&fake, &mut allow(&fake)) {
                     Err(InstallError::Refused(why)) => assert_eq!(why, AWAITS_REMOVAL, "{what}"),
                     other => panic!("{what}: {other:?}"),
                 }
@@ -4896,7 +5381,7 @@ mod windows_tests {
             ]);
             Ok(())
         };
-        match install_in_program_files(&fake, &mut named_meanwhile) {
+        match install(&fake, &mut named_meanwhile) {
             Err(InstallError::Refused(why)) => assert_eq!(why, AWAITS_REMOVAL),
             other => panic!("{other:?}"),
         }
@@ -4918,7 +5403,7 @@ mod windows_tests {
             "\\??\\C:\\Temp\\a".to_owned(),
             "!\\??\\C:\\Temp\\b".to_owned(),
         ]);
-        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        install(&fake, &mut allow(&fake)).unwrap();
         assert!(fake.events().contains(&Ev::Authorize));
         assert!(fake.entries.borrow().contains_key(UNINSTALL_KEY));
     }
@@ -4929,7 +5414,7 @@ mod windows_tests {
     fn an_unreadable_restart_list_refuses_the_install() {
         let fake = Fake::new();
         *fake.pending.borrow_mut() = Err("access denied".to_owned());
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Refused(why)) => assert_eq!(
                 why,
                 "Tornect cannot read whether Windows is to remove C:\\Program Files\\Tornect at \
@@ -5254,7 +5739,7 @@ mod windows_tests {
     #[test]
     fn the_link_registration_is_written_after_the_shortcut_and_before_the_entry() {
         let fake = Fake::new();
-        let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        let installed = install(&fake, &mut allow(&fake)).unwrap();
         assert_eq!(installed.links, WindowsLinks::Registered);
         let events = fake.events();
         let writes: Vec<&Ev> = events
@@ -5294,10 +5779,7 @@ mod windows_tests {
             } else {
                 fake.fail = vec!["write"];
             }
-            assert!(
-                install_in_program_files(&fake, &mut allow(&fake)).is_err(),
-                "{at}"
-            );
+            assert!(install(&fake, &mut allow(&fake)).is_err(), "{at}");
             let events = fake.events();
             let url = position(&events, |e| matches!(e, Ev::WriteUrl(_)));
             let after: Vec<Ev> = events[url + 1..]
@@ -5322,7 +5804,7 @@ mod windows_tests {
         }
         let mut fake = Fake::new();
         fake.fail_url = true;
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Failed(why)) => assert_eq!(why, "the registry refused"),
             other => panic!("{other:?}"),
         }
@@ -5361,7 +5843,7 @@ mod windows_tests {
                     fake.fail = vec!["write"];
                 }
                 *fake.url_during_prompt.borrow_mut() = Some(("write", now.clone()));
-                let why = match install_in_program_files(&fake, &mut allow(&fake)) {
+                let why = match install(&fake, &mut allow(&fake)) {
                     Err(InstallError::Cancelled(why)) if at == "cancel" => why,
                     Err(InstallError::Failed(why)) if at == "fail" => why,
                     other => panic!("{now:?} {at}: {other:?}"),
@@ -5398,7 +5880,7 @@ mod windows_tests {
         let fake = Fake::new();
         fake.cancel.borrow_mut().push("write");
         *fake.url_during_prompt.borrow_mut() = Some(("write", UrlKey::Command(fake.url_command())));
-        match install_in_program_files(&fake, &mut allow(&fake)) {
+        match install(&fake, &mut allow(&fake)) {
             Err(InstallError::Cancelled(why)) => assert_eq!(why, INSTALL_NEEDS_APPROVAL),
             other => panic!("{other:?}"),
         }
@@ -5422,7 +5904,7 @@ mod windows_tests {
         ] {
             let fake = Fake::new();
             *fake.url.borrow_mut() = key.clone();
-            let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+            let installed = install(&fake, &mut allow(&fake)).unwrap();
             assert_eq!(installed.links, WindowsLinks::OtherProgram, "{key:?}");
             assert_eq!(fake.url(), key);
             assert!(!url_touched(&fake), "{key:?}: {:?}", fake.events());
@@ -5433,7 +5915,7 @@ mod windows_tests {
             fake.cancel.borrow_mut().push("write");
             assert!(
                 matches!(
-                    install_in_program_files(&fake, &mut allow(&fake)),
+                    install(&fake, &mut allow(&fake)),
                     Err(InstallError::Cancelled(_))
                 ),
                 "{key:?}"
@@ -5452,7 +5934,7 @@ mod windows_tests {
     fn a_leftover_with_this_installs_command_is_kept_and_never_undone() {
         let fake = Fake::new();
         *fake.url.borrow_mut() = UrlKey::Command(fake.url_command());
-        let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        let installed = install(&fake, &mut allow(&fake)).unwrap();
         assert_eq!(installed.links, WindowsLinks::Registered);
         assert!(!url_touched(&fake), "{:?}", fake.events());
         assert_eq!(fake.url(), UrlKey::Command(fake.url_command()));
@@ -5461,7 +5943,7 @@ mod windows_tests {
         *fake.url.borrow_mut() = UrlKey::Command(fake.url_command());
         fake.cancel.borrow_mut().push("write");
         assert!(matches!(
-            install_in_program_files(&fake, &mut allow(&fake)),
+            install(&fake, &mut allow(&fake)),
             Err(InstallError::Cancelled(_))
         ));
         assert!(!url_touched(&fake), "{:?}", fake.events());
@@ -5481,7 +5963,7 @@ mod windows_tests {
             *fake.url.borrow_mut() = theirs();
             Ok(())
         };
-        match install_in_program_files(&fake, &mut appears) {
+        match install(&fake, &mut appears) {
             Err(InstallError::Refused(why)) => assert_eq!(why, URL_KEY_APPEARED),
             other => panic!("{other:?}"),
         }

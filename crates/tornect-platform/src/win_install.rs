@@ -1,6 +1,7 @@
 //! The Win32 side of the Program Files install of [`crate::install`]
 //! (§B.1.1): the known folders, this program's image held open with share
-//! mode read only and named by the held handle's own final path, reads that
+//! mode read only and named by the held handle's own final path (the
+//! lyrebird beside it held the same way, decision M1-88 (2)), reads that
 //! never follow a reparse point (`FILE_FLAG_OPEN_REPARSE_POINT`, the owner
 //! and the DACL through `GetSecurityInfo` on such a handle), the uninstall
 //! entry and Windows' list of removals at the next restart, both read in the
@@ -195,6 +196,17 @@ fn held_own_image() -> io::Result<(std::fs::File, String)> {
         .open(&own)?;
     let path = final_path_of(&file)?;
     Ok((file, path))
+}
+
+/// The file at `path` opened for reading with share mode read only, as the
+/// image is held: while the handle is open no one can write, rename or
+/// delete it. A reparse point at `path` is opened itself, never followed.
+fn held_file(path: &str) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 /// This program's own path as the installed copy's steps compare it: the
@@ -868,6 +880,12 @@ impl WindowsSystem for RealWindows {
             .map_err(|e| InstallError::Failed(format!("reading {path}: {e}")))
     }
 
+    fn hold_file(&self, path: &str) -> Result<Box<dyn io::Read + '_>, InstallError> {
+        held_file(path)
+            .map(|file| Box::new(file) as Box<dyn io::Read>)
+            .map_err(|e| InstallError::Failed(format!("reading {path}: {e}")))
+    }
+
     fn security(&self, path: &str) -> Result<Security, InstallError> {
         security_of(path)
             .map_err(|e| InstallError::Failed(format!("reading who may change {path}: {e}")))
@@ -988,7 +1006,8 @@ pub fn show_message(text: &str, warning: bool) {
 /// The link registration's calls on real registry keys (run under Wine here,
 /// and on Windows), each test on a key of its own under
 /// `HKEY_CURRENT_USER\Software\TornectTest`, never on a registration of
-/// `tornect:` links; what a test leaves is deleted when it ends.
+/// `tornect:` links; what a test leaves is deleted when it ends. The hold of
+/// a file on a file of the test's own.
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_VALUE_TYPE};
@@ -1153,5 +1172,29 @@ mod tests {
         let long = "x".repeat(1500);
         set_string(&command, None, &long).unwrap();
         assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Command(long));
+    }
+
+    /// A file the install holds (the lyrebird beside the image, decision
+    /// M1-88 (2)) cannot be written, renamed or deleted while it is held,
+    /// so nothing can be swapped in before the elevated copy reads it;
+    /// another reader, as robocopy is, can still open it. Once let go it
+    /// can be deleted.
+    #[test]
+    fn a_held_file_cannot_be_changed_renamed_or_deleted_but_can_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lyrebird.exe");
+        std::fs::write(&path, b"MZ the bridge helper").unwrap();
+        let text = path.to_str().unwrap();
+        let windows = RealWindows::of_this_computer();
+        let mut held = windows.hold_file(text).unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::rename(&path, dir.path().join("moved.exe")).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"MZ the bridge helper");
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut held, &mut bytes).unwrap();
+        assert_eq!(bytes, b"MZ the bridge helper");
+        drop(held);
+        std::fs::remove_file(&path).unwrap();
     }
 }
