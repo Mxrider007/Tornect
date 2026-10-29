@@ -2829,7 +2829,8 @@ mod tests {
     }
 
     /// SLICE-B2 B2-2: no command runs the guard offline beside a live host that
-    /// does not answer (Windows until M6, or a failed bind). That guard cannot
+    /// does not answer (a failed bind, on Unix or, since M-FEAT-5's named pipe,
+    /// on Windows; before it every Windows host was one). That guard cannot
     /// see the host's sessions: before, `unattended on` went through it and
     /// skipped the §B.8.6.2 live-session gate.
     #[tokio::test]

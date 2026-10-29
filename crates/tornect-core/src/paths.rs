@@ -157,7 +157,8 @@ impl Paths {
 
     /// Held by a running `tornect host` for its whole life, so every other
     /// command can tell that a host is alive here, including one with no control
-    /// channel to answer it (Windows until M6, or a failed bind).
+    /// channel to answer it (its socket or, on Windows, its named pipe failed to
+    /// bind).
     #[must_use]
     pub fn host_lock(&self) -> PathBuf {
         self.state_dir.join("host.lock")

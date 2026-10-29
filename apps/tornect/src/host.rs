@@ -4552,8 +4552,9 @@ mod tests {
     }
 
     /// The terminal names `tornect panic` only while it can reach this host
-    /// (SLICE-B2 B2-2). A Windows host (no endpoint until M6), or one whose
-    /// channel failed or stopped, names Ctrl-C.
+    /// (SLICE-B2 B2-2). A host whose channel failed or stopped (on Windows
+    /// too, where the channel is a named pipe since M-FEAT-5), or never came
+    /// up, names Ctrl-C.
     #[test]
     fn the_kill_path_named_is_one_that_works() {
         let control = ControlChannel::default();
