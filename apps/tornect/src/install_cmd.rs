@@ -1572,8 +1572,20 @@ mod tests {
             bundled_lyrebird_in(Some(&tmp.path().join("bin")), Some(&pin)),
             Ok((files.lyrebird(), BYTES.to_vec()))
         );
+        // The security review of the final pass: the user's own unpinned
+        // lyrebird in the bin folder, which the lookup tries first, is
+        // passed over for the pinned one the install wrote, not a shadow
+        // that fails every bridged rung.
+        let own = tmp.path().join("bin").join(tornect_signal::tor::LYREBIRD);
+        std::fs::write(&own, b"\x7fELF the user's own build").unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            bundled_lyrebird_in(Some(&tmp.path().join("bin")), Some(&pin)),
+            Ok((files.lyrebird(), BYTES.to_vec()))
+        );
         files.uninstall().unwrap();
         assert!(!files.pt_dir().exists());
+        assert!(own.exists(), "never the install's to remove");
     }
 
     /// §B.1.1: after the install, "Start Tornect when I sign in? [y/N]":

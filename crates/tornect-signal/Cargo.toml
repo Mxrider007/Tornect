@@ -53,6 +53,12 @@ tor-rtcompat.workspace = true
 safelog.workspace = true
 rustls.workspace = true
 
+# `bundled_lyrebird` opens each candidate without waiting (`O_NONBLOCK`):
+# std has no portable constant for it. Already in this crate's tree with
+# `fs` (tempfile, through arti-client).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true

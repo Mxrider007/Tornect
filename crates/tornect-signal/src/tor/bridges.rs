@@ -502,7 +502,11 @@ fn auto_order(private_lines: bool, last: Option<Rung>) -> Vec<Rung> {
 /// `PATH`, and never a relative path: either would let the current directory or
 /// any user-writable `PATH` entry choose what runs. A bundled or override binary
 /// must match [`LYREBIRD_SHA256`] and, on Unix, must not be writable by group or
-/// others. `Err` carries the reason the bridged rungs are unavailable.
+/// others; one that fails those checks is passed over for the next candidate,
+/// each checked the same way (an installed copy's `~/.local/bin` may hold the
+/// user's own unpinned `lyrebird` beside the pinned `pt/lyrebird` its install
+/// wrote). `Err` carries the reason the bridged rungs are unavailable: every
+/// candidate's reason, or that none was found.
 pub fn find_lyrebird(explicit: Option<&Path>) -> std::result::Result<PathBuf, String> {
     let env_dir = std::env::var_os(PT_DIR_ENV)
         .filter(|d| !d.is_empty())
@@ -545,20 +549,38 @@ fn find_lyrebird_in(
             if let Some(dir) = env_dir {
                 candidates.push((dir.join(LYREBIRD), PtSource::DevOverride));
             }
-            candidates
+            let mut refused: Vec<String> = Vec::new();
+            for (path, source) in candidates
                 .into_iter()
-                .filter(|(p, _)| p.is_absolute())
-                .find(|(p, _)| p.is_file())
-                .ok_or_else(|| {
-                    format!(
-                        "`{LYREBIRD}` not found (put it next to the tornect executable, or set \
-                         tor.pt_path; developers: {PT_DIR_ENV})"
-                    )
-                })?
+                .filter(|(p, _)| p.is_absolute() && p.is_file())
+            {
+                match check_lyrebird(&path, source, pin) {
+                    Ok(()) => return Ok(path),
+                    Err(why) => {
+                        tracing::debug!(%why, "passing over a lyrebird candidate");
+                        if !refused.contains(&why) {
+                            refused.push(why);
+                        }
+                    }
+                }
+            }
+            return Err(if refused.is_empty() {
+                lyrebird_not_found()
+            } else {
+                refused.join("; ")
+            });
         }
     };
     check_lyrebird(&path, source, pin)?;
     Ok(path)
+}
+
+/// Why no `lyrebird` runs when none was found.
+fn lyrebird_not_found() -> String {
+    format!(
+        "`{LYREBIRD}` not found (put it next to the tornect executable, or set tor.pt_path; \
+         developers: {PT_DIR_ENV})"
+    )
 }
 
 /// The largest `lyrebird` [`bundled_lyrebird`] reads (lyrebird 0.8.1 is
@@ -568,11 +590,15 @@ const LYREBIRD_MAX: u64 = 64 * 1024 * 1024;
 /// The running copy's own bundled `lyrebird`, for `tornect install` to put
 /// beside the installed copy (the final audit before the release): where
 /// [`find_lyrebird`] finds it with no `tor.pt_path` (beside the executable,
-/// then its `pt/` folder), never `$TORNECT_PT_DIR` or a configured path,
-/// and only while this build pins one. The file is opened once; the checks
-/// are made on that handle (a regular file, on Unix not writable by group
-/// or others, at most 64 MiB), and its bytes, read from it, must have the
-/// pinned SHA-256. Its path and bytes, or why there is none to install.
+/// then its `pt/` folder, a candidate that fails a check passed over for
+/// the next as there), never `$TORNECT_PT_DIR` or a configured path, and
+/// only while this build pins one. Each candidate is opened once, on Unix
+/// without waiting (`O_NONBLOCK`: a FIFO put at the name opens at once and
+/// is refused by its type); every check is made on that handle (a regular
+/// file, on Unix not writable by group or others, at most 64 MiB by its
+/// size before anything is read), at most 64 MiB and one byte are read from
+/// it, and those bytes must have the pinned SHA-256. Its path and bytes, or
+/// why there is none to install.
 pub fn bundled_lyrebird() -> std::result::Result<(PathBuf, Vec<u8>), String> {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -586,46 +612,90 @@ pub fn bundled_lyrebird_in(
     exe_dir: Option<&Path>,
     pin: Option<&str>,
 ) -> std::result::Result<(PathBuf, Vec<u8>), String> {
-    use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
     let Some(pin) = pin else {
         return Err(format!("this build pins no `{LYREBIRD}` for this platform"));
     };
-    let path = find_lyrebird_in(None, exe_dir, None, Some(pin))?;
-    let file = std::fs::File::open(&path).map_err(|e| format!("cannot open `{LYREBIRD}`: {e}"))?;
+    let Some(dir) = exe_dir.filter(|dir| dir.is_absolute()) else {
+        return Err(lyrebird_not_found());
+    };
+    let mut refused: Vec<String> = Vec::new();
+    for path in [dir.join(LYREBIRD), dir.join("pt").join(LYREBIRD)] {
+        match read_pinned(&path, pin) {
+            Ok(Some(bytes)) => return Ok((path, bytes)),
+            Ok(None) => {}
+            Err(why) => refused.push(why),
+        }
+    }
+    Err(if refused.is_empty() {
+        lyrebird_not_found()
+    } else {
+        refused.join("; ")
+    })
+}
+
+/// The bytes of the `lyrebird` at `path`, read as [`bundled_lyrebird`]
+/// reads a candidate: `None` when nothing is there, `Err` with the reason
+/// when what is there fails a check.
+fn read_pinned(path: &Path, pin: &str) -> std::result::Result<Option<Vec<u8>>, String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let at = path.display();
+    let file = match open_no_wait(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot open `{LYREBIRD}` at {at}: {e}")),
+    };
     let meta = file
         .metadata()
-        .map_err(|e| format!("cannot inspect `{LYREBIRD}`: {e}"))?;
+        .map_err(|e| format!("cannot inspect `{LYREBIRD}` at {at}: {e}"))?;
     if !meta.is_file() {
-        return Err(format!("`{LYREBIRD}` at {} is not a file", path.display()));
+        return Err(format!("`{LYREBIRD}` at {at} is not a regular file"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         if meta.permissions().mode() & 0o022 != 0 {
-            return Err(format!(
-                "`{LYREBIRD}` at {} is writable by other users",
-                path.display()
-            ));
+            return Err(format!("`{LYREBIRD}` at {at} is writable by other users"));
         }
     }
     if meta.len() > LYREBIRD_MAX {
-        return Err(format!(
-            "`{LYREBIRD}` at {} is larger than 64 MiB",
-            path.display()
-        ));
+        return Err(format!("`{LYREBIRD}` at {at} is larger than 64 MiB"));
     }
     let mut bytes = Vec::new();
     file.take(LYREBIRD_MAX + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read `{LYREBIRD}`: {e}"))?;
+        .map_err(|e| format!("cannot read `{LYREBIRD}` at {at}: {e}"))?;
+    if bytes.len() as u64 > LYREBIRD_MAX {
+        return Err(format!("`{LYREBIRD}` at {at} is larger than 64 MiB"));
+    }
     if hex::encode(Sha256::digest(&bytes)) != pin {
         return Err(format!(
-            "`{LYREBIRD}` at {} is not the pinned lyrebird 0.8.1 (SHA-256 mismatch)",
-            path.display()
+            "`{LYREBIRD}` at {at} is not the pinned lyrebird 0.8.1 (SHA-256 mismatch)"
         ));
     }
-    Ok((path, bytes))
+    Ok(Some(bytes))
+}
+
+/// Open `path` for reading, on Unix without waiting (`O_NONBLOCK`: a FIFO
+/// opens at once instead of waiting for a writer, and is then refused by
+/// its type) and never as a controlling terminal. A link at `path` is
+/// followed, as the bridges' lookup follows it: every check is made on the
+/// handle, so it is what was opened that is checked. Reads of a regular
+/// file are not changed by `O_NONBLOCK`.
+fn open_no_wait(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        Ok(std::fs::File::from(rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
 }
 
 /// The integrity checks of [`find_lyrebird`].
@@ -945,6 +1015,92 @@ mod tests {
             let err = bundled_lyrebird_in(Some(exe.path()), Some(&pin)).unwrap_err();
             assert!(err.contains("writable by other users"), "{err}");
         }
+    }
+
+    /// The security review of the final pass: a bundled candidate that fails
+    /// its checks is passed over for the next, each checked the same way, by
+    /// the bridges' lookup and by what `tornect install` carries alike: an
+    /// installed copy's `~/.local/bin` may hold the user's own unpinned
+    /// `lyrebird` beside the pinned `pt/lyrebird` its install wrote, which
+    /// before was shadowed and every bridged rung refused. With no candidate
+    /// passing, each reason is given.
+    #[test]
+    fn a_bundled_lyrebird_that_fails_is_passed_over_for_the_next() {
+        let exe = tempfile::tempdir().unwrap();
+        let pt = exe.path().join("pt");
+        std::fs::create_dir(&pt).unwrap();
+        let pinned = fake_lyrebird(&pt);
+        let pin = pin_of(&pinned);
+        let own = exe.path().join(LYREBIRD);
+        std::fs::write(&own, b"the user's own build").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            find_lyrebird_in(None, Some(exe.path()), None, Some(&pin)),
+            Ok(pinned.clone())
+        );
+        assert_eq!(
+            bundled_lyrebird_in(Some(exe.path()), Some(&pin)),
+            Ok((pinned.clone(), b"not really lyrebird".to_vec()))
+        );
+        let wrong = "0".repeat(64);
+        for err in [
+            find_lyrebird_in(None, Some(exe.path()), None, Some(&wrong)).unwrap_err(),
+            bundled_lyrebird_in(Some(exe.path()), Some(&wrong)).unwrap_err(),
+        ] {
+            assert!(err.contains(&own.display().to_string()), "{err}");
+            assert!(err.contains(&pinned.display().to_string()), "{err}");
+        }
+        // A build that pins none says so once, not once per candidate.
+        let err = find_lyrebird_in(None, Some(exe.path()), None, None).unwrap_err();
+        assert_eq!(err.matches("pins no").count(), 1, "{err}");
+    }
+
+    /// The security review of the final pass: what `tornect install` reads
+    /// is opened once and checked on that handle, its size before anything
+    /// is read (before, the whole file was hashed by path first, with no
+    /// cap), and a FIFO at the name is opened without waiting and passed
+    /// over, never waited on.
+    #[cfg(unix)]
+    #[test]
+    fn the_lyrebird_to_install_is_size_checked_before_it_is_read_and_never_waited_on() {
+        use rustix::fs::{CWD, FileType, Mode};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::mpsc;
+        fn in_time<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || tx.send(f()));
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("it waited on a FIFO")
+        }
+        let exe = tempfile::tempdir().unwrap();
+        let huge = exe.path().join(LYREBIRD);
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(LYREBIRD_MAX + 1).unwrap();
+        drop(file);
+        std::fs::set_permissions(&huge, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pin = "0".repeat(64);
+        let err = bundled_lyrebird_in(Some(exe.path()), Some(&pin)).unwrap_err();
+        assert!(err.contains("larger than 64 MiB"), "{err}");
+
+        std::fs::remove_file(&huge).unwrap();
+        rustix::fs::mknodat(CWD, &huge, FileType::Fifo, Mode::from_raw_mode(0o600), 0).unwrap();
+        let dir = exe.path().to_path_buf();
+        let err =
+            in_time(move || bundled_lyrebird_in(Some(&dir), Some(&"0".repeat(64)))).unwrap_err();
+        assert!(err.contains("is not a regular file"), "{err}");
+        let pt = exe.path().join("pt");
+        std::fs::create_dir(&pt).unwrap();
+        let pinned = fake_lyrebird(&pt);
+        let pin = pin_of(&pinned);
+        let dir = exe.path().to_path_buf();
+        assert_eq!(
+            in_time(move || bundled_lyrebird_in(Some(&dir), Some(&pin))),
+            Ok((pinned, b"not really lyrebird".to_vec()))
+        );
     }
 
     /// SLICE-A1 A1-4: relative candidates are never used — they would resolve
