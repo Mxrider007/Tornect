@@ -658,18 +658,7 @@ fn package(
     let facts = if platform.is_windows() {
         windows_facts(&built)?
     } else {
-        let facts = linux_facts(&built)?;
-        let needed = facts
-            .glibc
-            .as_deref()
-            .with_context(|| format!("{} names no GLIBC_ version", built.display()))?;
-        for name in [README, "README.md"] {
-            let path = root.join(name);
-            let text =
-                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            check_glibc_floor(name, &text, needed)?;
-        }
-        facts
+        linux_facts(root, &built)?
     };
 
     let stem = format!("tornect-{version}-{}", platform.name);
@@ -978,29 +967,114 @@ fn rustflags_config(platform: Platform, flags: &[String]) -> String {
 /// What the executable needs from the system, checked and recorded.
 struct Facts {
     lines: Vec<String>,
-    /// Linux: the newest `GLIBC_` version the executable needs (`2.43`),
-    /// which the build host's glibc decides.
-    glibc: Option<String>,
+}
+
+/// The `GLIBC_` entries of a version-needs table that name no version
+/// number but a glibc feature, with the glibc release that brought it. The
+/// loader checks every entry, so each one sets a floor like a version does.
+const GLIBC_FEATURES: [(&str, &str); 1] = [
+    // `-z pack-relative-relocs` (DT_RELR), new in glibc 2.36.
+    ("GLIBC_ABI_DT_RELR", "2.36"),
+];
+
+/// The newest glibc the executable's version-needs table asks for, from
+/// `objdump -p`'s "Version References". The loader checks every entry of
+/// that table, an entry no symbol carries included, so the table and not
+/// the symbols (`objdump -T`) sets the floor. An entry of [`GLIBC_FEATURES`]
+/// counts as its release; any other `GLIBC_` entry that is not a version
+/// number is refused: `GLIBC_PRIVATE` ties the executable to one glibc
+/// build, and a feature dist does not know has a floor it cannot state.
+fn glibc_needed(headers: &str) -> anyhow::Result<String> {
+    let (_, table) = headers
+        .split_once("Version References:")
+        .context("`objdump -p` shows no Version References")?;
+    let mut newest: Option<(Vec<u32>, String)> = None;
+    let mut from = "";
+    for line in table.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            break;
+        }
+        let line = line.trim();
+        if let Some(file) = line.strip_prefix("required from ") {
+            from = file.trim_end_matches(':');
+            continue;
+        }
+        let Some(name) = line.split_whitespace().last() else {
+            continue;
+        };
+        let Some(version) = name.strip_prefix("GLIBC_") else {
+            continue;
+        };
+        let version = GLIBC_FEATURES
+            .iter()
+            .find(|(feature, _)| *feature == name)
+            .map_or(version, |(_, release)| *release);
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()
+            .with_context(|| {
+                format!(
+                    "the executable needs {name} from {from}, which names no glibc release: \
+                     GLIBC_PRIVATE ties it to one glibc build; for a feature, find the glibc \
+                     release that brought it in glibc's NEWS and add it to GLIBC_FEATURES"
+                )
+            })?;
+        if newest.as_ref().is_none_or(|(p, _)| parts > *p) {
+            newest = Some((parts, version.to_owned()));
+        }
+    }
+    newest
+        .map(|(_, v)| v)
+        .context("the executable's version-needs table names no GLIBC_ version")
 }
 
 /// Every glibc floor a README states, in either of the forms the release
 /// README uses: "glibc X.Y or newer" and the loader's "`GLIBC_X.Y' not
-/// found". White space must already be one space per run.
-fn glibc_claims(text: &str) -> Vec<String> {
+/// found", in any case and with either apostrophe. Any other "glibc"
+/// followed by a number ("glibc 2.39+", "GLIBC 2.39 or later") is refused,
+/// so a floor stated another way cannot go unchecked. White space must
+/// already be one space per run.
+fn glibc_claims(text: &str) -> anyhow::Result<Vec<String>> {
+    // ASCII lowercasing keeps every byte offset.
+    let lower = text.to_ascii_lowercase();
     let mut found = Vec::new();
-    for (prefix, suffix) in [("glibc ", " or newer"), ("GLIBC_", "' not found")] {
-        for (at, _) in text.match_indices(prefix) {
-            let rest = &text[at + prefix.len()..];
-            let version: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if !version.is_empty() && rest[version.len()..].starts_with(suffix) {
-                found.push(version);
-            }
+    for (at, word) in lower.match_indices("glibc") {
+        let rest = &lower[at + word.len()..];
+        // Up to three characters that are neither letters nor digits.
+        let sep: usize = rest
+            .chars()
+            .take(3)
+            .take_while(|c| !c.is_alphanumeric())
+            .map(char::len_utf8)
+            .sum();
+        let after = &rest[sep..];
+        if !after.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
         }
+        let number: &str = &after[..after
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(after.len())];
+        let version = number.trim_end_matches('.');
+        let tail = &after[version.len()..];
+        let recognised = match &rest[..sep] {
+            " " => tail.starts_with(" or newer"),
+            "_" => tail.starts_with("' not found") || tail.starts_with("\u{2019} not found"),
+            _ => false,
+        };
+        ensure!(
+            recognised,
+            "`{}` states a glibc floor in a form dist does not read: write \"glibc X.Y or \
+             newer\" (or the loader's \"`GLIBC_X.Y' not found\")",
+            text[at..].chars().take(24).collect::<String>()
+        );
+        found.push(version.to_owned());
     }
-    found
+    Ok(found)
 }
 
 /// The README's glibc floor must be the one the executable needs (decision
@@ -1009,7 +1083,7 @@ fn glibc_claims(text: &str) -> Vec<String> {
 /// file's path, for the message.
 fn check_glibc_floor(name: &str, text: &str, needed: &str) -> anyhow::Result<()> {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let claims = glibc_claims(&text);
+    let claims = glibc_claims(&text).with_context(|| format!("reading {name}"))?;
     ensure!(
         !claims.is_empty(),
         "{name} names no glibc floor (\"glibc X.Y or newer\"): the Linux executable needs \
@@ -1028,8 +1102,39 @@ fn check_glibc_floor(name: &str, text: &str, needed: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-fn linux_facts(exe: &Path) -> anyhow::Result<Facts> {
+/// [`linux_facts_from`] on the executable and the two READMEs that state
+/// its glibc floor.
+fn linux_facts(root: &Path, exe: &Path) -> anyhow::Result<Facts> {
     let dynamic = capture(Command::new("readelf").arg("-d").arg(exe))?;
+    let symbols = capture(Command::new("objdump").arg("-T").arg(exe))?;
+    let headers = capture(Command::new("objdump").arg("-p").arg(exe))?;
+    let mut readmes = Vec::new();
+    for name in [README, "README.md"] {
+        let path = root.join(name);
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        readmes.push((name, text));
+    }
+    linux_facts_from(
+        &exe.display().to_string(),
+        &dynamic,
+        &symbols,
+        &headers,
+        &readmes,
+    )
+}
+
+/// The Linux executable's libraries are all allowed ([`LINUX_LIBS`]), and
+/// every README states the glibc floor its version-needs table sets
+/// ([`glibc_needed`], [`check_glibc_floor`]); from `readelf -d`,
+/// `objdump -T` and `objdump -p` output.
+fn linux_facts_from(
+    exe: &str,
+    dynamic: &str,
+    symbols: &str,
+    headers: &str,
+    readmes: &[(&str, String)],
+) -> anyhow::Result<Facts> {
     let needed: Vec<&str> = dynamic
         .lines()
         .filter(|l| l.contains("(NEEDED)"))
@@ -1038,12 +1143,14 @@ fn linux_facts(exe: &Path) -> anyhow::Result<Facts> {
     for lib in &needed {
         ensure!(
             LINUX_LIBS.contains(lib),
-            "{} loads {lib}, which a release must not depend on (a system liblzma means \
-             LZMA_API_STATIC did not take)",
-            exe.display()
+            "{exe} loads {lib}, which a release must not depend on (a system liblzma means \
+             LZMA_API_STATIC did not take)"
         );
     }
-    let symbols = capture(Command::new("objdump").arg("-T").arg(exe))?;
+    let glibc = glibc_needed(headers).with_context(|| format!("reading {exe}"))?;
+    for (name, text) in readmes {
+        check_glibc_floor(name, text, &glibc)?;
+    }
     let newest = |prefix: &str| -> String {
         symbols
             .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
@@ -1056,15 +1163,12 @@ fn linux_facts(exe: &Path) -> anyhow::Result<Facts> {
             .map(|(_, v)| format!("{prefix}{v}"))
             .unwrap_or_else(|| "(none)".to_owned())
     };
-    let glibc = newest("GLIBC_");
     Ok(Facts {
-        glibc: glibc.strip_prefix("GLIBC_").map(str::to_owned),
         lines: vec![
             format!("dynamic libraries  {}", needed.join(", ")),
             format!(
-                "newest versions    {}, {} and {}: it needs a glibc and a libstdc++ that \
-                 have them",
-                glibc,
+                "newest versions    GLIBC_{glibc}, {} and {}: it needs a glibc and a libstdc++ \
+                 that have them",
                 newest("GLIBCXX_"),
                 newest("CXXABI_")
             ),
@@ -1103,7 +1207,6 @@ fn windows_facts(exe: &Path) -> anyhow::Result<Facts> {
     let mut sorted = dlls.clone();
     sorted.sort_by_key(|d| d.to_ascii_lowercase());
     Ok(Facts {
-        glibc: None,
         lines: vec![
             format!(
                 "imported DLLs      {}, all Windows' own: {}",
@@ -1766,9 +1869,147 @@ tornect v0.1.0 (/w/apps/tornect) (*)
     #[test]
     fn glibc_claims_reads_both_forms() {
         let text = "with **glibc 2.43 or newer**: here it stops with \"version `GLIBC_2.43' not \
-                    found\"; the glibc and the GCC runtime; glibc 2.39. GLIBC_2.2.5 is old";
-        assert_eq!(glibc_claims(text), ["2.43", "2.43"]);
-        assert!(glibc_claims("no floor named here").is_empty());
+                    found\"; the glibc and the GCC runtime";
+        assert_eq!(glibc_claims(text).unwrap(), ["2.43", "2.43"]);
+        assert!(glibc_claims("no floor named here").unwrap().is_empty());
+        // In any case, and with either apostrophe.
+        assert_eq!(
+            glibc_claims("GLIBC 2.43 or newer; `glibc_2.43\u{2019} not found").unwrap(),
+            ["2.43", "2.43"]
+        );
+    }
+
+    /// The documentation pass's security review: a floor stated in a form
+    /// dist does not read is refused, not passed over, so a stale floor
+    /// cannot sit unchecked beside a correct one. (Until this change the
+    /// test above passed "glibc 2.39." and "GLIBC_2.2.5 is old" over; that
+    /// leniency is what changed.)
+    #[test]
+    fn a_glibc_floor_in_another_form_is_refused() {
+        for text in [
+            "glibc 2.39+",
+            "GLIBC 2.39 or later",
+            "glibc 2.39.",
+            "GLIBC_2.2.5 is old",
+            "glibc-2.39 or newer",
+            "needs glibc **2.39** or newer",
+            "glibc2.39 or newer",
+        ] {
+            let refused = glibc_claims(text).expect_err(text).to_string();
+            assert!(refused.contains("form dist does not read"), "{refused}");
+        }
+        let both = "x86_64 Linux with glibc 2.43 or newer (glibc 2.39+ works too)";
+        assert!(check_glibc_floor("R", both, "2.43").is_err());
+    }
+
+    /// `objdump -p` of a Linux executable, as the build hosts print it.
+    const OBJDUMP_P: &str = "\nt:     file format elf64-x86-64\n\nDynamic Section:\n  NEEDED  \
+                             libc.so.6\n\nVersion References:\n  required from libgcc_s.so.1:\n    \
+                             0x0b792650 0x00 05 GCC_3.0\n  required from libc.so.6:\n    \
+                             0x09691a75 0x00 03 GLIBC_2.2.5\n    0x069691b9 0x00 11 GLIBC_2.39\n    \
+                             0x069691b4 0x00 02 GLIBC_2.34\n  required from \
+                             ld-linux-x86-64.so.2:\n    0x0d696913 0x00 06 GLIBC_2.3\n\n";
+
+    /// The documentation pass's security review: the floor is read from the
+    /// version-needs table, which the loader checks entry by entry, so an
+    /// entry no symbol carries counts: `GLIBC_ABI_DT_RELR` as glibc 2.36,
+    /// and `GLIBC_PRIVATE` or a feature dist does not know is refused.
+    #[test]
+    fn the_glibc_floor_is_read_from_the_version_needs_table() {
+        assert_eq!(glibc_needed(OBJDUMP_P).unwrap(), "2.39");
+        let older = OBJDUMP_P.replace("GLIBC_2.39", "GLIBC_2.35");
+        assert_eq!(glibc_needed(&older).unwrap(), "2.35");
+        let entry = |name: &str| {
+            older.replace(
+                "06 GLIBC_2.3\n",
+                &format!("06 GLIBC_2.3\n    0x0fd4b2d3 0x00 07 {name}\n"),
+            )
+        };
+        assert_eq!(glibc_needed(&entry("GLIBC_ABI_DT_RELR")).unwrap(), "2.36");
+        for refused in ["GLIBC_PRIVATE", "GLIBC_ABI_SOMETHING_NEW"] {
+            let message = format!("{:#}", glibc_needed(&entry(refused)).unwrap_err());
+            assert!(
+                message.contains(refused) && message.contains("ld-linux-x86-64.so.2"),
+                "{message}"
+            );
+        }
+        assert!(glibc_needed("Dynamic Section:\n").is_err());
+        assert!(
+            glibc_needed(
+                "Version References:\n  required from libgcc_s.so.1:\n    0x0 0x00 05 GCC_3.0\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// The reader takes the table as this host's `objdump -p` prints it:
+    /// this test executable's own, whose floor is at least the newest
+    /// `GLIBC_` version its symbols name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_hosts_objdump_output_is_read() {
+        let exe = std::env::current_exe().unwrap();
+        let headers = capture(Command::new("objdump").arg("-p").arg(&exe)).unwrap();
+        let symbols = capture(Command::new("objdump").arg("-T").arg(&exe)).unwrap();
+        let parts = |v: &str| -> Vec<u32> { v.split('.').map(|n| n.parse().unwrap()).collect() };
+        let table = parts(&glibc_needed(&headers).unwrap());
+        let newest_symbol = symbols
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .filter_map(|w| w.strip_prefix("GLIBC_"))
+            .filter(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+            .map(parts)
+            .max()
+            .unwrap();
+        assert!(table >= newest_symbol, "{table:?} < {newest_symbol:?}");
+    }
+
+    /// The README check is part of reading the Linux executable's facts,
+    /// which dist cannot do without: a README whose floor is not the
+    /// table's stops it, as does a library a release may not load.
+    #[test]
+    fn the_linux_facts_hold_the_readmes_to_the_table() {
+        let dynamic = " 0x0000000000000001 (NEEDED)  Shared library: [libc.so.6]\n";
+        let symbols =
+            "0000000000000000  DF *UND*  0000000000000000 (GLIBC_2.34) __libc_start_main\n";
+        let readme = |text: &str| vec![("R", text.to_owned())];
+        let facts = linux_facts_from(
+            "t",
+            dynamic,
+            symbols,
+            OBJDUMP_P,
+            &readme("glibc 2.39 or newer"),
+        )
+        .unwrap();
+        assert!(
+            facts.lines.iter().any(|l| l.contains("GLIBC_2.39,")),
+            "{:?}",
+            facts.lines
+        );
+        // The symbols name 2.34 at most; the table's 2.39 decides.
+        let stale = linux_facts_from(
+            "t",
+            dynamic,
+            symbols,
+            OBJDUMP_P,
+            &readme("glibc 2.34 or newer"),
+        )
+        .err()
+        .expect("a README with the symbols' floor passed")
+        .to_string();
+        assert!(stale.contains("R says glibc 2.34"), "{stale}");
+        assert!(linux_facts_from("t", dynamic, symbols, OBJDUMP_P, &readme("no floor")).is_err());
+        let lzma =
+            format!("{dynamic} 0x0000000000000001 (NEEDED)  Shared library: [liblzma.so.5]\n");
+        assert!(
+            linux_facts_from(
+                "t",
+                &lzma,
+                symbols,
+                OBJDUMP_P,
+                &readme("glibc 2.39 or newer")
+            )
+            .is_err()
+        );
     }
 
     /// Decision M1-89: dist refuses a README whose glibc floor is not the
@@ -1797,7 +2038,7 @@ tornect v0.1.0 (/w/apps/tornect) (*)
         for name in [README, "README.md"] {
             let text = fs::read_to_string(root.join(name)).unwrap();
             let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            let claims = glibc_claims(&text);
+            let claims = glibc_claims(&text).unwrap();
             assert!(!claims.is_empty(), "{name} names no glibc floor");
             floors.extend(claims);
         }

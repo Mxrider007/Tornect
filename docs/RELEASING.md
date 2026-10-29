@@ -88,7 +88,11 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
    - on Linux, refuses an executable whose newest `GLIBC_` version is not the floor that
      `packaging/release/README-release.md` and `README.md` state ("glibc X.Y or newer", "`GLIBC_X.Y'
      not found"; decision M1-89): the build host's glibc decides the floor, so a build on another
-     host stops here until those texts, and the distributions they name, are corrected by hand;
+     host stops here until those texts, and the distributions they name, are corrected by hand.
+     The floor comes from the executable's version-needs table (`objdump -p`, "Version
+     References"), which the loader checks entry by entry: `GLIBC_ABI_DT_RELR` counts as 2.36, and
+     `GLIBC_PRIVATE` or another `GLIBC_` entry that names no release stops the run. A "glibc"
+     followed by a number in any other form in those READMEs stops it too;
    - strips the debug info (symbols stay);
    - writes `THIRD_PARTY_LICENSES.txt` (`xtask/src/licences.rs`), offline: every crates.io package
      of `cargo tree -p tornect --target <triple> -e normal,build` with its version, licence expression
