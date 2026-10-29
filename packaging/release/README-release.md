@@ -278,9 +278,9 @@ paired, learns nothing. Two other parties take part:
   uses can tell that Tornect runs with direct connections on.
 - **This network's router.** Each computer asks its router (PCP or NAT-PMP
   first, UPnP otherwise) to open one UDP port for the session. A UPnP opening
-  shows as "Tornect" in the router's settings; PCP and NAT-PMP have no field
-  for a name, so the router lists those under its own label or none. The
-  opening is closed when the session ends; if Tornect stops first, most
+  shows as "Tornect" in the router's settings; Tornect's PCP and NAT-PMP
+  requests carry no name, so the router lists those under its own label or
+  none. The opening is closed when the session ends; if Tornect stops first, most
   routers drop it within 10 minutes, and Tornect removes it at its next start.
 
 Your internet provider can see that the two computers exchange encrypted

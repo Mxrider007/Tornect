@@ -2115,6 +2115,18 @@ tornect v0.1.0 (/w/apps/tornect) (*)
                 !readme.contains("every session still goes over Tor"),
                 "README-release.md says internet sessions stay on Tor"
             );
+            // The documentation pass's security review: PCP defines an
+            // optional description (RFC 7220); what is true is that Tornect's
+            // requests send none (tornect-net `mapping/nat.rs` `options`).
+            assert!(
+                readme.contains("Tornect's PCP and NAT-PMP requests carry no name"),
+                "README-release.md does not say that Tornect's PCP and NAT-PMP requests carry no \
+                 name"
+            );
+            assert!(
+                !readme.contains("PCP and NAT-PMP have no field"),
+                "README-release.md says PCP has no field for a name"
+            );
         }
     }
 

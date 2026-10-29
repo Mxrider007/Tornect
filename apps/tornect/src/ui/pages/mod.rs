@@ -5362,8 +5362,11 @@ mod tests {
             connection::ROUTER_SWITCH,
             "Ask this network's router to open a port (UPnP, NAT-PMP, PCP)"
         );
-        // Only UPnP carries a description ("Tornect"); PCP and NAT-PMP have
-        // no field for one (`tornect-net` `mapping/upnp.rs` `DESCRIPTION`).
+        // Only UPnP carries a description ("Tornect", `tornect-net`
+        // `mapping/upnp.rs` `DESCRIPTION`); Tornect's PCP and NAT-PMP
+        // requests carry none (`mapping/nat.rs` `options`: crab_nat's
+        // `PortMappingOptions` has no description, though PCP defines an
+        // optional one, RFC 7220).
         assert_eq!(
             connection::ROUTER_LINE,
             "The opening is for one session. A UPnP opening shows as \"Tornect\" in the router's \
