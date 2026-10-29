@@ -1669,8 +1669,9 @@ and refuses a direct `Bind` with `TRANSPORT`); `lan_only` ⇒ same-site candidat
 computer's on-link private IPv4 prefixes or its unique-local /48, never link-local, never a STUN server or the
 router), no Tor media fallback (an onion `Bind` is refused with `TRANSPORT`, and no onion services stream binds),
 failure ⇒ `BYE{NO_LAN_PATH}`; the same holds for a client whose own `network.lan_only` is set (decision M1-85: it
-offers only same-site candidates and ends the session `BYE{NO_LAN_PATH}` rather than take Tor media); signaling
-always traverses Tor in v1.
+offers only same-site candidates and ends the session `BYE{NO_LAN_PATH}` rather than take Tor media); a session without
+media (`TOR_FALLBACK{NO_MEDIA}`) asks for no path and is kept, on Tor's signaling and carrying no picture, input or
+files; signaling always traverses Tor in v1.
 
 #### B.8.7 Host-side UX
 
@@ -2215,7 +2216,7 @@ client's `sessions.log` line carries `elevation`.
 | Combo | Behaviour |
 |---|---|
 | Unattended + Paranoid / per-grant `require_tor_only` | `transport_policy = tor_only`: no candidates either way, media over the onion media stream (decision M1-79; the Tor presets' caps, M1-74); the other party never learns your IP, also when it sends `CANDIDATES` anyway (the host follows the policy its accept signed). Tor in use through a bridge has the same effect on that side (decision M1-86). |
-| Unattended + LAN-only | `lan_only`: same-site candidates only (on-link private IPv4, the unique-local /48; never link-local, STUN or the router), no Tor media fallback; a client with no same-site path gets `BYE{NO_LAN_PATH}` post-auth. A client's own `network.lan_only` means the same for its side (decision M1-85). |
+| Unattended + LAN-only | `lan_only`: same-site candidates only (on-link private IPv4, the unique-local /48; never link-local, STUN or the router), no Tor media fallback; a client with no same-site path gets `BYE{NO_LAN_PATH}` post-auth. A client's own `network.lan_only` means the same for its side (decision M1-85). A session without media (`TOR_FALLBACK{NO_MEDIA}`, `connect --no-video`) asks for no path and is kept from any network on Tor's signaling: no media or services stream binds, so it carries no picture, input or files. |
 | Unattended + restricted discovery (optional, power-user; `tor.restricted_discovery`) | The client generates its x25519 client-auth keypair (Arti keymgr) and sends the public key in `PAIR_REQUEST.client_auth_pk`; the host stores it with the pairing and rebuilds the descriptor on revoke. Pairing a new device needs local **Pairing mode** (re-auth; unrestricted descriptor for 10 min; logged). Caveats shown in-app: ≤ 160 clients, removal not guaranteed until descriptor rotation (~3 h), arti-client feature still `__is_experimental` (pinned; Part E). |
 
 "Stealth unattended" (one-click recommendation card, not a preset default) = restricted discovery

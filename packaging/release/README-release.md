@@ -302,7 +302,9 @@ NAT-PMP, PCP)" turn those two off; the other computer then still learns this
 computer's internet address from the direct connection itself. `lan_only =
 true` under `[network]` keeps sessions on the local network in both
 directions: no STUN server or router is asked, and a session that cannot
-connect directly ends instead of going through Tor. Direct connections are off
+connect directly ends instead of going through Tor. A session without a
+picture (`tornect connect --no-video`) is the exception: it is kept from any
+network, over Tor, and carries no picture, input or files. Direct connections are off
 while Tor reaches the network through a bridge, because they would show that
 network that Tornect is in use (`direct_with_bridges = true` under `[network]`
 allows them anyway). `tornect doctor` says whether direct connections are on,
