@@ -183,7 +183,8 @@ address and when the session starts, never with whom when both computers use the
 to open one UDP port for the session; the internet provider may recognise the traffic as Tornect. The window's
 question says so before you decide. "Allow direct connections" in Settings › Connection, `paranoid = true` under
 `[network]`, `tornect connect --tor-only` or a grant's "Pictures and input through Tor only" keeps sessions on
-Tor; direct connections are off while Tor uses a bridge.
+Tor; direct connections are off while Tor uses a bridge, unless `direct_with_bridges = true` is set under
+`[network]`.
 
 **A viewer with control can copy your files by default.** Settings › Sharing's four switches are on by default,
 and "Let them see and copy files" lets a session with control see and copy any file you can open on this computer

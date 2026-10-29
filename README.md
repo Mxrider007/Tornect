@@ -86,7 +86,7 @@ default, no clipboard. The release notes list every limit.
 - **Staying on Tor:** switch off "Allow direct connections" in Settings › Connection (or set
   `paranoid = true` under `[network]`): the computers you meet then never learn your IP
   address, and no STUN server or router is asked. Direct connections are also off while Tor
-  uses a bridge.
+  uses a bridge, unless `direct_with_bridges = true` is set under `[network]`.
 
 ## Security
 
