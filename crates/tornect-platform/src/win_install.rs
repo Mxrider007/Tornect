@@ -26,8 +26,8 @@ use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS,
-    ERROR_UNSUPPORTED_TYPE, HLOCAL, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SHARING_VIOLATION,
+    ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, HLOCAL, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
@@ -56,9 +56,9 @@ use windows_sys::core::GUID;
 
 use crate::helper_task::{Ace, Security};
 use crate::install::{
-    Elevated, HeldImage, InstallError, UNINSTALL_ROOT, URL_KEY_APPEARED, URL_SCHEME_KEY,
-    URL_SCHEME_NAME, UninstallEntry, UrlKey, WindowsSystem, WindowsTarget, elevated_command,
-    step_succeeded,
+    Elevated, FolderEntry, HeldImage, InstallError, UNINSTALL_ROOT, URL_KEY_APPEARED,
+    URL_SCHEME_KEY, URL_SCHEME_NAME, UninstallEntry, UrlKey, WindowsSystem, WindowsTarget,
+    elevated_command, step_succeeded,
 };
 use crate::win::{ElevateError, KnownFolder, wide};
 use crate::win_task::{Com, Hresult, check};
@@ -470,8 +470,12 @@ fn delete_key_tree_at(path: &str) -> io::Result<()> {
 /// Delete `path`, an entry of the install folder other than the installed
 /// copy, at once: a file, a folder with what it holds, or a link (a
 /// junction, a mount point or a symbolic link) as a link, never followed.
-/// The installed copy's restart step, elevated.
-pub fn delete_in_folder(path: &str) -> Result<(), InstallError> {
+/// A file (not a link) that is in use, which Windows refuses with
+/// `ERROR_ACCESS_DENIED` for a running program's image or
+/// `ERROR_SHARING_VIOLATION` for one held open, is [`FolderEntry::InUse`]:
+/// the step marks it for the restart instead. The installed copy's restart
+/// step, elevated.
+pub fn delete_in_folder(path: &str) -> Result<FolderEntry, InstallError> {
     let failed = |e: io::Error| InstallError::Failed(format!("removing {path}: {e}"));
     let name = wide(path);
     // SAFETY: `name` is NUL-terminated; the attributes of `path` itself.
@@ -481,14 +485,27 @@ pub fn delete_in_folder(path: &str) -> Result<(), InstallError> {
     }
     let directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
     let link = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-    match (link, directory) {
+    let result = match (link, directory) {
         // The link itself: `remove_dir` and `remove_file` never follow one.
         (true, true) => std::fs::remove_dir(path),
         (_, false) => std::fs::remove_file(path),
         // `remove_dir_all` removes a link inside as a link, never its target.
         (false, true) => std::fs::remove_dir_all(path),
+    };
+    match result {
+        Ok(()) => Ok(FolderEntry::Deleted),
+        Err(e)
+            if !link
+                && !directory
+                && matches!(
+                    e.raw_os_error().and_then(|c| u32::try_from(c).ok()),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                ) =>
+        {
+            Ok(FolderEntry::InUse)
+        }
+        Err(e) => Err(failed(e)),
     }
-    .map_err(failed)
 }
 
 /// Mark `path` for removal at the next restart

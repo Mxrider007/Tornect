@@ -873,20 +873,32 @@ pub fn write_own_entry(
     write(&target.entry)
 }
 
+/// What the restart step's delete did with one entry of the install folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderEntry {
+    /// It is gone.
+    Deleted,
+    /// A file that is in use and cannot be deleted while it is: the
+    /// installed `lyrebird.exe` while another account's Tornect runs it from
+    /// the shared copy. It is marked for the next restart with the copy.
+    InUse,
+}
+
 /// `tornect remove-at-restart` (§B.1.1): the installed copy's own elevated
 /// step, the second prompt of an uninstall run from it. Refused unless this
 /// program, `own`, is the installed copy from the known folder, neither that
 /// copy nor its folder is a reparse point, and the ACL check passes; then
 /// every entry of its folder other than `tornect.exe` goes at once
 /// (`delete`: a file, a folder with what it holds, or a link as a link,
-/// never followed), and only then the copy and then its folder are marked
-/// for removal at the next restart (`mark`), in that order, since Windows
+/// never followed), and only then the files found in use
+/// ([`FolderEntry::InUse`]), the copy and then its folder are marked for
+/// removal at the next restart (`mark`), in that order, since Windows
 /// removes a folder at the restart only when it is empty by then. A refusal
 /// or a failed delete marks nothing. Nothing comes from the command line.
 pub fn mark_own_folder_for_restart(
     sys: &dyn WindowsSystem,
     own: &str,
-    delete: &dyn Fn(&str) -> Result<(), InstallError>,
+    delete: &dyn Fn(&str) -> Result<FolderEntry, InstallError>,
     mark: &dyn Fn(&str) -> Result<(), InstallError>,
 ) -> Result<(), InstallError> {
     let target = WindowsTarget::entry_of(sys)?;
@@ -894,11 +906,18 @@ pub fn mark_own_folder_for_restart(
     let entries = sys
         .folder_entries(&target.folder)?
         .ok_or_else(|| InstallError::Failed(format!("{} is not there", target.folder)))?;
+    let mut in_use = Vec::new();
     for name in entries
         .iter()
         .filter(|name| !name.eq_ignore_ascii_case(WINDOWS_EXE))
     {
-        delete(&windows_join(&target.folder, name))?;
+        let path = windows_join(&target.folder, name);
+        if delete(&path)? == FolderEntry::InUse {
+            in_use.push(path);
+        }
+    }
+    for path in &in_use {
+        mark(path)?;
     }
     mark(&target.exe)?;
     mark(&target.folder)
@@ -1457,12 +1476,36 @@ pub fn uninstall_from_program_files(
             return Ok(removed);
         }
         match sys.run_elevated(&remove_folder) {
-            Ok(()) => removed.folder = true,
+            Ok(()) => {}
             Err(InstallError::Cancelled(_)) => return Err(cancelled(&removed)),
             Err(e) => return Err(e),
         }
+        // `rmdir /s /q` can end with 0 while a file it could not delete
+        // stays: `lyrebird.exe` while another account's Tornect runs it.
+        if let Elevated::RemoveFolder { folder } = &remove_folder
+            && let Some(left) = sys.folder_entries(folder)?
+        {
+            return Err(InstallError::Failed(folder_left(folder, &left)));
+        }
+        removed.folder = true;
     }
     Ok(removed)
+}
+
+/// Why the install folder is still there after its removal: what it still
+/// holds, and the likely reason.
+fn folder_left(folder: &str, left: &[String]) -> String {
+    let holds = if left.is_empty() {
+        String::new()
+    } else {
+        format!(" it still holds {};", left.join(", "))
+    };
+    format!(
+        "{folder} could not be removed entirely:{holds} a program running from it, such as \
+         {WINDOWS_LYREBIRD} while Tornect uses a bridge in another account, cannot be deleted \
+         while it runs. Close Tornect in every account, then run `tornect uninstall` again, or \
+         remove the folder after a restart."
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3676,6 +3719,10 @@ mod windows_tests {
         /// What another program puts in the link registration while the
         /// prompt of an elevated step (by kind) is open, once.
         url_during_prompt: RefCell<Option<(&'static str, UrlKey)>>,
+        /// Files a running program holds: the folder's removal leaves them,
+        /// and the folder with them, and still ends as a success, as
+        /// `rmdir /s /q` can.
+        in_use: BTreeSet<String>,
     }
 
     /// The tests' lyrebird.exe; the fake's pin is its SHA-256.
@@ -3733,6 +3780,7 @@ mod windows_tests {
                 url: RefCell::new(UrlKey::Absent),
                 fail_url: false,
                 url_during_prompt: RefCell::new(None),
+                in_use: BTreeSet::new(),
             }
         }
 
@@ -4025,8 +4073,10 @@ mod windows_tests {
                     let prefix = format!("{folder}\\");
                     self.files
                         .borrow_mut()
-                        .retain(|f, _| !f.starts_with(&prefix));
-                    self.folders.borrow_mut().remove(&folder);
+                        .retain(|f, _| !f.starts_with(&prefix) || self.in_use.contains(f));
+                    if !self.files.borrow().keys().any(|f| f.starts_with(&prefix)) {
+                        self.folders.borrow_mut().remove(&folder);
+                    }
                 }
                 // Marked: the folder stays until the restart.
                 Elevated::RemoveAtRestart { .. } => {}
@@ -4831,7 +4881,7 @@ mod windows_tests {
         let done = RefCell::new(Vec::new());
         let deleted = |path: &str| {
             done.borrow_mut().push(format!("delete {}", key(path)));
-            Ok(())
+            Ok(FolderEntry::Deleted)
         };
         let marked = |path: &str| {
             done.borrow_mut().push(format!("mark {}", key(path)));
@@ -5691,7 +5741,7 @@ mod windows_tests {
             let done = Done::default();
             let deleted = |path: &str| {
                 done.borrow_mut().push(format!("delete {path}"));
-                Ok(())
+                Ok(FolderEntry::Deleted)
             };
             let marked = |path: &str| {
                 done.borrow_mut().push(format!("mark {path}"));
@@ -5719,7 +5769,7 @@ mod windows_tests {
         let done = Done::default();
         let deleted = |path: &str| {
             done.borrow_mut().push(format!("delete {path}"));
-            Ok(())
+            Ok(FolderEntry::Deleted)
         };
         let marked = |path: &str| {
             done.borrow_mut().push(format!("mark {path}"));
@@ -5743,6 +5793,91 @@ mod windows_tests {
         let result = mark_own_folder_for_restart(&fake, &fake.exe(), &in_use, &marked);
         assert!(matches!(result, Err(InstallError::Failed(_))), "{result:?}");
         assert!(done.borrow().is_empty(), "{:?}", done.borrow());
+    }
+
+    /// The security review of W4: a file of the folder that is in use, as
+    /// the installed lyrebird.exe while another account's Tornect runs it,
+    /// is marked for the restart, before the copy and the folder, so the
+    /// folder is empty by then; the other entries still go at once.
+    #[test]
+    fn the_restart_step_marks_a_file_in_use_before_the_copy() {
+        let fake = Fake::new();
+        copied(&fake);
+        for name in ["left.log", WINDOWS_LYREBIRD] {
+            fake.files
+                .borrow_mut()
+                .insert(key(&windows_join(&fake.folder(), name)), b"x".to_vec());
+        }
+        let done = Done::default();
+        let deleted = |path: &str| {
+            done.borrow_mut().push(format!("delete {}", key(path)));
+            Ok(if path.ends_with(WINDOWS_LYREBIRD) {
+                FolderEntry::InUse
+            } else {
+                FolderEntry::Deleted
+            })
+        };
+        let marked = |path: &str| {
+            done.borrow_mut().push(format!("mark {}", key(path)));
+            Ok(())
+        };
+        mark_own_folder_for_restart(&fake, &fake.exe(), &deleted, &marked).unwrap();
+        let folder = key(&fake.folder());
+        assert_eq!(
+            *done.borrow(),
+            [
+                format!("delete {folder}\\left.log"),
+                format!("delete {folder}\\lyrebird.exe"),
+                format!("mark {folder}\\lyrebird.exe"),
+                format!("mark {}", key(&fake.exe())),
+                format!("mark {folder}"),
+            ]
+        );
+        // A mark that fails stops the step there: neither the copy nor
+        // the folder is marked.
+        let done = Done::default();
+        let in_use = |_: &str| Ok(FolderEntry::InUse);
+        let refused = |path: &str| {
+            done.borrow_mut().push(format!("mark {}", key(path)));
+            Err(InstallError::Failed(format!("marking {path}")))
+        };
+        let result = mark_own_folder_for_restart(&fake, &fake.exe(), &in_use, &refused);
+        assert!(matches!(result, Err(InstallError::Failed(_))), "{result:?}");
+        assert_eq!(done.borrow().len(), 1, "{:?}", done.borrow());
+    }
+
+    /// The security review of W4: the folder's removal can end as a
+    /// success while a file in use stays (`rmdir /s /q`); the uninstall then
+    /// says what is left and does not count the folder as removed.
+    #[test]
+    fn a_folder_left_holding_a_file_in_use_is_not_reported_removed() {
+        let mut fake = Fake::new();
+        fake.beside(LYREBIRD_EXE);
+        install(&fake, &mut allow(&fake)).unwrap();
+        assert!(fake.files.borrow().contains_key(&key(&fake.lyrebird())));
+        fake.in_use.insert(key(&fake.lyrebird()));
+        let refused = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap_err();
+        let InstallError::Failed(why) = refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(
+            why,
+            format!(
+                "{} could not be removed entirely: it still holds lyrebird.exe; a program \
+                 running from it, such as lyrebird.exe while Tornect uses a bridge in another \
+                 account, cannot be deleted while it runs. Close Tornect in every account, then \
+                 run `tornect uninstall` again, or remove the folder after a restart.",
+                fake.folder()
+            )
+        );
+        assert!(fake.folders.borrow().contains(&key(&fake.folder())));
+        assert!(!fake.files.borrow().contains_key(&key(&fake.exe())));
+
+        // Once nothing runs from it, the next uninstall removes it.
+        fake.in_use.clear();
+        let removed = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert!(removed.folder);
+        fake.assert_nothing_installed();
     }
 
     /// Another program's registration of `tornect:` links.
