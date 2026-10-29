@@ -36,7 +36,13 @@ particular:
   including from the owner's own account or from a remote Control session, which acts as that
   account (`docs/PLAN.md` §B.8.2, T9);
 - the signaling and media protocols and their parsers, the encrypted stores, `sessions.log`;
+- the direct path: the candidates exchanged after the accept and the filter that admits them,
+  STUN, the router port mapping (UPnP, NAT-PMP, PCP) and its cleanup, and the QUIC connection
+  with both keys pinned;
 - capture and input injection (what a viewer can see or do beyond what was granted);
+- chat, the clipboard and file transfer: what a viewer can read, write or learn beyond what the
+  host's Sharing switches and the session's level allow (a view-only session, a session whose
+  input reaches nothing, a locked host, Tornect's own folders);
 - `tornect:` links and invitations: a link or a pasted text that connects, pairs, answers or
   starts hosting by itself, and the link registrations `tornect install` writes
   (`docs/PLAN.md` §B.6, *Links never act*);
@@ -56,8 +62,14 @@ The design these protect is in [`docs/PLAN.md`](docs/PLAN.md) §B.6 and §B.8.
   Windows host where an administrator grant exists, any program running as the owner can start
   the administrator helper, so every Control session there can reach administrator windows.
 - A person at the host who accepts a session on purpose.
-- The plain IP address a peer learns in a mode that sends media directly, which the design
-  documents (no such mode is built yet).
+- The IP addresses that a direct connection shows by design, on by default since decisions
+  M1-77 to M1-87: a computer the host accepted, and the computer a viewer connects to, learn
+  its local and public addresses, and one public STUN server per session learns its IP address
+  and when the session starts (the release `README-release.md`, *Direct connections*). Any
+  address learnt where the design says none is **is** in scope: with `network.paranoid`,
+  `connect --tor-only` or a grant's "Pictures and input through Tor only", while Tor uses a
+  bridge without `direct_with_bridges`, before the host accepts, or by a refused or unpaired
+  computer, and a public address or a STUN server's request under `network.lan_only`.
 
 ## Where Tornect comes from
 
