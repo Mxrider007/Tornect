@@ -1622,11 +1622,184 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             // Slice-F F2-1: what the Linux start-at-login host does.
             "the host answers pings only and refuses every session, because it has no window \
              or terminal to show one",
+            // polkit's policy file, which the zip does not carry (the final audit).
+            "org.tornect.policy",
+            "not in this zip",
+            "/usr/share/polkit-1/actions",
+            "systemctl restart polkit",
+            // A window-subsystem `tornect.exe` and its named pipe (the final audit).
+            "start /wait tornect.exe host",
+            "start /wait tornect.exe panic",
+            // Invitations, links and the install (decision M1-73, §B.1.1).
+            "Copy invitation",
+            "tornect id --invitation",
+            "tornect install",
+            "tornect uninstall",
+            // Unattended access, end to end (§B.8).
+            "Connect without asking",
+            "tornect unattended grant",
+            "tornect connect --unattended",
+            "emergency stop code",
         ] {
             assert!(
                 readme.contains(needle),
                 "README-release.md lacks `{needle}`"
             );
+        }
+        // What an earlier build said and this one no longer does.
+        for stale in [
+            "`tornect.exe` is a console program",
+            "cannot reach a running Windows host",
+        ] {
+            assert!(
+                !readme.contains(stale),
+                "README-release.md still says `{stale}`"
+            );
+        }
+    }
+
+    /// The first literal of `const NAME: (&str, &str) = ("…", "…");` in
+    /// Rust source (a switch's title and its line).
+    fn str_pair_first(src: &str, name: &str) -> String {
+        let decl = format!("const {name}: (&str, &str) = (");
+        let start = src.find(&decl).unwrap_or_else(|| panic!("no `{name}`")) + decl.len();
+        let body = src[start..]
+            .trim_start()
+            .strip_prefix('"')
+            .unwrap_or_else(|| panic!("`{name}` does not start with a literal"));
+        body[..body
+            .find('"')
+            .unwrap_or_else(|| panic!("`{name}` never ends"))]
+            .to_owned()
+    }
+
+    #[test]
+    fn str_pair_first_reads_the_title() {
+        let src =
+            "pub(in x) const A: (&str, &str) = (\n    \"Chat\",\n    \"They \\\n write.\",\n);\n";
+        assert_eq!(str_pair_first(src, "A"), "Chat");
+    }
+
+    /// `field: <n>,` in the `impl Default for <ty>` block of Rust source.
+    fn default_number(src: &str, ty: &str, field: &str) -> u64 {
+        let block = &src[src
+            .find(&format!("impl Default for {ty} {{"))
+            .unwrap_or_else(|| panic!("no `impl Default for {ty}`"))..];
+        let block = &block[..block.find("\n}\n").unwrap_or(block.len())];
+        let at = block
+            .find(&format!("{field}: "))
+            .unwrap_or_else(|| panic!("`{ty}::default` sets no `{field}`"))
+            + field.len()
+            + 2;
+        let digits: String = block[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{field}` is not a number"))
+    }
+
+    #[test]
+    fn default_number_reads_a_field_of_its_block() {
+        let src = "impl Default for B {\n    fn default() -> Self {\n        Self { n: 7 }\n    }\n}\n\
+                   impl Default for A {\n    fn default() -> Self {\n        Self {\n            \
+                   n: 2048,\n        }\n    }\n}\n";
+        assert_eq!(default_number(src, "A", "n"), 2048);
+        assert_eq!(default_number(src, "B", "n"), 7);
+    }
+
+    /// The release README's "Chat, clipboard and files" names the switches
+    /// Settings › Sharing draws and the limits `[services]` defaults to (the
+    /// final audit before the release: it said nothing of them, while a
+    /// viewer with control may see and copy any file by default). The words
+    /// and the numbers are read from source, so neither can change without
+    /// the README.
+    #[test]
+    fn the_release_readme_names_the_sharing_switches_and_limits() {
+        let root = crate::workspace_root().unwrap();
+        let readme = fs::read_to_string(root.join(README)).unwrap();
+        let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sharing =
+            fs::read_to_string(root.join("apps/tornect/src/ui/pages/settings/sharing.rs")).unwrap();
+        let strip = fs::read_to_string(root.join("apps/tornect/src/ui/view/strip.rs")).unwrap();
+        let config = fs::read_to_string(root.join("crates/tornect-core/src/config.rs")).unwrap();
+        let mut needed: Vec<String> = ["CHAT", "CLIPBOARD", "RECEIVE", "BROWSE", "SHARE_CLIPBOARD"]
+            .map(|name| format!("**{}**", str_pair_first(&sharing, name)))
+            .into();
+        needed.push(format!("**{}**", str_const(&strip, "TURN_OFF")));
+        for (field, words) in [
+            ("max_file_mib", "each file up to {} GiB (`max_file_mib`)"),
+            ("session_quota_mib", "up to {} GiB (`session_quota_mib`)"),
+            (
+                "keep_free_mib",
+                "{} GiB of the disk always kept free (`keep_free_mib`)",
+            ),
+        ] {
+            let mib = default_number(&config, "Services", field);
+            assert_eq!(
+                mib % 1024,
+                0,
+                "`{field}` is not whole GiB: say it otherwise"
+            );
+            needed.push(words.replace("{}", &(mib / 1024).to_string()));
+        }
+        assert!(
+            config.contains("wayland_clipboard: false,"),
+            "`wayland_clipboard` is no longer off by default: the README says it is"
+        );
+        needed.extend(["wayland_clipboard", "clipboard_sync", "200 KB/s"].map(str::to_owned));
+        for needle in &needed {
+            assert!(
+                readme.contains(needle.as_str()),
+                "README-release.md lacks `{needle}`"
+            );
+        }
+    }
+
+    /// The release notes under `packaging/release/`: every `NOTES-*.md`.
+    fn release_notes(root: &Path) -> Vec<(String, String)> {
+        let mut notes: Vec<(String, String)> = fs::read_dir(root.join("packaging/release"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("NOTES-") && n.ends_with(".md"))
+            .map(|n| {
+                let text = fs::read_to_string(root.join("packaging/release").join(&n)).unwrap();
+                (n, text.split_whitespace().collect::<Vec<_>>().join(" "))
+            })
+            .collect();
+        notes.sort();
+        notes
+    }
+
+    /// No release notes say what this build no longer does (the final
+    /// audit: the slice's notes said every session went over Tor and no
+    /// client asked for an unattended session, and described a console
+    /// `tornect.exe` that could not reach its host's control channel).
+    #[test]
+    fn no_release_notes_say_what_this_build_no_longer_does() {
+        let root = crate::workspace_root().unwrap();
+        let direct = fs::read_to_string(root.join("crates/tornect-session/src/direct.rs")).unwrap();
+        let notes = release_notes(&root);
+        assert!(
+            !notes.is_empty(),
+            "no release notes under packaging/release"
+        );
+        let mut stale = vec![
+            "No client in this build asks for an unattended session",
+            "`tornect.exe` is a console program",
+            "cannot reach a running Windows host",
+        ];
+        if direct.contains("pub const INTERNET_DIRECT: bool = true;") {
+            stale.extend([
+                "Everything travels over Tor",
+                "Pictures and input travel over the Tor circuit",
+            ]);
+        }
+        for (name, text) in &notes {
+            for words in &stale {
+                assert!(!text.contains(words), "{name} still says `{words}`");
+            }
         }
     }
 
