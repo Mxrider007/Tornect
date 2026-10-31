@@ -43,6 +43,17 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; reached through zbus 5, which ashpd 0.13.13 (latest) requires; no advisory against its code" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; reached through zbus 5, which ashpd 0.13.13 (latest) requires; no advisory against its code" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; a build-time proc macro of zbus 5, which ashpd 0.13.13 (latest) requires" },
+  # crypto-bigint 0.5 has timing variability in subtraction, zero counting, division
+  # and Montgomery multiplication, fixed only in 0.7.6. It is built only as a
+  # dependency of elliptic-curve 0.13, which opaque-ke 4.0.1 and voprf 0.5.0 require;
+  # no release of either moves to elliptic-curve 0.14. With the ristretto255 suite
+  # (`TornectOpaque`, tornect-signal's auth.rs) the only elliptic-curve code that runs
+  # is expand_message_xmd (SHA-512 and XOR), and every scalar and point operation is
+  # curve25519-dalek's, so no crypto-bigint function is called or linked (security
+  # review of 2026-10-31). `[bans]` keeps both crates to those dependents. Drop this
+  # once opaque-ke and voprf move to elliptic-curve 0.14; re-check whenever the OPAQUE
+  # suite or opaque-ke's features change.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 is reached only through elliptic-curve 0.13 under opaque-ke/voprf; with the ristretto255 suite no crypto-bigint code is called or linked" },
 ]
 
 [licenses]
@@ -91,6 +102,14 @@ wildcards = "deny"
 # `publish = false`); cargo-deny 0.20 otherwise reports each as a wildcard.
 allow-wildcard-paths = true
 highlight = "all"
+# The precondition of RUSTSEC-2026-0387's ignore: only opaque-ke and voprf depend on
+# elliptic-curve, and only elliptic-curve depends on crypto-bigint. Another dependent
+# (a NIST-curve crate such as p256, through an Arti feature) would bring crypto-bigint
+# arithmetic on secret scalars into the build, and fails this check.
+deny = [
+  { crate = "elliptic-curve", wrappers = ["opaque-ke", "voprf"], reason = "RUSTSEC-2026-0387's ignore holds only while opaque-ke and voprf are its sole dependents" },
+  { crate = "crypto-bigint", wrappers = ["elliptic-curve"], reason = "RUSTSEC-2026-0387's ignore holds only while elliptic-curve is its sole dependent" },
+]
 
 [sources]
 unknown-registry = "deny"

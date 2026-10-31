@@ -988,7 +988,8 @@ mod tests {
                 "RUSTSEC-2026-0192",
                 "RUSTSEC-2026-0370",
                 "RUSTSEC-2026-0371",
-                "RUSTSEC-2026-0372"
+                "RUSTSEC-2026-0372",
+                "RUSTSEC-2026-0387"
             ]
         );
         assert!(ignored.iter().all(|i| i.reason.len() > 20), "{ignored:?}");
