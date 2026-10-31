@@ -2376,7 +2376,9 @@ tornect v0.1.0 (/w/apps/tornect) (*)
     /// router (UPnP, NAT-PMP or PCP opens a port), so the front page, the
     /// zipped README and this pre-release's notes do not say "no port
     /// forwarding" (the slice.1 notes, of a build whose sessions all went
-    /// over Tor, keep it).
+    /// over Tor, keep it). The review of the last fixes: nor "no port to
+    /// forward", nor "no servers" or "without servers", in any case and
+    /// across line breaks; "no server of its own" is what is true.
     #[test]
     fn the_documents_of_this_build_do_not_claim_no_port_forwarding() {
         let root = crate::workspace_root().unwrap();
@@ -2390,11 +2392,19 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             "packaging/release/NOTES-v0.1.0-slice.2.md",
         ] {
             let text = fs::read_to_string(root.join(name)).unwrap();
-            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(
-                !text.contains("no port forwarding"),
-                "{name} says `no port forwarding`"
-            );
+            let text = text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            for claim in [
+                "no port forwarding",
+                "port to forward",
+                "no servers",
+                "without servers",
+            ] {
+                assert!(!text.contains(claim), "{name} says `{claim}`");
+            }
         }
     }
 

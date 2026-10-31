@@ -3,10 +3,10 @@
 Tornect lets you see and control another computer, like AnyDesk or
 TeamViewer, without any server of its own. A computer's Tornect ID is its Tor
 onion address: Tor finds the other computer and checks that it is the one you
-paired with, so there is no account, no server to trust and no port to
-forward. After the other side accepts, the two computers connect directly
-when they can reach each other (on the same local network or across the
-internet), which is much faster; otherwise the session goes over Tor
+paired with, so there is no account, no server to trust and nothing to set
+up on the router. After the other side accepts, the two computers connect
+directly when they can reach each other (on the same local network or across
+the internet), which is much faster; otherwise the session goes over Tor
 ("Direct connections" below).
 
 This is a **pre-release** for testing between two machines you control, one
