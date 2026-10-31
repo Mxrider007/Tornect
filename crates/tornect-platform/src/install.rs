@@ -5880,6 +5880,32 @@ mod windows_tests {
         fake.assert_nothing_installed();
     }
 
+    /// The review of the last fixes: while another account's Tornect runs
+    /// the installed lyrebird.exe it runs the installed tornect.exe too, so
+    /// an uninstall from another copy leaves both, and says so, in the
+    /// order Windows lists them.
+    #[test]
+    fn a_folder_left_holding_both_programs_names_both() {
+        let mut fake = Fake::new();
+        fake.beside(LYREBIRD_EXE);
+        install(&fake, &mut allow(&fake)).unwrap();
+        fake.in_use.insert(key(&fake.lyrebird()));
+        fake.in_use.insert(key(&fake.exe()));
+        let refused = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap_err();
+        let InstallError::Failed(why) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            why.starts_with(&format!(
+                "{} could not be removed entirely: it still holds lyrebird.exe, tornect.exe; a \
+                 program running from it",
+                fake.folder()
+            )),
+            "{why}"
+        );
+        assert!(fake.folders.borrow().contains(&key(&fake.folder())));
+    }
+
     /// Another program's registration of `tornect:` links.
     fn theirs() -> UrlKey {
         UrlKey::Command("\"C:\\Program Files\\Other\\other.exe\" \"%1\"".to_owned())
