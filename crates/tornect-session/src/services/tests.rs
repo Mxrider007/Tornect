@@ -1785,7 +1785,7 @@ async fn the_viewer_binds_or_hears_why_not() {
     assert!(matches!(bound, Err(ServicesBindError::Protocol)));
 
     // A host that refuses and closes without reading the `Bind`: the viewer
-    // still hears its answer (`ef489fa5`). The terminal host's own answer
+    // still hears its answer (`b3c6d68f`). The terminal host's own answer
     // is `the_terminal_hosts_services_offer_nothing`'s.
     let (client, mut server) = duplex(1024);
     tokio::spawn(async move {

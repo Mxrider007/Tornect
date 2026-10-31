@@ -16,13 +16,13 @@ and there is no second machine.
 
 ## Done
 
-**Track 1 — Arti (commit `e9b58c4`).** `tornect-signal::tor`: `TorNode`, `OnionListener`
+**Track 1 — Arti (commit `fbcde62`).** `tornect-signal::tor`: `TorNode`, `OnionListener`
 (PoW-aware admission with backpressure, handshake/circuit budgets), `OnionStream`, identity
 derivation seed → Arti keystore so `tornect id` == the published address, `framing`, the interim
 `ping` protocol, `tests/live.rs`. CLI `tornect host` / `tornect ping`. Verified live over Tor
 twice (evidence: `docs/notes/m1-track1-evidence.md`).
 
-**Toolchain + plan (commits `79949a8`, `5ea20e0`).** `rust-toolchain.toml` pins 1.96.0
+**Toolchain + plan (commits `94e4279`, `e3adcd9`).** `rust-toolchain.toml` pins 1.96.0
 (rustfmt, clippy, the two cross targets); `rust-version`/`clippy.toml msrv` 1.95. Plan
 **r6**: the two r5 findings applied (monotonic decay/clock with a `Clock` trait; local
 `Suspended{Local{by}}`), the research-audit amendments applied (§A.2, §A.4, §B.2 punch +
@@ -32,7 +32,7 @@ user's `TORNECT_UI_PLAN.md` adopted as `docs/UI_PLAN.md` (byte-identical, gated 
 runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rejected per
 §B.2/§B.8. Two adversarial review passes were applied to r6 in place.
 
-**Phase-2 part 1 (commit `278d977`, ~3 200 changed lines + ~21 000 new lines incl. tests).**
+**Phase-2 part 1 (commit `f6ba30c`, ~3 200 changed lines + ~21 000 new lines incl. tests).**
 
 - `tornect-core::unattended::{store, grant, schedule, codec, limiter, clock, guard, readiness,
   ipc, password, hosts, keyring}` — `UnattendedStore`/`UnattendedGrant`/`FailState` per §B.8.9,
@@ -62,17 +62,17 @@ runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rej
 
 ## Open / next (in order)
 
-1. ~~The third review round of tracks A and B~~ — **done 2026-09-04** (commits `7a6ae2e`,
-   `3134335`, `28be8b0`). See *Round 3* below. It does **not** replace the milestone
+1. ~~The third review round of tracks A and B~~ — **done 2026-09-04** (commits `4c72ae4`,
+   `b354f83`, `874d988`). See *Round 3* below. It does **not** replace the milestone
    `security-reviewer` close, which still has to run over the finished M1.
-2. ~~Track C — the unattended branch~~ — **done 2026-09-04** (`1366484`, `4f057a0`,
-   `30f5d65`). See *Track C* below. Two pieces of its B.8.14 row are **not** done and
+2. ~~Track C — the unattended branch~~ — **done 2026-09-04** (`d31eb87`, `4ccbd7c`,
+   `9936d80`). See *Track C* below. Two pieces of its B.8.14 row are **not** done and
    are carried into track D: **admin intent + scope** (the branch reaches `ADMIN_RESULT`
    but answers `ok: false, "not implemented at M1"` — the scope rules of §B.8.4.1,
    `unlock(pk)` / `suspend(pk ≠ self)` / `revoke(pk ≠ self)` / `revoke_all`, are
    unimplemented) and the **stop token** (`HELLO.stop_token` is observed by the existing
    seam but nothing in the unattended path consults it yet).
-3. ~~Track D — CLI/IPC/platform~~ — **done 2026-09-05** (`1b33136`, `e63966a`, `ac9cf4f`).
+3. ~~Track D — CLI/IPC/platform~~ — **done 2026-09-05** (`c32dc15`, `5c3ebdf`, `e8018a6`).
    See *Track D* below. Admin intent + scope and the stop token, carried in from track C, are
    both delivered.
 4. ~~Wire `serve_host` into `tornect host`~~ — **done 2026-09-21, fourth session** (decision
@@ -110,7 +110,7 @@ unauthenticated inputs (`SessionLogHistory` / `FilePairedDevices`).
 
 Three commits, each gated:
 
-- **`1366484` — the crypto core (`tornect-signal::auth`).** OPAQUE-3DH over ristretto255
+- **`d31eb87` — the crypto core (`tornect-signal::auth`).** OPAQUE-3DH over ristretto255
   with Argon2id (64 MiB / t=3 / p=1) and the whole §B.8.4.3 schedule (`context`,
   `identifiers`, `session_token`, `confirm_key`, `token_confirm`, `proof_fp`). No wire and
   no store dependencies: `HostLogin` / `ClientLogin` are pure state machines over the byte
@@ -121,14 +121,14 @@ Three commits, each gated:
   `rand`. Nine tests, including one that is functional rather than declarative: a record
   registered under the suite KSF **cannot** be opened by a login that omits it, so a silent
   regression to the crate's 19 MiB / t=2 default cannot pass.
-- **`4f057a0` — the host branch (`tornect-signal::unattended`).** `UnattendedAuth` is the
+- **`4ccbd7c` — the host branch (`tornect-signal::unattended`).** `UnattendedAuth` is the
   real `UnattendedHook`, replacing the `NOT_GRANTED` stub with the full §B.8.4.5 path. The
   charge is write-ahead and fsynced before KE2 is written, and every exit path settles it;
   a transport failure settles as the matching `FailKind` and returns the `HandshakeError`
   unchanged so `serve_host` reports the documented code. The §B.8.5.2 budgets are held by
   an `InFlight` guard that releases on drop. `OpaqueServerSetupSource` fills the
   `ServerSetupSource` seam core declares but cannot implement.
-- **`30f5d65` — the client branch + end-to-end.** `Intent::Unattended` drives the exchange;
+- **`9936d80` — the client branch + end-to-end.** `Intent::Unattended` drives the exchange;
   the accept checks mirror the attended ones (session type 1, `session_token` absent,
   `token_confirm` present and verified in constant time). The `hosts.toml` TOFU pin enters
   as a `ServerKeyPin` seam; a mismatch aborts **before** KE3 (A16) and the key is recorded
@@ -139,7 +139,7 @@ against a real `serve_host` running the real hook — no stub at any layer — r
 `SESSION_ACCEPT` with a derived token and zero popups. That is the B.8.14 M1 acceptance
 shape minus the Tor transport; live verification over Tor stays in track E.
 
-**Track C review (2026-09-04, `8dd3de9`).** Six hostile reviewers over the new code, each
+**Track C review (2026-09-04, `324877d`).** Six hostile reviewers over the new code, each
 finding attacked by three refuters: **26 raw findings → 3 confirmed, 23 refuted**; full report
 in `kore_project_V3/agents/security/reports/2026-09-04_tornect_track_c_review.md`. All three
 fixed:
@@ -175,7 +175,7 @@ already implemented** in `MutationGuard::admin`, `AdminOp::from_wire`, `AdminEff
 fill, not logic to write — but `crates/tornect-platform` **did not exist at all**, and
 `serve_host` **is still not wired into `tornect host`** (see *Still open* below).
 
-**`1b33136` — admin intent, the emergency stop, and an ordering fix.**
+**`c32dc15` — admin intent, the emergency stop, and an ordering fix.**
 
 - `AdminAuthority` is the seam; `GuardAdmin` wraps `MutationGuard::admin`; `RefuseAdmin`
   is the default, so a host wired without an authority refuses rather than pretending to
@@ -260,7 +260,7 @@ majority-refute killing it: **38 raw findings → 3 confirmed, 35 refuted.** Ful
 including the refuted set so a later pass does not re-litigate it, in
 `kore_project_V3/agents/security/reports/2026-09-04_tornect_m1_round3_review.md`.
 
-- **HIGH — the SAS was grindable (`28be8b0`, decision M1-37, supersedes M1-8).** The r6 input
+- **HIGH — the SAS was grindable (`874d988`, decision M1-37, supersedes M1-8).** The r6 input
   `th_after(PAIR_REQUEST)` is attacker-malleable on *both* sides after the peer's contribution
   is visible, against a ~2^20 code: a MITM grinds `host_nonce` toward the client and the
   unsigned `PAIR_REQUEST` toward the host (`client_auth_pk` is parsed and discarded but still
@@ -271,12 +271,12 @@ including the refuted set so a later pass does not re-litigate it, in
   seeds regenerated; `client_random()` scripts a second value. Note for r7: this **partly
   answers M1-31** — signing `PAIR_REQUEST` alone would not have fixed it, since the attacker
   re-signs each candidate with its own key.
-- **MEDIUM — a locked keystore permanently broke the log chain (`7a6ae2e`).** Untagged lines
+- **MEDIUM — a locked keystore permanently broke the log chain (`4c72ae4`).** Untagged lines
   written while `K_master` exists but is unreadable land after the key epoch and past
   `log_chain_head`, so `verify_chain` returns `Broken` forever after the recovery load: a
   standing tamper badge with nothing tampered, clearable only by `reset_store`. Now buffered
   and flushed tagged.
-- **LOW — the file-keystore password escalation was never tested (`3134335`).** Its only
+- **LOW — the file-keystore password escalation was never tested (`b354f83`).** Its only
   discriminating assertion sat in a dead branch, while `VERIFICATION.md` recorded U3 as
   VERIFIED on the strength of it; a mutation deleting the escalation left the suite green.
 
@@ -292,11 +292,11 @@ Scope ruling: **vertical slice first** (M1-39, M3-1; `docs/notes/CONTINUATION.md
 
 Done:
 - **Track D review re-run** (first thing, frozen worktree `/home/mx/tornect-review-trackd` @
-  `b92b10f`): 105/105 agents completed, 33 raw → 12 survivors → 8 distinct; S1 (HIGH, IPC
+  `4dee0a9`): 105/105 agents completed, 33 raw → 12 survivors → 8 distinct; S1 (HIGH, IPC
   30 s answer timeout vs 120 s polkit dialog ⇒ `unattended on` commits after the CLI reported
   failure, stop code lost) verified by hand. **Unfixed** — first item next session.
   Report: `kore_project_V3/agents/security/reports/2026-09-21_tornect_track_d_review.md`.
-- **Bridge ladder (M1-38)**, commit `0603be5`: `tor::bridges` (Rung, Ladder, Transport,
+- **Bridge ladder (M1-38)**, commit `99bf2ab`: `tor::bridges` (Rung, Ladder, Transport,
   built-in bridge lines, lyrebird discovery, last-good memory), `TorNode::start_auto` (fresh
   client per rung on its own runtime, `ready_for_traffic` only, stall/cap policy),
   `tornect tor-check`, `--bridges`, doctor line. Live: direct 14.3 s / obfs4 78.2 s /
@@ -314,11 +314,11 @@ build, packaging — the app is not yet functional end to end.
 
 ## Session 2026-09-21 (2) — track D fixed, slice-range review, hardening
 
-Commits, all pushed: `93dafe5` (track D), `a490f7f` (proto/input), `30e3112` (bridge ladder +
-lyrebird pin), `22f8386` (cargo-deny in the gate), `eb26ad8` (a flaky test). The gate is green at
+Commits, all pushed: `5552fca` (track D), `41561a4` (proto/input), `cf6c46a` (bridge ladder +
+lyrebird pin), `6a98d62` (cargo-deny in the gate), `fa7261c` (a flaky test). The gate is green at
 **368 tests**, and `cargo deny --offline check` now runs inside `cargo xtask verify`.
 
-- **Track D: all 8 distinct survivors fixed** (`93dafe5`). Each was re-verified against the
+- **Track D: all 8 distinct survivors fixed** (`5552fca`). Each was re-verified against the
   code first. S1, S2 and S3/S10 have regression tests that fail on the old code.
   - S1/S4 (HIGH): the CLI waits `RESPONSE_TIMEOUT` = 150 s, and an undelivered `On` turns
     access back off and clears the token.
@@ -333,7 +333,7 @@ lyrebird pin), `22f8386` (cargo-deny in the gate), `eb26ad8` (a flaky test). The
 
   Checked under a real PTY (`on` → `grant` → `status`) and over the host IPC socket.
   **Residual:** zxcvbn still scores "Laptop-of-Ana tornect 2026" at 4, even with the label.
-- **Review of `b92b10f..f39ca00`** (A′: 3 read-only sub-agents; no ≈ 100-agent refuted
+- **Review of `4dee0a9..b1ce2a3`** (A′: 3 read-only sub-agents; no ≈ 100-agent refuted
   review, because it was not approved at that size): 0 critical, 0 high. The fixes:
   - M1-40: private bridge lines replace the built-ins; `auto` does not probe direct Tor when
     private lines are set, and direct goes last after a bridge was needed.
@@ -356,14 +356,14 @@ Requirements the session layer inherits from the review (SLICE-A2 / A1 G3):
 - no unbound 4001 stream may keep a circuit alive.
 
 Also latent: `KillSwitch` latches — nothing resets it after one kill. It must become per-session,
-or be reset, when `serve_host` is wired. — **FIXED 2026-09-21 in `a1fcc8b`; see the session
+or be reset, when `serve_host` is wired. — **FIXED 2026-09-21 in `0ddb22e`; see the session
 below.**
 
 ## Session 2026-09-21 (3) — kill switch unlatched, SessionSink seam
 
-Resumed at `8a7563a`. Two commits, **not pushed**; gate green at **370 tests**.
+Resumed at `e84a0dc`. Two commits, **not pushed**; gate green at **370 tests**.
 
-- **`a1fcc8b` `fix(signal)`: the kill switch is per-session.** `KillSwitch` held one
+- **`0ddb22e` `fix(signal)`: the kill switch is per-session.** `KillSwitch` held one
   `watch<Option<u16>>` for the host's lifetime, so the first kill latched `Some(reason)`
   for good; `established()` polls it first in a biased `select!`, so every session accepted
   after a master-off / revoke-all / panic / emergency stop was `BYE`d on entry — one kill
@@ -374,7 +374,7 @@ Resumed at `8a7563a`. Two commits, **not pushed**; gate green at **370 tests**.
   not got to `Established`. Refusing *new* access after a master-off stays the grant store's
   job, so dropping the latch does not widen what is accepted. Failing-first proven: the
   regression test fails on the old code with `Frame(Io(Kind(BrokenPipe)))`.
-- **`5ee0709` `feat(signal)`: the `SessionSink` seam.** `HostDeps.sessions: Arc<dyn SessionSink>`.
+- **`ccf5943` `feat(signal)`: the `SessionSink` seam.** `HostDeps.sessions: Arc<dyn SessionSink>`.
   `on_start(&LiveSession)` after `SESSION_ACCEPT` and `th_final` (device, label, session id,
   **session token** — the M1-41 `Bind` key input — `th_final`, mode, `unattended`);
   `on_end(session_id, Option<&SessionEnd>)` as soon as `established` returns and **before the
@@ -390,7 +390,7 @@ Resumed at `8a7563a`. Two commits, **not pushed**; gate green at **370 tests**.
 
 ## Session 2026-09-21 (4) — `serve_host` in `tornect host`, `tornect connect`
 
-Resumed at `c478ad9`. The three commits of session 3 were pushed at the start, after the gate
+Resumed at `8e753da`. The three commits of session 3 were pushed at the start, after the gate
 re-ran green (370 tests). The operator answered the blocking question: **"Keep ping, add
 connect"** (decision M1-42).
 
@@ -459,11 +459,11 @@ connect"** (decision M1-42).
 ## Session 2026-09-21 (5) — the session layer: media over Tor
 
 **Commits** (gate green at **424 tests**, cargo-deny ok):
-- `e926da7` `feat(proto)`: the 64-byte client frame cap; `BindOk` documented as a hint.
-- `aea3fc2` `feat(session)`: `MediaHost` + `MediaViewer`, decision M1-43.
-- `ffbaf7f` `feat(tornect)`: `tornect host --capture`, the media stream in `tornect connect`.
-- `4323050` `fix(signal)`: the M1-44 review fixes.
-- `543b17e` `fix(tornect)`: the media-end wording.
+- `dacafe3` `feat(proto)`: the 64-byte client frame cap; `BindOk` documented as a hint.
+- `fa9c935` `feat(session)`: `MediaHost` + `MediaViewer`, decision M1-43.
+- `51e31fc` `feat(tornect)`: `tornect host --capture`, the media stream in `tornect connect`.
+- `0b753cc` `fix(signal)`: the M1-44 review fixes.
+- `ff438aa` `fix(tornect)`: the media-end wording.
 
 **What exists now.**
 - `tornect-session` serves the Tor media stream of M1-39.
@@ -482,7 +482,7 @@ connect"** (decision M1-42).
   - the media stream opened about 1 s after the accept;
   - `tornect panic` ended media and session on both ends.
 
-**Review of `f39ca00..517a773`** (KORE A′: 3 read-only threat modelers; the synthesis is at
+**Review of `b1ce2a3..6451379`** (KORE A′: 3 read-only threat modelers; the synthesis is at
 `/home/mx/kore_project_V3/agents/security/reports/2026-09-21_tornect_slice_b_review.md`).
 - Totals: 0 critical, 0 high, 4 medium; 106 candidates refuted.
 - Fixed failing-first (M1-44): B1-2 ⊕ B2-1, B1-3 ⊕ B2-5, B1-1 and B1-4. B3-12 (a doc fix) too.
@@ -501,8 +501,8 @@ connect"** (decision M1-42).
 
 ## Session 2026-09-22 (6) — the gate stops fighting cargo; two quick wins; a review that did not run
 
-**The review of `517a773..9bfbe87` did NOT run.** Three read-only threat modelers were launched
-first, on a frozen worktree at `9bfbe87`, and all three died within ~15 minutes on the account's
+**The review of `6451379..2078e60` did NOT run.** Three read-only threat modelers were launched
+first, on a frozen worktree at `2078e60`, and all three died within ~15 minutes on the account's
 **weekly** usage limit, with no report written. That whole range — the `tornect-session` crate,
 the CLI media path and the M1-44 fixes — is **unreviewed**. The frozen worktree
 `/home/mx/tornect-review-slice-c` is kept for the re-launch; the limit resets 2026-09-24 17:00 -03.
@@ -528,28 +528,28 @@ the live re-run.
 
 **Gate: green at 437 tests** (428 at the start), cargo-deny ok, 22–66 s. Everything is pushed.
 
-- **The review of `517a773..9bfbe87` ran** (three read-only threat modelers on the frozen
+- **The review of `6451379..2078e60` ran** (three read-only threat modelers on the frozen
   worktree, ≈ 0.91 M tokens, ≈ 21 min each): 0 critical, 0 high, 2 medium, 6 low, 13 info, 90
   candidates refuted. Synthesis and dispositions:
   `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_c_review.md`.
-- **B2-2 (M1-46, `be17943`).** `tornect host` holds `state/host.lock`. Its control channel is up
+- **B2-2 (M1-46, `a197e19`).** `tornect host` holds `state/host.lock`. Its control channel is up
   even without a store, and then serves `tornect panic` only. No command runs offline beside a host
   that does not answer (one already running offline when the host started still could, until
-  `b2eb4ae` in session 8). The kill path the terminal names is always one that works. The real binary
+  `5b8034f` in session 8). The kill path the terminal names is always one that works. The real binary
   was checked in three situations: store locked at start, socket path unbindable, and normal.
-- **C1-1 (M1-47, `2aff94e`).** Reading a media `Bind` takes no slot, so squatting streams can no
+- **C1-1 (M1-47, `701532a`).** Reading a media `Bind` takes no slot, so squatting streams can no
   longer deny every session its picture.
-- **C2-1 + B2-8 (M1-47, `9735cb8`).**
+- **C2-1 + B2-8 (M1-47, `a7ea4b3`).**
   - Ctrl-C in `tornect connect` is heard on its own task, and a second press quits at once.
   - The viewer yields after every message.
   - `bye` gives up after 3 s (`timeouts::BYE`), and pings run to a fixed deadline (for M2 frames;
-    host `PING`s still restarted the wait until `73711f1` in session 8).
-- **C1-5, C1-6, C3-4 (`a10c995`).** The `i32::MIN` wheel delta is refused; `watch_kill` arms
+    host `PING`s still restarted the wait until `8b7a025` in session 8).
+- **C1-5, C1-6, C3-4 (`2be80fc`).** The `i32::MIN` wheel delta is refused; `watch_kill` arms
   before it sweeps; `tornect panic` names its home.
-- **Frame rate (M1-47, `6530d93`).** `MediaLimits::window_frames` goes from 8 to 20. Over Tor that
+- **Frame rate (M1-47, `0e76c9c`).** `MediaLimits::window_frames` goes from 8 to 20. Over Tor that
   gave **13.2 and 13.0 fps** in two live runs, against 6.3 at 8, with 0 errors and the card in
   order.
-- **The client's `BYE` could be lost (`6f27930`).** In live run 1 the client shut Tor down right
+- **The client's `BYE` could be lost (`4377916`).** In live run 1 the client shut Tor down right
   after a flushed `BYE`, and the host logged the end as `io`. `bye` now waits for the host's close,
   within 3 s.
 - **Live media check, run 2: all 10 checks pass**, including `tornect panic` ending media and
@@ -570,16 +570,16 @@ the live re-run.
 - **Infos:** C1-4, C1-5 (b) (the input bucket counts frames, not OS events), C1-7, C2-3 to C2-7,
   C3-5, C3-7.
 
-**Unreviewed by a hostile review:** everything after `9bfbe87`, including this session's fixes
-(the range `9bfbe87..d1ef55b` was reviewed in session 8: slice D).
+**Unreviewed by a hostile review:** everything after `2078e60`, including this session's fixes
+(the range `2078e60..122fa93` was reviewed in session 8: slice D).
 
 ## Session 2026-09-22 (8) — Wayland capture live; the slice-D review; the slice-C lows and the slice-D fixes
 
 **Gate: green at 480 passed, 0 failed, 4 ignored** (437 at the start, 458 after the Wayland
-backend), cargo-deny ok. `d1ef55b..843478f` is pushed; `843478f..9c1aa12` and this hand-off were
+backend), cargo-deny ok. `122fa93..3e815cc` is pushed; `3e815cc..ec30722` and this hand-off were
 local when it was written, for push 2.
 
-- **Wayland capture and input (M1-48; `87f75b3`, `885278f`, `ae6b97d`, `f66cde5`).**
+- **Wayland capture and input (M1-48; `49ca274`, `a7a1c54`, `9718f80`, `f9dde45`).**
   - `tornect-capture`'s `wayland` module: one RemoteDesktop portal session with ScreenCast
     sources, on a thread with its own runtime and zbus connection; PipeWire over `dlopen` with
     LP64 mirrors and the 232-byte EnumFormat pod; frames copied on damage (`Ok(None)` otherwise);
@@ -601,36 +601,36 @@ local when it was written, for push 2.
     Run 1 labelled the media end `MEDIA FAILED: … Circuit closed` (fixed below; OPEN until a
     live run).
   - **No input crossed Tor**: `tornect connect` sends none, and no key was injected live at all.
-- **The slice-D review of `9bfbe87..d1ef55b` ran in full** (62/62 agents, 8 finder
+- **The slice-D review of `2078e60..122fa93` ran in full** (62/62 agents, 8 finder
   dimensions and 3 refuters per raw finding, 47.8 min): 18 raw → 8 survived →
   **5 distinct defects, all LOW, no BLOCK**; 10 refuted. D1 was raised at MEDIUM and taken at LOW
   by the parent; **the operator ruled LOW**. D4 and D5 were ledger and plan drift, fixed by this
   hand-off. Its §10 addendum on the Wayland policy: keep the persisted grant, under three
   conditions (M1-48), and do not grow the waits. Synthesis:
   `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_d_review.md`.
-- **Fixed, each code fix failing-first (M1-49; 21 commits `73711f1` … `9c1aa12`; tests 458 → 480):**
-  - D2 (`73711f1`): host `PING`s no longer restart `next_event`'s wait.
-  - D1 (`b2eb4ae`): an offline command refuses its write once a host has started beside it.
-  - D3 (`5521d22`): the C1-1 test holds every waiting slot.
-  - C3-1 (`25d73b0`): the one-session slot is reserved in the same step as its check.
-  - C3-2 (`9a36dc3`): a violation ends the session before its `ERROR` is written.
-  - C2-2 (b) (`5b20ecd`): the viewer's writes race its stop.
-  - C1-3 (`8b6388f`): held keys are released after 3 s of silence, and **the viewer pings once a
-    second when idle**; not while a picture or `Pong` write was stuck, until `4f12573` (slice-G
+- **Fixed, each code fix failing-first (M1-49; 21 commits `8b7a025` … `ec30722`; tests 458 → 480):**
+  - D2 (`8b7a025`): host `PING`s no longer restart `next_event`'s wait.
+  - D1 (`5b8034f`): an offline command refuses its write once a host has started beside it.
+  - D3 (`53c00dc`): the C1-1 test holds every waiting slot.
+  - C3-1 (`d4c8b0d`): the one-session slot is reserved in the same step as its check.
+  - C3-2 (`7504fdd`): a violation ends the session before its `ERROR` is written.
+  - C2-2 (b) (`445605b`): the viewer's writes race its stop.
+  - C1-3 (`aa8e470`): held keys are released after 3 s of silence, and **the viewer pings once a
+    second when idle**; not while a picture or `Pong` write was stuck, until `8f8fa44` (slice-G
     G2-1).
-  - C1-2 (`b1f5fd3`): X11 and `SendInput` map the pointer over the encoded region (a mapping, not
-    a refusal); the X11 half used the root size read at connect (slice-G G2-2), fixed in `3379655`.
-  - C3-3 (`eba4f1e`): a `DISPLAY` with a host part is refused.
-  - C3-5 (`1307c04`): doctor and the banner name the capture backend truthfully.
-  - The media-end wording (`a338a9d`, client side).
-  - The §10 hardening: a pending portal open ends with its session (`b81eb55`; an end that came
-    before the open had stored its cancel was lost until `79a06b1`, slice-G G1-1); a view-only
-    session drops its input handle (`244e0b9`); doctor names the grant file and how to revoke it
-    (`9e4766e`); the token's path is out of log lines (`92bd313`; `remember_token`'s failures still
-    named it until `717d77a`, slice-G G1-2).
-  - The zbus warning filter (`abcb9e4`); the R9, R5 ≡ R8 and R7 test tightenings (`47b0dcd`,
-    `c090ddd`, `e70a370`); the O2 comment (`1f2b563`); R2: **the first Ctrl-C ends a pending
-    media open** (`9c1aa12`).
+  - C1-2 (`2832953`): X11 and `SendInput` map the pointer over the encoded region (a mapping, not
+    a refusal); the X11 half used the root size read at connect (slice-G G2-2), fixed in `683b0ee`.
+  - C3-3 (`b225da6`): a `DISPLAY` with a host part is refused.
+  - C3-5 (`6bac607`): doctor and the banner name the capture backend truthfully.
+  - The media-end wording (`8cd3d91`, client side).
+  - The §10 hardening: a pending portal open ends with its session (`714d418`; an end that came
+    before the open had stored its cancel was lost until `429a782`, slice-G G1-1); a view-only
+    session drops its input handle (`03e0f58`); doctor names the grant file and how to revoke it
+    (`40f173c`); the token's path is out of log lines (`433be8d`; `remember_token`'s failures still
+    named it until `73592db`, slice-G G1-2).
+  - The zbus warning filter (`58e8e99`); the R9, R5 ≡ R8 and R7 test tightenings (`15ae3cf`,
+    `d579599`, `aa62d8e`); the O2 comment (`9dad6f2`); R2: **the first Ctrl-C ends a pending
+    media open** (`ec30722`).
 - **Windows:** `cargo check --target x86_64-pc-windows-gnullvm -p tornect-session -p
   tornect-capture` is clean, 0 warnings (6 min; the first gnullvm check of the Arti stack here).
 - **Operator rulings:** D1 is LOW; the store-less host keeps M1-46, and §B.8.6.2 now carries the
@@ -654,76 +654,76 @@ local when it was written, for push 2.
 - Before unattended connects on Wayland: the §B.8.8 5 s dialog budget, no dialog without a valid
   token, and (M4) the block window and indicator.
 
-**Unreviewed by a hostile review:** everything after `d1ef55b`, including `pipewire.rs`'s unsafe
+**Unreviewed by a hostile review:** everything after `122fa93`, including `pipewire.rs`'s unsafe
 FFI, the portal and token handling, the idle ping and this session's fixes. (Reviewed since: the
-slice-G review of 2026-09-24 covered `d1ef55b..0e3afea`; its outcome is in the last session's
+slice-G review of 2026-09-24 covered `122fa93..0c79e86`; its outcome is in the last session's
 "Still open".)
 
 ## Sessions 2026-09-23/24 — the window, the indicator, the Windows build, packaging, start at login; three reviews and their fixes; the pre-release prepared
 
-**Gate: green at 634 passed, 0 failed, 5 ignored** at `51f4be3` (480 at `9c1aa12`), cargo-deny ok against the
-RustSec database `1931a145168d` of 2026-09-23. `origin/main` is `6b0da44`; everything after it (`b09d919` …
-`51f4be3` and the documentation commits of 2026-09-24) was local when this was written. **Not tagged.** The fifth
+**Gate: green at 634 passed, 0 failed, 5 ignored** at `b356095` (480 at `ec30722`), cargo-deny ok against the
+RustSec database `1931a145168d` of 2026-09-23. `origin/main` is `da92fa2`; everything after it (`7f32009` …
+`b356095` and the documentation commits of 2026-09-24) was local when this was written. **Not tagged.** The fifth
 ignored test is the systemd round trip.
 
-- **The window (M1-50; `9b61b17`, `efa51b5`, `d9dc4ce`, `d370207`).** `tornect` with no subcommand opens a manual
+- **The window (M1-50; `0ad2171`, `b182884`, `39f94ee`, `cd45f6d`).** `tornect` with no subcommand opens a manual
   winit loop driving egui-winit and egui-wgpu: the home screen, inline pairing and session cards, the client's
   code card, the stream window with input by physical scancode (sent only for a control grant), the sharing
   banner, the first-run Wayland grant as a setup step, and a hidden `--preview`. `--no-host` makes a
   connect-only window.
-- **The sharing indicator (M1-50; `f509f7c`, `164461b`).** An always-on-top, undecorated window "Tornect:
+- **The sharing indicator (M1-50; `87d4c58`, `c47bb46`).** An always-on-top, undecorated window "Tornect:
   sharing" that opens without the focus, in the same process as the window; one row per shared session, with
   Stop. Its line puts the label last (E1-2), which departs from §B.8.7.3's word order.
-- **The Windows build (M1-51; `bd3ef35`, `0a1cd53`, `818bb8a`, `787b5da`, `10090a3`).** `result_large_err` fixed
+- **The Windows build (M1-51; `d6196a8`, `ce93daa`, `6316699`, `e6589af`, `91c89a1`).** `result_large_err` fixed
   by boxing the TOML error; every C and C++ object built with the stack protector; libc++ linked statically, so
   `tornect.exe` imports only DLLs Windows ships (the first link needed `libc++.dll`); the 13 test binaries build.
   The `a14` flake (about 1 run in 300) fixed. Under Wine 10.0: `--version`, `id`, `doctor` and four test
   binaries pass.
-- **pt-fetch, dist and B3-6 (M1-52; `0135ddd`, `9d514e7`, `2e47ffb`, `2480dfb`).** lyrebird fetched, pinned and
+- **pt-fetch, dist and B3-6 (M1-52; `2118518`, `be46cc0`, `a3605ed`, `dbfd6f1`).** lyrebird fetched, pinned and
   signature-checked; both zips from one clean commit, reproducible on this machine (two builds from scratch,
   bit-identical executables); the gate fails without cargo-deny. The Linux executable needs glibc 2.43 or newer.
-- **Start at login (M1-53; `8a7ddbb`, `95f455e`, `75f6df8`).** `tornect service install`, `uninstall` and `status`:
+- **Start at login (M1-53; `f08645f`, `68063dd`, `902bce8`).** `tornect service install`, `uninstall` and `status`:
   a systemd user unit or a Task Scheduler task from XML, through the guard with OS re-authentication (polkit;
   CredUI's secure prompt and `LogonUserW` on Windows).
-- **The slice-E review** of `0e3afea..2480dfb` (a threat-model review without a refuter pass): 1 Medium, 11 Low, 6 Info
+- **The slice-E review** of `0c79e86..dbfd6f1` (a threat-model review without a refuter pass): 1 Medium, 11 Low, 6 Info
   plus P-1, no BLOCK. Fixed: **E1-1 ≡ E2-1** (the Medium: keys typed for another program answered a card) by the
-  operator's "pointer-only Allow" (`49e29f7`), E1-6 (`012546c`), E1-4 and E1-3 (`9368b51`), E1-2 (`0472185`), E1-5's
-  sentence (`f109571`), E2-3 (`dea1f35`), E2-2's interim rule (`b09d919`), E2-4 and P-2 (`08c796c`; PARTIAL without
-  the linker flag), E2-7 (`92e26b0`, its flaky test fixed in `fe7e02e` and `c859efc`). E3-1 and E3-3 are met by
+  operator's "pointer-only Allow" (`8232e13`), E1-6 (`626ea5a`), E1-4 and E1-3 (`b741602`), E1-2 (`67fd68f`), E1-5's
+  sentence (`b481de6`), E2-3 (`d2eebf3`), E2-2's interim rule (`7f32009`), E2-4 and P-2 (`4b8e3fd`; PARTIAL without
+  the linker flag), E2-7 (`2b5351c`, its flaky test fixed in `37b224d` and `888c25e`). E3-1 and E3-3 are met by
   `dist` and the gate.
-- **The slice-F review** of `2480dfb..75f6df8` (the same form): 2 Medium, 4 Low, 6 Info plus P-1 and P-2, no
-  BLOCK. Fixed: **F2-1** (the Linux start-at-login host answers pings only, `e7c83bd`), **F1-1** (a failed task query
-  is never "not registered", `22aa1ce`), F1-3 (`7242cad`), F2-2 with F1-4 and F2-6's characters (`6b0da44`), F2-3
-  (`4f6c708`), F2-4 (`d242fd6`, and the manual removal step `dbe628c`), F1-2 and F1-5 (`ea4ebca`), default 3 and N-2 in
-  the README (`2711c61`), and the operator's `--elevated` refusal for a standard account (`3e19b3e`).
-- **The fix-closure check** (phase 2a at `6b0da44`: 13 of 13 claims closed, new N-1 LOW and N-2 INFO; phase 2b at
-  `3259031`: 9 of 11, E2-4 PARTIAL, new N-3 INFO and N-4 LOW) and **the release-preparation review** (phase 2c, four
-  parts up to `bd8178a`: L-1, L-2 and Infos), no BLOCK anywhere. Fixed: N-1 (`0aaf4e0`), N-3 (`80c501b`), N-4
-  (`3d624b1`), L-1 (`5b3b02e`), L-2 (`ace22d4`), I-2 (`b7d9eba`), I-3 (`ef089ca`), P2-I1 (`c859efc`), P2-I2
-  (`24033f3`), P2-I3 (`bd8178a`), P2-I4 (`e74da9f`), the build VM's host name out of the code (`231792f`) and the docs
-  (`ef729f2` and the documentation commits of 2026-09-24). P3-I1 … P3-I3 are disclosed, not fixed.
+- **The slice-F review** of `dbfd6f1..902bce8` (the same form): 2 Medium, 4 Low, 6 Info plus P-1 and P-2, no
+  BLOCK. Fixed: **F2-1** (the Linux start-at-login host answers pings only, `826381c`), **F1-1** (a failed task query
+  is never "not registered", `6fffefa`), F1-3 (`61fc001`), F2-2 with F1-4 and F2-6's characters (`da92fa2`), F2-3
+  (`2afbc8b`), F2-4 (`5962f23`, and the manual removal step `e75d686`), F1-2 and F1-5 (`c019a17`), default 3 and N-2 in
+  the README (`5c12622`), and the operator's `--elevated` refusal for a standard account (`2dd82eb`).
+- **The fix-closure check** (phase 2a at `da92fa2`: 13 of 13 claims closed, new N-1 LOW and N-2 INFO; phase 2b at
+  `556e6e9`: 9 of 11, E2-4 PARTIAL, new N-3 INFO and N-4 LOW) and **the release-preparation review** (phase 2c, four
+  parts up to `69ba7be`: L-1, L-2 and Infos), no BLOCK anywhere. Fixed: N-1 (`a6e4a6b`), N-3 (`b66cb7b`), N-4
+  (`7ba4725`), L-1 (`5cb392d`), L-2 (`8c373e2`), I-2 (`a67451e`), I-3 (`630a46d`), P2-I1 (`888c25e`), P2-I2
+  (`aaed004`), P2-I3 (`69ba7be`), P2-I4 (`bdb0e70`), the build VM's host name out of the code (`b50e398`) and the docs
+  (`4e9746d` and the documentation commits of 2026-09-24). P3-I1 … P3-I3 are disclosed, not fixed.
 - **The release preparation (M1-52).** `cargo deny fetch` (2026-09-24 03:01) moved the RustSec database from
   2026-08-29 to 2026-09-23, and the gate then failed on **RUSTSEC-2026-0285** (rustls 0.23.43): rustls 0.23.45
-  (`00bc286`). The database is named in the gate and in `BUILD-INFO.txt` (`37d04fe`, with its ignores `ef089ca` and
-  the 7-day limit `b7d9eba`); `THIRD_PARTY_LICENSES.txt` goes into each zip (`594711b`, `ad9bef3`); `pt.rs:620`
-  (`fbb846d`); `docs/RELEASING.md` (`bd9a095`). A dist check run at `594711b` built both zips and passed the smoke
+  (`e22a22d`). The database is named in the gate and in `BUILD-INFO.txt` (`fb570b0`, with its ignores `630a46d` and
+  the 7-day limit `a67451e`); `THIRD_PARTY_LICENSES.txt` goes into each zip (`f392465`, `ebd83f3`); `pt.rs:620`
+  (`1475ab9`); `docs/RELEASING.md` (`1b311de`). A dist check run at `f392465` built both zips and passed the smoke
   tests (Wine with the home inside the profile); its zips were deleted.
-- **Release verification at `bd8178a`:** the gate three times (633 / 0 / 5), the `tornect-signal` binary 40 of 40,
+- **Release verification at `69ba7be`:** the gate three times (633 / 0 / 5), the `tornect-signal` binary 40 of 40,
   Xvfb 59 passed, five failing-first spot checks, gnullvm clippy clean. **T-1** (LOW, test strength: the
-  view-only mapping was pinned by no test) is fixed in `51f4be3` (634 / 0 / 5).
+  view-only mapping was pinned by no test) is fixed in `b356095` (634 / 0 / 5).
 - **Live on the build VM, 2026-09-24:** start at login with the debug build's re-auth escape (install; `systemctl
   --user start` as the login stand-in, whose journal shows the pings-only line; F2-3's refusal through the live
   control channel; a graceful stop; uninstall; nothing left enabled). The Windows release executable under Wine:
   33 imports and no `credui.dll`, `--version`, `id`, `doctor`, the E2-2 refusals.
 - **The console check of the window over real Tor was NOT PERFORMED three times:** 2026-09-23 02:27–02:50 (at
-  `d370207`) and 22:53–23:38 (at `dea1f35`), 2026-09-24 01:14–01:20 (at `6b0da44`, behind a 5-minute presence
+  `cd45f6d`) and 22:53–23:38 (at `d2eebf3`), 2026-09-24 01:14–01:20 (at `da92fa2`, behind a 5-minute presence
   gate). Each time the windows were up and both hosts `REACHABLE`, and nobody was at the VM screen. Its polkit part
   was never reached.
 - **Operator rulings:** decision M1-54 (each with its date).
 
 **Still open:**
 - The console check (the window over real Tor with a person at the screen, keys over Tor, the polkit path live).
-- E2-4's load-time residual: the linker's dependent-load flag is set in `37a70e1`; the final `dist` checks
+- E2-4's load-time residual: the linker's dependent-load flag is set in `877ac00`; the final `dist` checks
   `DependentLoadFlags: 0x800` on the release exe; the loader's effect NEEDS-DEVICE(windows).
 - Everything at run time on Windows (NEEDS-DEVICE), and the Linux ↔ Windows session.
 - Carried to M6 or later: E2-2's DACL, E2-5, E2-6, E2-8, E3-2, E3-4 (before 2026-10-26), E3-5, slice-E P-1
@@ -734,22 +734,22 @@ ignored test is the systemd round trip.
   (no key repeats are forwarded).
 - Cosmetic: a long IPC refusal is cut at 256 characters mid-word; the pings-only host still prints its "sharing:
   this desktop …" line.
-- **Reviewed 2026-09-24, slice G** (`d1ef55b..0e3afea`: the Wayland backend, `pipewire.rs`'s unsafe FFI, the
+- **Reviewed 2026-09-24, slice G** (`122fa93..0c79e86`: the Wayland backend, `pipewire.rs`'s unsafe FFI, the
   portal and token handling, the idle ping, the slice-D fixes; two threat modelers and the Security parent, no
-  refuter pass): 0 Critical, 0 High, 0 Medium, **six Lows, all fixed**: G1-2 `717d77a`, G1-1 `79a06b1`, G1-3
-  `996e6db` (test `fd7e2f7`), G2-1 `4f12573`, G1-4 `602d0f9` + `117fb34`, G2-2 `3379655`; one Info, G2-3 (the 3 s
+  refuter pass): 0 Critical, 0 High, 0 Medium, **six Lows, all fixed**: G1-2 `73592db`, G1-1 `429a782`, G1-3
+  `fb7e766` (test `0086503`), G2-1 `8f8fa44`, G1-4 `8436504` + `1e94171`, G2-2 `683b0ee`; one Info, G2-3 (the 3 s
   quiet release can let go of a live viewer's drag in a Tor stall; disclosed in the notes). The closure check's
   round 1 verified G1-2, G1-1 and G1-3 closed and filed an Info (its N-2, the order of owed releases: fixed in
-  `339f785`). Round 2 (no BLOCK, nothing above Low open) verified G2-1, G1-4 and G2-2 closed in code (G2-2's live
-  RandR change NEEDS-DEVICE(x11)), found `602d0f9` and `fd7e2f7` sound, and found the two fixes from the fifth
-  console check sound on the security side: the code card that outlives the host's wait (`a4887c2`, decision M1-55)
-  and the host's `PairedOnly` on a timeout after its accept (`f4bced7`, `fsm/host.rs:883-889`, an outcome label
-  only). Its one Info, R2-I1 (a late yes read "Paired" whatever the error), is fixed in `a024c32`.
+  `0d03e43`). Round 2 (no BLOCK, nothing above Low open) verified G2-1, G1-4 and G2-2 closed in code (G2-2's live
+  RandR change NEEDS-DEVICE(x11)), found `8436504` and `0086503` sound, and found the two fixes from the fifth
+  console check sound on the security side: the code card that outlives the host's wait (`3e4716b`, decision M1-55)
+  and the host's `PairedOnly` on a timeout after its accept (`1cd7068`, `fsm/host.rs:883-889`, an outcome label
+  only). Its one Info, R2-I1 (a late yes read "Paired" whatever the error), is fixed in `e4089a6`.
 - The slice-G live and device items: G2-1 over real Tor (a vanished viewer's held key, timed), the quiet release
   and G1-4's releases through the Wayland portal, whether GNOME lets go of a RemoteDesktop session's held keys and
   dismisses its dialog on `Session.Close`, `Closed` on "Stop sharing" and screen lock, G2-2 with a real RandR change
   (NEEDS-DEVICE(x11)), and how often onion circuits stall for 3 s or more (G2-3).
-- **Round 3** (no BLOCK, nothing above Low open): `a024c32` VERIFIED CLOSED; the documentation after `bd8178a` read
+- **Round 3** (no BLOCK, nothing above Low open): `e4089a6` VERIFIED CLOSED; the documentation after `69ba7be` read
   for its security statements, none false.
 
 ## Gotchas (the build VM)

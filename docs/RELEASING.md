@@ -29,7 +29,7 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
 7. The zips carry the licence texts and notices that the bundled dependencies require of a binary
    distribution: `LICENSE`, `THIRD_PARTY_NOTICES.md`, lyrebird's notice (`pt/lyrebird.txt`;
    `lyrebird.txt` beside `tornect.exe` in the Windows zip) and
-   `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `594711b`,
+   `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `f392465`,
    `docs/VERIFICATION.md`, *Release tooling*).
 8. The release notes and the zipped `README-release.md` name the one download location,
    `<repository>/releases` from the workspace `repository` field
@@ -38,7 +38,7 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
    `the_release_docs_name_the_download_location` checks the committed files; a notes file written
    for a later release keeps the sentence.
 9. No release blocker recorded in a milestone's hand-off note (`docs/notes/m<N>-state.md`, section
-   *Blockers*) is open. For any commit at or after `c1ec5a15` (`INTERNET_DIRECT = true`: every
+   *Blockers*) is open. For any commit at or after `a4af339f` (`INTERNET_DIRECT = true`: every
    default-configured session asks a public STUN server), that means the three of
    `docs/notes/m2-state.md`:
    - the owner's call on the default STUN servers' published terms
@@ -126,7 +126,7 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
      Windows zip holds beside `tornect.exe`, decision M1-88 (2)), and on a
      Windows machine when one is at hand. Under Wine the `--home` goes inside the Wine user's
      profile folder, `C:\users\<user>\…`, not under `target/tornect-test/` (which Wine sees as
-     `Z:\…`): since `b09d919`, `tornect.exe` refuses a `--home` or `TORNECT_HOME` outside the profile
+     `Z:\…`): since `7f32009`, `tornect.exe` refuses a `--home` or `TORNECT_HOME` outside the profile
      folder that Windows names (review finding E2-2). From the unpacked zip, through Wine's `cmd`
      so that `%USERPROFILE%` names that folder:
      `wine cmd /v:on /c 'tornect.exe --home %USERPROFILE%\tornect-smoke-h1 id & echo exit !ERRORLEVEL!'`

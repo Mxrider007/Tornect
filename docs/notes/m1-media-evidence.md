@@ -2,7 +2,7 @@
 
 **What ran.** Two instances on the build VM, each with its own `TORNECT_HOME` (`target/tornect-test/s61-host`,
 `s61-client`) and its own PTY, over the real Tor network (direct Tor, no bridges needed). Binary: the
-tree at `ffbaf7f` (`tornect-session`, decision M1-43). The driver is the appendix: it pairs with the SAS
+tree at `51e31fc` (`tornect-session`, decision M1-43). The driver is the appendix: it pairs with the SAS
 compared by the driver, runs a control session with media for three pings, then a view-only session
 ended by `tornect panic`.
 
@@ -126,19 +126,19 @@ screen sharing stopped (session over, ended by the host): 38 pictures, 5 KiB sen
 
 ## Re-run, 2026-09-22 (seventh session): a 20-unit window
 
-Same driver, same homes, the tree at `a10c995` plus the window change.
+Same driver, same homes, the tree at `2be80fc` plus the window change.
 - **Run 1:** session 1 gave 309/309 pictures, 0 errors, the card in order (0–308), **13.2 fps**.
   The client then shut Tor down right after its `BYE`, and the host logged the end as `io`: the
   flushed `BYE` never left. The driver stopped there, waiting for "the client left (USER)".
 - **Run 2:** 296 pictures, **13.0 fps**, and **all 10 checks true**, including `tornect panic`
   ending media and session and a clean host exit. The driver said FAIL only because it asked for
   11 results from its 10 checks, fixed below.
-- **Fix for run 1** (`6f27930`): `ClientSession::bye` waits for the host to close (it closes once
+- **Fix for run 1** (`4377916`): `ClientSession::bye` waits for the host to close (it closes once
   it has read the `BYE`) before closing, within 3 s.
 
 ## The loopback demo (the quality design's step 18), 2026-10-24
 
-`tornect demo --loopback --headless-stats` (`apps/tornect/src/demo_cmd.rs`, `0e2aa6bf`): a real `MediaHost` and
+`tornect demo --loopback --headless-stats` (`apps/tornect/src/demo_cmd.rs`, `e8475168`): a real `MediaHost` and
 `MediaViewer` in one process over a 4 MiB `tokio::io::duplex`, no Tor, no network, no window. The source is the
 stamped test card; the host serves it as it serves a Tor stream (`Route::Tor`, so each preset runs its Tor row:
 Best quality 12 fps, Balanced 15, Best performance 20) with `MediaLimits`' defaults and the given encoder
@@ -150,8 +150,8 @@ paint per fresh picture; `lost` is pictures sent minus pictures decoded.
 **Where it ran:** not the dev VM (GNOME, VMware): this build container (4 vCPU "Intel(R) Xeon(R) Processor @
 2.10GHz", x86_64, no GPU, no display), as root (the demo serves nobody, so the host's root refusal of M1-67
 does not apply to it). Binary: `cargo build --release -p tornect` (thin LTO, codegen-units 1) of the working tree
-during this work: before the pre-bind log budget (`f9ad35ad`) and the demo's last edit (`0e2aa6bf`'s error
-text for a viewer left behind); neither touches the loopback path's timing, and `507500fc` changes only the
+during this work: before the pre-bind log budget (`e6ca6411`) and the demo's last edit (`e8475168`'s error
+text for a viewer left behind); neither touches the loopback path's timing, and `e2034c61` changes only the
 Wayland source. Each run 10 s, the card at 30 fps, one run at a
 time, nothing else running. Command, for each row:
 `target/release/tornect demo --loopback --headless-stats --size <WxH> --quality <preset> --threads <n> --seconds 10`
@@ -219,7 +219,7 @@ software OpenH264 path of the slice, so the misses are expected and stated, not 
   73–103 ms per picture (STATS `yuv2rgb_ms`), slower than the host's 12 fps, so pictures queue in the ack
   window: `ack_ms` climbs from 168 to 896 ms over 9 s and e2e p50 is 349–388 ms (p95 590–975). At the
   host's end the viewer is still 5–9 pictures behind, its next write meets the closed pipe ("broken pipe"),
-  and the demo exits 1. A re-run with the new error text (`0e2aa6bf`) said the same with 3 pictures behind.
+  and the demo exits 1. A re-run with the new error text (`e8475168`) said the same with 3 pictures behind.
 - **The cause is the picture's width, not its size:** the `openh264` crate converts with SIMD only when the
   width is a multiple of 8 (`openh264-0.9.8/src/decoder.rs:604`, `write_rgba8`) and otherwise falls back to a
   scalar loop. Every scaled picture's width is a multiple of 8 (`picture_size`), but a desktop under a
@@ -251,7 +251,7 @@ B7 capture=0.9/4 PASS convert+encode=9.0/5 FAIL decode=1.9/4 PASS (B.7 targets a
   ("RGBA conversion of a picture whose width is not a multiple of 8"); not fixed here: either the host fits
   every picture's width to a multiple of 8 (a crop of up to 7 columns, which amends M1-74 (3)'s "the whole
   desktop but for an odd last column") or `tornect-codec` converts the last columns itself. Fixed since by a variant of
-  the second (`2458eb96`: the codec converts such a width whole): the next section.
+  the second (`9ad7e9f9`: the codec converts such a width whole): the next section.
 - **Encoder threads (`--threads 0`, automatic: 3 on 4 vCPU) against 1:** encode p50 1.04–1.14× faster at
   1080p and above (20.6 → 18.0 ms at 2560×1440 Best quality, 41.9 → 40.3 ms at 3538×1918), no change at 720p.
   Far from the 1.5× that design §9 asks before the default may change: the default stays 1 (M1-74 (5)).
@@ -262,10 +262,10 @@ B7 capture=0.9/4 PASS convert+encode=9.0/5 FAIL decode=1.9/4 PASS (B.7 targets a
 
 ## The loopback demo after the final reviews' fixes, 2026-10-24
 
-The same container, command and reading as the section above, with a binary built at `31c75b7b` (`cargo build
+The same container, command and reading as the section above, with a binary built at `7301bc70` (`cargo build
 --release -p tornect`, 4 min 6 s): the codec's own RGBA conversion for a width that is not a multiple of 8
-(`2458eb96`), the stop-aware pacing (`7aba5d27`), the gate's turn (`05ffc570`) and the Wayland retry
-(`31c75b7b`, not on this path). The commit after it changes only a doc comment and the docs. Each run 10 s, one at
+(`9ad7e9f9`), the stop-aware pacing (`2f7ea666`), the gate's turn (`17303ea2`) and the Wayland retry
+(`7301bc70`, not on this path). The commit after it changes only a doc comment and the docs. Each run 10 s, one at
 a time, nothing else running; stderr (OpenH264's warnings) left out. `yuv2rgb` is the range of the viewer's
 per-second conversion means.
 

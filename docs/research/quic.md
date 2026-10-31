@@ -104,8 +104,8 @@ What logs addresses or keys (input to design DIRECT-6, decision M1-83, step A7):
   datagram that caused it: after `set_server_config(None)` a further Initial starts no
   `Incoming`, and the real viewer's endpoint answers the host's replies to spoofed Initials
   this way, which the tests show harms neither connection.
-- **Review fixes (2026-10-26; `a96b703c`, `4dcb9d90`, `6e2768e6`).**
-  - **The accept race, corrected.** `be894c1f` capped the handshakes in flight at four and
+- **Review fixes (2026-10-26; `c02ad428`, `6978b14d`, `70b129fa`).**
+  - **The accept race, corrected.** `f57bb85f` capped the handshakes in flight at four and
     dropped the oldest for a fifth, and its commit message and the `accept` doc said a
     spoofed Initial raced from the validated address "cannot lock the real dialler out".
     That held only for Initials raced *before* the real one: dropping a `Connecting` closes
@@ -145,7 +145,7 @@ What logs addresses or keys (input to design DIRECT-6, decision M1-83, step A7):
     attempt ignored at the cap retries with it.
   - **Possession of the pinned key.** The pinned key is public (`PAIR_ACCEPT`,
     `SESSION_ACCEPT.quic_spki`), so the `CertificateVerify` check is what keeps a peer
-    that only knows it out. At `be894c1f` no test guarded it (every impostor presented its
+    that only knows it out. At `f57bb85f` no test guarded it (every impostor presented its
     own key and was refused by the SPKI comparison first). Now a signature by another key,
     over another message, or with a flipped bit fails in both verifier impls, and a viewer
     or host built with `QuicIdentity::with_key` that presents the pinned key but signs

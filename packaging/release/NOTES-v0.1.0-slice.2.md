@@ -66,8 +66,8 @@ a row and a recipe in `docs/VERIFICATION.md`.
 | Chat, clipboard text and files (M1-76) | four switches in Settings › Sharing (all on by default; "Let them see and copy files" gives a viewer with control read access to any file the user can open), the banner's "Turn off clipboard and files", files into Downloads › Tornect | VERIFIED (unit) 2026-10-25/26, the Wayland portal part on a fake portal over a private D-Bus; over Tor, on GNOME's portal and on Windows NEEDS-DEVICE (the step 29 live rows) |
 | Direct connections (M1-77 to M1-87) | after the accept: candidates over Tor, STUN, router port mapping, hole punching, QUIC with both keys pinned; Tor within 4 s otherwise; `paranoid`, `--tor-only`, the grant's Tor-only switch, `lan_only`, off over a bridge | VERIFIED (unit) 2026-10-26 … 28: property tests, the in-memory NAT matrix, loopback sessions, the redaction end to end; 10-minute coverage-guided fuzz runs without ASan. Live on the dev VM, between two machines, through real routers, CGNAT, IPv6, a VPN and on Windows NEEDS-DEVICE; the default STUN servers' live check NEEDS-DEVICE |
 | Unattended access end to end (M-FEAT-4, M-FEAT-5, M-UI-5) | the grant wizard in Settings › Security, the window's Connect with password, `tornect connect --unattended` (Linux), passwords remembered in the system keychain, the emergency stop code | VERIFIED (unit, and the real host over a pipe); a live unattended session over Tor is OPEN; polkit's dialog and Windows' secure prompt NEEDS-DEVICE |
-| The Windows control channel (M-FEAT-5, `53efbaf1`) | `tornect panic` and the `unattended` commands reach a Windows host through a named pipe only this account can open | VERIFIED (unit) for the rules that need no Windows, type-checked for Windows; NEEDS-DEVICE(windows) |
-| A Windows window without a console (`da36aba9`) | double-clicking opens no console; command-line runs use `start /wait` | type-checked only; NEEDS-DEVICE(windows) |
+| The Windows control channel (M-FEAT-5, `b1bf5888`) | `tornect panic` and the `unattended` commands reach a Windows host through a named pipe only this account can open | VERIFIED (unit) for the rules that need no Windows, type-checked for Windows; NEEDS-DEVICE(windows) |
+| A Windows window without a console (`c7dd9671`) | double-clicking opens no console; command-line runs use `start /wait` | type-checked only; NEEDS-DEVICE(windows) |
 | Install, uninstall and start at sign-in (M-FEAT-6, M1-58, M1-69, M1-88, M1-89) | `tornect install` into `~/.local/bin` (with the pinned lyrebird) or `C:\Program Files\Tornect`; the start at sign-in runs the window in the background; the Linux zip carries polkit's policy file (`polkit/org.tornect.policy`) | VERIFIED (unit); NEEDS-DEVICE(linux-desktop) with polkit's policy file, NEEDS-DEVICE(windows). The Windows install carries the pinned `lyrebird.exe` in the same elevated copy as `tornect.exe` (decision M1-88 (2), W4): VERIFIED (unit), NEEDS-DEVICE(windows) |
 | The code audit of 2026-10-22 (findings B01 to B32) and the final audit before this release (F1 to F9) | each fixed with a test that fails without it, except the open items under *Known limitations* | VERIFIED (unit); the Windows and desktop halves NEEDS-DEVICE as their rows say |
 | Logs | a release build writes warnings and errors only; `--log debug` for a bug report | VERIFIED (unit); a release binary NEEDS-DEVICE(the build VM) |
@@ -340,44 +340,44 @@ and its tests against the plan's threat model (`docs/PLAN.md` §B.6, §B.8), not
 Critical or High issue; every Medium was fixed.
 
 - **Up to slice.1** (unchanged): the window, the viewer's input, the "Tornect: sharing" window, the Windows build,
-  the packaging and start at login (`0e3afea..2480dfb`, `2480dfb..75f6df8`), the Wayland backend
-  (`d1ef55b..0e3afea`), the fix-closure checks and the release preparation up to `bd8178a`: three Mediums, all
-  fixed; RUSTSEC-2026-0285 (rustls) fixed by rustls 0.23.45 (`00bc286`).
+  the packaging and start at login (`0c79e86..dbfd6f1`, `dbfd6f1..902bce8`), the Wayland backend
+  (`122fa93..0c79e86`), the fix-closure checks and the release preparation up to `69ba7be`: three Mediums, all
+  fixed; RUSTSEC-2026-0285 (rustls) fixed by rustls 0.23.45 (`e22a22d`).
 - **The redesign and unattended access** (2026-09-27 to 2026-10-09): reviewed in rounds whose findings were fixed
   or recorded before the tag (`docs/VERIFICATION.md`, the sections *Before the tag: …*).
 - **The code audit of 2026-10-22** (findings B01 to B32, *Audit fixes*): each fixed with a test, or open as listed
   above.
 - **Invitations** (M1-73): a self-review (one Low open, LOW-1 above) and an independent security and correctness
-  review of `4929ae57..8e9b954b` (0 blocker, 0 major, 11 minor; 10 fixed, one recorded). **The fixes after it
-  (`8e9b954b..0cb245d5`) have had no security review of their own** (OPEN).
+  review of `aae7e1a3..3fa9b974` (0 blocker, 0 major, 11 minor; 10 fixed, one recorded). **The fixes after it
+  (`3fa9b974..ef64b878`) have had no security review of their own** (OPEN).
 - **Quality presets** (M1-74): a security reviewer's run per part, and final security and correctness reviews of
-  `9af40339..d2c453fe` (security: 6 minor; correctness: 2 major, 5 minor), each finding fixed or answered.
-- **Switching screens** (M1-75): a security review of the whole feature (`d1eb85d4..fdb072d0`) by a session that
-  wrote none of it, and a final security and correctness review of `d1eb85d4..904904e9`: six minor findings, fixed.
+  `a31c1a8d..6f61942a` (security: 6 minor; correctness: 2 major, 5 minor), each finding fixed or answered.
+- **Switching screens** (M1-75): a security review of the whole feature (`3285c9ee..b6702f81`) by a session that
+  wrote none of it, and a final security and correctness review of `3285c9ee..a23df56c`: six minor findings, fixed.
 - **Chat, clipboard and files** (M1-76): security reviews of its steps, a security review of the services diffs
-  (`c6a40bb2..d7a329db`: one Medium, fixed in `d7a329db`) and a final security and correctness review of
-  `c6a40bb2..96b67647`: five minor findings, fixed.
+  (`4a49fac5..833799f4`: one Medium, fixed in `833799f4`) and a final security and correctness review of
+  `4a49fac5..acb7a16f`: five minor findings, fixed.
 - **Direct connections** (M1-77 to M1-87): reviews of each step, a security review of the whole feature (step C2:
-  no code defect, one coverage gap closed) and a final security and correctness review of `cc918b56..1aeaea49`:
-  three minor findings, fixed in `0ac8dd03`, `625aabdc` and `03cbfc95`.
-- **The final audit before this release** (2026-10-28): two major and seven minor findings, fixed in `66c03834`,
-  `81c17944`, `9a64b5f9`, `0a503bd1` and `5a507b1f`; the Windows half of F1/F4 was ruled W4 (decision M1-88 (2)):
+  no code defect, one coverage gap closed) and a final security and correctness review of `36f729f6..c658bdf4`:
+  three minor findings, fixed in `cc985c3c`, `ce9fb274` and `cdc83520`.
+- **The final audit before this release** (2026-10-28): two major and seven minor findings, fixed in `28d4d5ef`,
+  `9ed69934`, `6cfac495`, `6af03d95` and `ef094cee`; the Windows half of F1/F4 was ruled W4 (decision M1-88 (2)):
   the install's one elevated copy carries the pinned `lyrebird.exe` beside `tornect.exe`.
 - **The final pass's security review** (2026-10-29), of the final audit's fixes and the documentation up to
-  `9f321b31`: eight minor findings, fixed in `2ed94086`, `4f4f9d58`, `e3edcd15`, `36ca36db`, `6aa3fc8b` and
-  `ce17dee3`.
+  `fdd5b551`: eight minor findings, fixed in `8ac80c84`, `1998a119`, `d72485a3`, `0ffdbfae`, `dfc7797c` and
+  `c7ce2598`.
 - **The reviews of the final pass's fixes** (2026-10-29): a security review of the documentation pass's code
-  (`86996906`, `80b39b1e`, `6c2b2606`, `7ccea43a`, `d780b1da`, `9e005a1e`) and one of the review's fixes and W4
-  (`937a971c..2371f154`): one major finding (nothing read the polkit policy the Linux zip ships) and eleven minor
-  ones, fixed in `0d965ec7` to `f0f68f84`. A review of those fixes (`6cd03d8c..a0db7122`) found four minor ones,
-  fixed in `0339372f` (the policy check reads the file's prolog as fixed text), `36e15907` (a glibc version a few
-  words after "glibc" in a README stops `dist`), `5755ae42` (the READMEs' last claims that nothing asks the router
-  or a server) and `1baefa4d` (a Windows device recipe's expected message, with a test).
+  (`dd7d94fb`, `d954c291`, `73906909`, `f2aac947`, `36e607e3`, `1e6ca1c0`) and one of the review's fixes and W4
+  (`f9d7fd91..9278f636`): one major finding (nothing read the polkit policy the Linux zip ships) and eleven minor
+  ones, fixed in `906cd269` to `1af5ed22`. A review of those fixes (`a90ab067..d71a1da5`) found four minor ones,
+  fixed in `c7455ca9` (the policy check reads the file's prolog as fixed text), `c2b10532` (a glibc version a few
+  words after "glibc" in a README stops `dist`), `2c1e1e27` (the READMEs' last claims that nothing asks the router
+  or a server) and `33266a87` (a Windows device recipe's expected message, with a test).
 
 **Not reviewed:** the code commits no security review has read: the fixes of the last review's four findings
-(`0339372f`, the policy file's prolog; `36e15907`, dist's glibc check; `5755ae42`, the READMEs and their drift test;
-`1baefa4d`, a test of the Windows uninstall), and any code among the commits that the owner's release run adds up to
-`@@COMMIT@@`. Every other code commit after `9f321b31`, the last one the final pass's security review read, was read
+(`c7455ca9`, the policy file's prolog; `c2b10532`, dist's glibc check; `2c1e1e27`, the READMEs and their drift test;
+`33266a87`, a test of the Windows uninstall), and any code among the commits that the owner's release run adds up to
+`@@COMMIT@@`. Every other code commit after `fdd5b551`, the last one the final pass's security review read, was read
 by one of the reviews above. The commits after it that change only documentation or comments need no security
-review and had none: `e104375a`, `686db830`, `2444aa47`, `937a971c`, `9a7c7580` (two doc comments), `6cd03d8c` and
+review and had none: `0479618c`, `a7736691`, `126302ae`, `f9d7fd91`, `7f694a5e` (two doc comments), `a90ab067` and
 the closing gate's commit that wrote this list.

@@ -7,8 +7,8 @@ Paste the block under **HAND-OFF** into a new session.
 ## HAND-OFF
 
 Continue building Tornect from this repository (branch `main`; the remote `origin` is the private GitHub
-repository). **Push state when this was written:** `origin/main` = `6b0da44`; the 33 commits `b09d919` …
-`51f4be3` and the documentation commits of 2026-09-24 (this file's among them) were local, due for a push
+repository). **Push state when this was written:** `origin/main` = `da92fa2`; the 33 commits `7f32009` …
+`b356095` and the documentation commits of 2026-09-24 (this file's among them) were local, due for a push
 **without a tag**. Check `git status -sb` and `git log --oneline origin/main..` first.
 
 The operator's goal for this run:
@@ -45,7 +45,7 @@ days old).
 
 ### STATE (2026-09-24)
 
-**Gate: green at 634 passed, 0 failed, 5 ignored** at `51f4be3`, cargo-deny ok. The 5 ignored tests need a
+**Gate: green at 634 passed, 0 failed, 5 ignored** at `b356095`, cargo-deny ok. The 5 ignored tests need a
 person, the network or the user's systemd: the live portal check, the polkit round trip, the systemd round trip
 and the two live Tor tests.
 
@@ -63,11 +63,11 @@ and the two live Tor tests.
 - **Start at login (M1-53):** `tornect service install`, `uninstall` and `status` (a systemd user unit; a Task
   Scheduler task from XML); the Linux start-at-login host answers pings only; the operator's three defaults and
   the `--elevated` refusal for standard accounts.
-- **Reviews:** slice E (`0e3afea..2480dfb`), slice F (`2480dfb..75f6df8`), the fix-closure check and the
-  release-preparation review, up to `bd8178a`: no Critical or High, every Medium fixed. **Unreviewed:**
-  `d1ef55b..0e3afea` (the Wayland backend with `pipewire.rs`'s unsafe FFI), and everything after `bd8178a`
-  (`51f4be3`, a test, and the documentation).
-- **Release verification** at `bd8178a`: all PASS; its one finding, T-1, is fixed in `51f4be3`.
+- **Reviews:** slice E (`0c79e86..dbfd6f1`), slice F (`dbfd6f1..902bce8`), the fix-closure check and the
+  release-preparation review, up to `69ba7be`: no Critical or High, every Medium fixed. **Unreviewed:**
+  `122fa93..0c79e86` (the Wayland backend with `pipewire.rs`'s unsafe FFI), and everything after `69ba7be`
+  (`b356095`, a test, and the documentation).
+- **Release verification** at `69ba7be`: all PASS; its one finding, T-1, is fixed in `b356095`.
 - **Not verified, honestly:** the window over real Tor with a person at the screen (**NOT PERFORMED three
   times**: 2026-09-23 02:27 and 22:53, 2026-09-24 01:14, each time the windows up, both hosts `REACHABLE`,
   nobody at the VM screen); keys over Tor, and any input over Tor in a live run; the polkit path live; anything on
@@ -82,7 +82,7 @@ and the two live Tor tests.
      screen; three attempts ended with nobody at the screen. Run the check early in a session, while the operator is
      available.
    - Rebuild first (`cargo build -p tornect` in a scope, about 2–3 min): the relaunch kit
-     (`target/tornect-test/phase_b3/relaunch.sh`) runs the `6b0da44` build, which predates the signal handling,
+     (`target/tornect-test/phase_b3/relaunch.sh`) runs the `da92fa2` build, which predates the signal handling,
      N-1, N-4, P2-I4 and T-1. No other build beside the check.
    - The windows: a Wayland host, a `--no-host` client, and a second host whose capture and XTEST run on a
      private Xvfb `:99` holding a zenity entry box (two windows are titled "Tornect": tell them apart by the ID
@@ -130,7 +130,7 @@ and the two live Tor tests.
    `ServerKeyPin`); the §B.8.14 M1 acceptance needs it. Before unattended connects are wired on Wayland (Security
    §10, M1-48): the §B.8.8 budget (a 5 s dialog, and no dialog at all without a valid token: `HOST_NOT_READY`),
    and at M4 the block window and the indicator closing their gaps.
-8. **A hostile review of `d1ef55b..0e3afea`** (the Wayland backend, `pipewire.rs`'s unsafe FFI, the portal and
+8. **A hostile review of `122fa93..0c79e86`** (the Wayland backend, `pipewire.rs`'s unsafe FFI, the portal and
    token handling, the idle ping, the slice-D fixes). Freeze the range on a worktree and start the review first; ask
    the operator what size to run, and when.
 9. **M5 items:** a ScreenCast-only portal session for view-only sessions (ruled for M5), and downscaling before
@@ -156,7 +156,7 @@ and the two live Tor tests.
   older glibc needs a container or cargo-zigbuild, neither installed.
 - **Cosmetic:** a long IPC refusal is cut at 256 characters mid-word (seen under Wine); the pings-only host still
   prints its "sharing: this desktop …" line.
-- **Earlier lists that stay valid** (the eighth session's hand-off, in git history at `ece3752`): the open
+- **Earlier lists that stay valid** (the eighth session's hand-off, in git history at `2f83aaf`): the open
   slice-C infos (C1-4, C1-5 (b), C1-7, C2-3 to C2-7, C3-7); the slice-B lows; the Wayland UNVERIFIED items
   (GNOME dismissing the dialog on `Session.Close`, "Remember This Selection", the token's app-id binding, zbus
   trace logging, the first picture of a static screen, `pipewire.rs`'s unsafe code); O1 and the cross-process
@@ -222,18 +222,18 @@ and `docs/notes/m1-state.md` updates.
 
 ## What the sessions of 2026-09-23 and 2026-09-24 did
 
-- **2026-09-23:** the window (`9b61b17` … `d370207`) and its first console attempt (02:27, NOT PERFORMED); the
-  sharing indicator (`f509f7c`, `164461b`); the Windows build of the whole app (`bd3ef35` … `10090a3`); `pt-fetch`,
-  `dist` and B3-6 (`0135ddd` … `2480dfb`); start at login (`8a7ddbb`, `95f455e`, `75f6df8`); the slice-E review;
-  its fixes (`49e29f7` … `dea1f35`); the second console attempt (22:53, NOT PERFORMED); the slice-F review and its
-  two Mediums fixed (`e7c83bd`, `22aa1ce`) with F1-3 and F2-2 (`7242cad`, `6b0da44`). Push 5: `origin/main` =
-  `6b0da44`.
+- **2026-09-23:** the window (`0ad2171` … `cd45f6d`) and its first console attempt (02:27, NOT PERFORMED); the
+  sharing indicator (`87d4c58`, `c47bb46`); the Windows build of the whole app (`d6196a8` … `91c89a1`); `pt-fetch`,
+  `dist` and B3-6 (`2118518` … `dbfd6f1`); start at login (`f08645f`, `68063dd`, `902bce8`); the slice-E review;
+  its fixes (`8232e13` … `d2eebf3`); the second console attempt (22:53, NOT PERFORMED); the slice-F review and its
+  two Mediums fixed (`826381c`, `6fffefa`) with F1-3 and F2-2 (`61fc001`, `da92fa2`). Push 5: `origin/main` =
+  `da92fa2`.
 - **2026-09-24:** the third console attempt (01:14, NOT PERFORMED, behind a presence gate); the fix-closure check
-  (phase 2a: 13 of 13 closed); the remaining fixes (`b09d919` … `3259031`: E2-2, E2-4, the `--elevated` refusal,
+  (phase 2a: 13 of 13 closed); the remaining fixes (`7f32009` … `556e6e9`: E2-2, E2-4, the `--elevated` refusal,
   F2-3, F2-4, F1-2, F1-5, default 3, N-1, E2-7, the window's signals); phase 2b; the release preparation
-  (`00bc286` … `bd9a095`: RUSTSEC-2026-0285, the advisory database in the gate and `BUILD-INFO.txt`, the licence
-  texts); phase 2c and its fixes (`fe7e02e` … `bd8178a`: N-3, N-4, L-1, L-2, I-2, I-3, P2-I1 … P2-I4, the host name
-  out of the code); the release verification and T-1 (`51f4be3`); these documentation commits (decisions M1-50 …
+  (`e22a22d` … `1b311de`: RUSTSEC-2026-0285, the advisory database in the gate and `BUILD-INFO.txt`, the licence
+  texts); phase 2c and its fixes (`37b224d` … `69ba7be`: N-3, N-4, L-1, L-2, I-2, I-3, P2-I1 … P2-I4, the host name
+  out of the code); the release verification and T-1 (`b356095`); these documentation commits (decisions M1-50 …
   M1-54, Part G, the ledger, the release notes, `CLAUDE.md`, the host name out of every doc).
 
 **Honest limits:**
@@ -241,6 +241,6 @@ and `docs/notes/m1-state.md` updates.
   injected live.
 - Nothing has run on a Windows machine: Wine only.
 - The polkit path has not run live; the start-at-login run used the debug build's re-authentication escape.
-- `d1ef55b..0e3afea` has had no hostile review.
+- `122fa93..0c79e86` has had no hostile review.
 - The pre-release is not tagged; its notes' fields stay unfilled until the final `dist`. `m1` is not tagged,
   and CI has never run.

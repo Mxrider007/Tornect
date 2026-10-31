@@ -6,22 +6,22 @@ checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
 is implemented in this container: B1 to B7 (2026-10-27), B8 to B13 (2026-10-28; "OPEN, owned by
-Phase B steps" below). **`INTERNET_DIRECT` is `true` since step B12 (`c1ec5a15`).** No tag was
+Phase B steps" below). **`INTERNET_DIRECT` is `true` since step B12 (`a4af339f`).** No tag was
 made; what the dev VM and real networks still owe is listed under B12 and B13 below. **The close
 is done (2026-10-28):** C1 wrote the final text of decisions M1-77 to M1-86 and the plan's final
 words (the threat model included), C2 reviewed the whole feature's security and found no code
 defect (the C1 and C2 entries at the end of "OPEN, owned by Phase B steps"); the review of C1 and
 C2 corrected the live demos' expected lines for two instances on one VM, which never go direct on
 the site (decision M1-82 item 11). The feature's final review (security and correctness) found three
-minor defects, fixed in `0ac8dd03`, `625aabdc` and `03cbfc95` (the last entry but one of "OPEN,
+minor defects, fixed in `cc985c3c`, `ce9fb274` and `cdc83520` (the last entry but one of "OPEN,
 owned by Phase B steps"). The closing pass (the whole workspace's gates and a ledger audit against
 the design's acceptance items) fixed one more gap, the second unique-local address offered but never
-usable (`6b7d91e3`), and corrected eleven stale ledger statuses (the last entry). What is left
+usable (`446af445`), and corrected eleven stale ledger statuses (the last entry). What is left
 before `m2` is the owner's: the three blockers below, then the tag.
 
 ## Blockers: no release zip to users, no `m2` tag
 
-Since `c1ec5a15` every default-configured session sends this computer's IP address and the
+Since `a4af339f` every default-configured session sends this computer's IP address and the
 session's time to one public STUN server of its part of the default list (design §5.3, §5.4;
 decision M1-81). Two of the four operators (Twilio, Nextcloud) were never checked live, and
 whether Google's and Nextcloud's lack of published terms for third-party use fails §5.4's terms
@@ -74,7 +74,7 @@ checked against the resolver first; it is no reason by itself to replace a serve
 
 ## Commits
 
-Seventy-odd commits from `34e5bfbd` (A1, the pins) to the docs commit of checkpoint A22, built in
+Seventy-odd commits from `acf9b112` (A1, the pins) to the docs commit of checkpoint A22, built in
 the design's §15 order: A1 pins and decision rows M1-77 to M1-86; A2/A3 the cancel-safe channel;
 A4 the signal wire (`CANDIDATES`, `CANDIDATES_DONE`, `TOR_FALLBACK`, `dir1`); A5/A6 the path seam
 and the transport knob; A7 telemetry quiet targets and the address classes and filters; A8 the
@@ -82,38 +82,38 @@ session socket (`QuietUdp`, `PunchSocket`); A9 the pinned QUIC; A10/A11 probes a
 A12/A13 `DirectLink`, `LoopbackNet`, `MemNet`; A14/A15 `BindProof` and the direct bind; A16
 `DirectHost`; A17 `choose_path`; A18/A19 the binaries; A20/A21 the window, the switch and the
 consent copy; each followed by its ledger commit and, for A9, A14/A15, A17 and A18/A19, a security
-review and its fixes. `git log --oneline 34e5bfbd^..HEAD` lists them.
+review and its fixes. `git log --oneline acf9b112^..HEAD` lists them.
 
-Checkpoint A22 (this session, base `6a4bc7c9`):
+Checkpoint A22 (this session, base `406627b4`):
 
-- `68df1347` fix(core): `punch_timeout_ms` must be 1000 to 10000 and a fixed `direct_port` 1024 or
+- `e5403c22` fix(core): `punch_timeout_ms` must be 1000 to 10000 and a fixed `direct_port` 1024 or
   above (`Config::validate`).
-- `5b4c6921` test(fuzz): `to_wire`/`from_wire` moved into `direct/wire.rs`, which the `candidates`
+- `2e60d8e9` test(fuzz): `to_wire`/`from_wire` moved into `direct/wire.rs`, which the `candidates`
   target compiles through `#[path]` and drives into `RemoteFilter::admit`.
-- `4286c96d` feat(xtask): `dist` refuses a release graph that enables `tornect-net`'s
+- `423b3158` feat(xtask): `dist` refuses a release graph that enables `tornect-net`'s
   `test-support`.
-- `45f49a35` test(session): whole direct sessions on loopback sockets, the redaction e2e and
+- `678d8cb2` test(session): whole direct sessions on loopback sockets, the redaction e2e and
   `direct_loopback_stats` (`quinn` became a dev-dependency of tornect-session for the raw send).
-- `4f82c0fb` fix(session): a doc link the wire move broke (only rustdoc saw it).
-- `cea42a1c` feat(session): the link's counters at debug (`direct path open` on the viewer,
+- `7cc9f0e7` fix(session): a doc link the wire move broke (only rustdoc saw it).
+- `22b387b3` feat(session): the link's counters at debug (`direct path open` on the viewer,
   `direct link closed` on the host) so design §13 rows 2 and 11 can be read off a live session.
 - the docs commit: decision notes on M1-79, M1-82, M1-83, the ledger rows, this note.
 
 The security review of the Phase A diff found no defect (ledger row "Checkpoint A22: the security
 review of the Phase A diff" lists what was judged).
 
-The final security and correctness reviews of the whole Phase A diff (fixes after `d6adb5a4`;
+The final security and correctness reviews of the whole Phase A diff (fixes after `61708b3f`;
 ledger rows "Final review: …"):
 
-- `8e15f2d4` fix(session): an onion `Bind` is told `TRANSPORT` only after its MAC verified.
-- `3f68da92` fix(session): a kill lets live direct media end through its teardown (within
+- `50e23d45` fix(session): an onion `Bind` is told `TRANSPORT` only after its MAC verified.
+- `26c86437` fix(session): a kill lets live direct media end through its teardown (within
   `DIRECT_DRAIN`) before the link closes.
-- `83df7047` fix(signal): `departure` reads one byte past an early frame, so B04 holds again for a
+- `ed3ccd24` fix(signal): `departure` reads one byte past an early frame, so B04 holds again for a
   requester that sent one frame and left.
-- `6c96c327` fix(signal): the viewer's `ping` queues at most a session's worth of host path frames.
-- `82b539a0` docs(net): the session socket's port is not exclusive on Windows or macOS
+- `36961bb2` fix(signal): the viewer's `ping` queues at most a session's worth of host path frames.
+- `557e041c` docs(net): the session socket's port is not exclusive on Windows or macOS
   (`SO_EXCLUSIVEADDRUSE` not set; device check added to §13 rows 12 and 13).
-- `dd76eadf` docs: decisions cited by their M1 rows.
+- `a0634442` docs: decisions cited by their M1 rows.
 - the docs commit: ledger rows, the B04 and A2 residual, decision notes on M1-79 and M1-80.
 
 ## Before `m2a` (all [VM] or device; recipes in the ledger)
@@ -157,11 +157,11 @@ and the crates below ring check here).
   `NoMapper` everywhere. Left from it: the Windows `GetBestRoute2` run, the netdev gateway on a
   desktop and on macOS, the live STUN check (NEEDS-DEVICE rows) and the owner's call on the Google
   and Nextcloud terms (OPEN until B12).
-- B2 (done 2026-10-27, `322fda87`): the Binding codec (`tornect_net::stun`, the bare 20-byte
+- B2 (done 2026-10-27, `5d52585b`): the Binding codec (`tornect_net::stun`, the bare 20-byte
   request, `parse_response` with the RFC 8489 §6.3.3 discard rule), all four RFC 5769 vectors
   transcribed and recomputed, the `stun` fuzz target with its seeds. Left from it: the 10-minute
   campaign on the dev VM (NEEDS-DEVICE row, recipe in the ledger and in the target's header).
-- B3 (done 2026-10-27, `a6cf881f`, `9f04aae2`, `b88a7048`): the four-operator default list, its
+- B3 (done 2026-10-27, `bff44b6a`, `bb142b38`, `a2b19d0c`): the four-operator default list, its
   migration and its bounds (`tornect-core` config), `stun::partition`, `gather::ask_stun` (random
   first server, a second at 750 ms of another operator where there is one, RTO 500 ms, at most 2
   servers and 4 requests in the 1500 ms budget, replies only from the address asked under its
@@ -170,12 +170,12 @@ and the crates below ring check here).
   left for B6: the link's gathering task reading `tees.stun` and calling `ask_stun` with this role's
   part, `stun_base` combined with the scope, `enable_stun` and the mapping's head start, the
   `DirectParams`/`DirectOptions` STUN fields (the second ULA design gap was listed here as well,
-  but B6 did not take it up: settled at the feature's close, `6b7d91e3`, one ULA offered). Left
+  but B6 did not take it up: settled at the feature's close, `446af445`, one ULA offered). Left
   for B11/B12: the
   app's `RealNet::prefetch` call, with a list that is empty whenever STUN may not run (design
-  §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged); B11 wired it (`856e101a`,
+  §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged); B11 wired it (`e464d2b7`,
   `RouterPorts::follow_stun`), B12 turns the list on.
-- B2/B3 review fixes (2026-10-27, `d59f0c15`, `25e4161f`, `f8e7bea3`, `d7fa045c`; ledger rows
+- B2/B3 review fixes (2026-10-27, `1d2cd2d1`, `6ef7861c`, `c6e86c1c`, `3b4ce607`; ledger rows
   "Review of steps B2 and B3", decision M1-81's review note): `RealNet::resolve` looks a name up
   at session time only while `StunDns::refreshed()` is false (no round since the cache was made or
   cleared); after a round a miss is `NotFound` at once. The operator split is only disjoint when
@@ -185,11 +185,11 @@ and the crates below ring check here).
   `tunnel: vpn.then_some(base)`; B11 restarts `prefetch` on every settings save and every change of
   the bridge state (a cleared cache stays cold, and a newly listed name is answered only after the
   next round), words `STUN_LINE` with "when both computers use the same list" (and may add a doctor
-  note when the list is not the default) — all three done at B11 (`856e101a`; the refresh restarts
+  note when the list is not the default) — all three done at B11 (`e464d2b7`; the refresh restarts
   when its names change, which a save or a bootstrap may do); C1 puts the same-list condition into
   M1-81's final text and the plan's threat model, and §13 rows 10/11 (B13) include the
   split-tunnel case whose recipe is in the ledger.
-- B4/B5 (done 2026-10-27, `48626004`, `5209419a`, `798fb61a`; ledger rows "Step B4", "Step B5" and
+- B4/B5 (done 2026-10-27, `2116049f`, `4ec31098`, `269f34cd`; ledger rows "Step B4", "Step B5" and
   "Steps B4 and B5", decision M1-81's step note): `RealMapper` (PCP with our own nonce and NAT-PMP
   through crab_nat, UPnP-IGD through igd-next with the unicast search first and the gateway check),
   `MappingLedger` under `Paths::router_ports_dir()` (one locked list per running process),
@@ -202,8 +202,8 @@ and the crates below ring check here).
   SHUTDOWN_RELEASE_WAIT)` at exit, and the link holding the `Mapping` with `keep_renewed` beside
   the session. Left as NEEDS-DEVICE: the `FakePcp` tests on Windows (Wine cannot run them) and on
   macOS (`lo0` aliases), and real routers (design §13 row 4, after B12).
-- B6/B7 (done 2026-10-27, `b9b55f1b`, `9236a7bc`, `515cf9d5`; review fixes 2026-10-28, `0d993c85`,
-  `5a315cd6`, `15a69006`; ledger rows "Step B6", "Step B7" and "Steps B6 and B7", "Review of steps
+- B6/B7 (done 2026-10-27, `8f31bab4`, `ca430487`, `cd5e6ca0`; review fixes 2026-10-28, `cc4304e7`,
+  `c0954777`, `f6d19142`; ledger rows "Step B6", "Step B7" and "Steps B6 and B7", "Review of steps
   B6 and B7", decision M1-81's notes): `gather::plan` (`GatherConfig` in `DirectParams`, from
   `DirectOptions::gather(role)`: this role's part of the STUN list, `enable_stun`, the router
   switches) and the gathering task (`gather::Gatherer`): router from the bind, STUN after the 250 ms
@@ -226,13 +226,13 @@ and the crates below ring check here).
   `sessions.log` through two handles with no lock between them (OPEN row; the unattended connect
   lines already did). Left as NEEDS-DEVICE: the real router run of the sweep and the release, on a
   home with unattended access on (after B12).
-- B8 (done 2026-10-28, `015554ce`; ledger rows "Step B8"): `NatBox` in `MemNet` (EIM/ADM/APDM
+- B8 (done 2026-10-28, `e2bf7fda`; ledger rows "Step B8"): `NatBox` in `MemNet` (EIM/ADM/APDM
   mapping, EIF/ADF/APDF filtering, port preservation, hairpin, forwards, the 30 s timeout,
   `translate: false` firewalls, boxes in a row, the fates `NoMapping`/`NatFiltered`/`NoHairpin`,
   `WireRecord.seen_from`, `MemUdp::spoof_as`), `MemStun` (honest, lying, silent), `MemNet::name`,
   `MemMapper` (`Ok`, `Grant(d)`, `Lie(ip)`, `Refuse`, `PermanentOnly`, off; `router_log()`,
   `forwards()`) and `MachineSpec::gateway`; all test-only (`cfg(test)` or `test-support`).
-- B9 (done 2026-10-28, `46893628`, `01419e3d`, `1f2ab1c6`, `45e97b30`, `c0cab646`; ledger rows "Step
+- B9 (done 2026-10-28, `cb0a3284`, `af012e61`, `ac2c8ee2`, `b694627d`, `c8291f30`; ledger rows "Step
   B9", decisions M1-82, M1-83 and M1-87): `ViewerDirect::with_internet` and
   `DirectHost::with_internet` (`cfg(test)`; release builds keep `INTERNET_DIRECT`); the design §12.4
   matrix in `tornect-session` `tests::direct_nat` (23 tests: both FSMs, a 500 ms `LaggedDuplex`,
@@ -250,11 +250,11 @@ and the crates below ring check here).
   subnets is read as the code behaves (the viewer's label stays internet, the host's same-site;
   never relabelled, never inferred from the address class); 20 % loss is stated as a rate (at
   least 3 of 8 seeds direct; measured 4 of 8, the rest `Quic` by 4.2 s or `NoPath` at 4.0 s), the
-  real rate measured at B13; the `BYE` racing `TOR_FALLBACK` is fixed (`831b9856`,
+  real rate measured at B13; the `BYE` racing `TOR_FALLBACK` is fixed (`10d37234`,
   `PathExchange::heard`). C1's wording for the 1.5 s row is in M1-82's notes. Left as
   NEEDS-DEVICE: the matrix between real networks (design §13 rows 3 to 11), with one recipe per
   row in the ledger ("Step B13 recipe: design §13 row N", 2026-10-28).
-- B10 (done 2026-10-28, `1f788b8d`, `27597483`, `d4cbd71c`, `a8cfd817`; ledger rows "Step B10";
+- B10 (done 2026-10-28, `46339a2c`, `3bfb2670`, `a1b892a8`, `a6b15bbc`; ledger rows "Step B10";
   decisions M1-74, M1-76, M1-84 and M1-85's notes): quality: `Route::Direct`, the direct row of the
   presets (Balanced 1080p30 at 6 Mbit/s, Best performance 720p60 at 4 Mbit/s, Best quality 30 fps
   at 12 Mbit/s or `[media] max_bitrate_kbps`), picked by the host from the claimed path, a 300 ms
@@ -270,16 +270,16 @@ and the crates below ring check here).
   the peer and the path; the claim check under the registry lock; the late-bound slot; the 5 s
   bound; `services_bind_mac_direct`; the quantizer ranges, window floors and least bitrate of the
   Tor rows; the stream-count test's composition. Left as NEEDS-DEVICE: the direct row and the
-  4 MiB window measured on real paths (ledger rows, after B12). `a8cfd817` fixed a `cargo doc`
-  failure `27597483` brought in (a public doc linking a crate-private constant). Review fixes
+  4 MiB window measured on real paths (ledger rows, after B12). `a6b15bbc` fixed a `cargo doc`
+  failure `3bfb2670` brought in (a public doc linking a crate-private constant). Review fixes
   (2026-10-28, ledger rows "Step B10 review fix"): the services stream runs on a task of its own and
   its end (services design §6.3 step 5: `Close{code}`, the summary, controls and workers) runs at
-  every host end, a kill and a device end included (`1b0f0b9c`); the viewer's services handle comes
+  every host end, a kill and a device end included (`49f61bb7`); the viewer's services handle comes
   with the bound media only (`DirectBound`) and a failed bind shuts the link before `TOR_FALLBACK`
-  (`5fc38220`); the second stream's credit is given per connection, after the claim, by a host with
-  services (`929f0e6d`); a kill seen as the port closes still takes the kill's goodbye (`6d76c23c`);
-  a viewer whose write fails after the host's end ends as the host's `Close` says (`42b7dfb8`).
-- B11 (done 2026-10-28, `f20c9b17`, `856e101a`, `acf4730c`; ledger rows "Step B11"; decisions
+  (`6ded0551`); the second stream's credit is given per connection, after the claim, by a host with
+  services (`b49474a8`); a kill seen as the port closes still takes the kill's goodbye (`e7c616fc`);
+  a viewer whose write fails after the host's end ends as the host's `Close` says (`a7a2b116`).
+- B11 (done 2026-10-28, `80543d4e`, `e464d2b7`, `e581196b`; ledger rows "Step B11"; decisions
   M1-81 and M1-84's notes): every Phase B word is written and drawn, picked by `Settings::internet`
   (the constant outside tests) or an `internet` argument, so this build still shows Phase A's and
   B12's flip changes no test. Settings, Connection: the Phase B switch, `DIRECT_HOW_INTERNET`,
@@ -300,7 +300,7 @@ and the crates below ring check here).
   puts it in M1-81's final text). The two tests the B10 review left (`lan_only` services on the
   link; a second stream while `ServicesSlot` is unset) are written. Left as NEEDS-DEVICE: the
   window's Phase B page, notice and consent line on a desktop after B12 (ledger row).
-  Review fixes (2026-10-28, `b425e7a9`, `5e21e924`, `9a827a91`, `2d3eaaac`, `3d742bba`; ledger
+  Review fixes (2026-10-28, `e171ea28`, `78e797d7`, `4bac2603`, `94d2923f`, `c9e8b2e5`; ledger
   rows "Review of step B11"; decisions M1-81, M1-84 and M1-86's notes): the STUN names'
   refresh no longer starts when a process starts (a config with `tor.bridges = "auto"` reads as
   plain Tor before the bootstrap): `DirectKnobs::tor_known` is false until the first
@@ -313,9 +313,9 @@ and the crates below ring check here).
   `run_connect` and the window's Tor arm is by inspection (they need Tor); the gate holds
   whatever the call site. One flake seen once in the full app suite
   (`the_terminal_hosts_services_leave_the_session_without_them`, OPEN row).
-- B12 (done 2026-10-28, `6ef9372e`, `ed5b6010`, `c1ec5a15`; ledger rows "Step B12"; decision
+- B12 (done 2026-10-28, `3f29a872`, `ab3bea07`, `a4af339f`; ledger rows "Step B12"; decision
   M1-78's note): `INTERNET_DIRECT = true`, flipped once the full MemNet suite and the redaction
-  e2e were green on the base `b6efd48a` (tornect-net 306 passed, tornect-session 388 passed, the
+  e2e were green on the base `3d8f8b0a` (tornect-net 306 passed, tornect-session 388 passed, the
   23 matrix rows and the e2e among them) and again after the flip (tornect-session 389 passed with
   the new row `this_build_goes_direct_over_the_internet`, which runs the halves as the app builds
   them; the app's tests 880 passed as `tester`). Two tests that pinned the Phase A scope through
@@ -323,7 +323,7 @@ and the crates below ring check here).
   after the flip reads 29.8 fps, `BindOk` 118 ms after the accept. New: the ignored
   `tornect-net` integration test `live_stun` (design §12.5 Phase B), run on the dev VM. The plan's
   M2 text says Phase B is built (a minimal edit; C1 writes the final text). The leftover flake of
-  the B11 review is settled (`6ef9372e`: the count was read before the refused stream's task
+  the B11 review is settled (`3f29a872`: the count was read before the refused stream's task
   ended; 100 runs in four parallel copies clean). Left as NEEDS-DEVICE (ledger rows, recipes):
   the live STUN run, two instances on one VM (`ROUTE tor no-path`, or `direct internet` through
   a hairpinning router, since the review of steps C1 and C2), the bridge demo, the `host`
@@ -344,7 +344,7 @@ and the crates below ring check here).
   summary row points at each recipe). Left: the [VM] and [DEV] runs of those rows, the nightly
   fuzz campaigns, `cargo xtask dist` (this container's proxy refuses archive.torproject.org, so
   lyrebird cannot be fetched); no tag (the design tags `m2a` and `m2`; tags are the owner's).
-- Review of steps B12 and B13 (2026-10-28, `53339cd5`, `2c354e59`, `77f41a85`, `f4145423`; ledger
+- Review of steps B12 and B13 (2026-10-28, `ab775a7c`, `53961f16`, `d5b2732f`, `2336b251`; ledger
   rows "Review of steps B12 and B13"; decision M1-81's note): one major, four minor, all
   addressed. The release README in every zip, `README.md` and both plan copies said the internet
   path was off and named the Phase A switch: the README's "Direct connections" now says what an
@@ -373,8 +373,8 @@ and the crates below ring check here).
   modes, the M2 row) and the release README's limits follow. Three stale rows of the Phase A
   ledger section were corrected. No release notes file was written: the notes of the next
   pre-release are written at its dist run (`docs/RELEASING.md`) from the zipped README.
-- C2 (done 2026-10-28; `6caa2880`; ledger rows "C2: …"): the security review of the whole
-  direct-connection diff (`1a935a41..` the close; signal, net, session, platform, proto,
+- C2 (done 2026-10-28; `9edb4e07`; ledger rows "C2: …"): the security review of the whole
+  direct-connection diff (`e9ef4735..` the close; signal, net, session, platform, proto,
   core, the app, the consent copy, the router mapping), judged against design §9.1's invariants
   and the security invariants of `docs/PLAN.md` §B.6 and §B.8: no defect. One coverage gap closed: a view-only
   session bound on the direct path never decodes or injects input
@@ -395,27 +395,27 @@ and the crates below ring check here).
   are offered), the "release README" in §B.6, `README.md`'s privacy bullet (the same-list
   condition, the router), the Phase A close row's dated prefix and `netdev` in the C2 row.
 - The feature's final review (2026-10-28; ledger section "Direct connections, the final review";
-  decision M1-81's history): five minor findings, three defects, all fixed. (1) `0ac8dd03`: the
+  decision M1-81's history): five minor findings, three defects, all fixed. (1) `cc985c3c`: the
   ledger loader looped over a list's declared length, so a crafted or corrupt list in
   `<state>/router-ports/` hung the sweep's blocking thread, the exit and `doctor`; a full list
   now stops reading, and a `ledger` fuzz target ran 10 coverage-guided minutes here (12.8 M runs,
-  clean; the ASan campaign is the dev VM's). (2) `625aabdc`: every UPnP delete (a release, a
+  clean; the ASan campaign is the dev VM's). (2) `ce9fb274`: every UPnP delete (a release, a
   sweep, the removal after a cut add) first reads the router's table
   (`GetGenericPortMappingEntry`, at most 32 entries) and deletes only the entry that forwards to
   this computer's address and port as `Tornect`; a router that hides its table still gets a
   release's or a sweep's delete, never the cut add's. `FakeIgd` now keeps a table and answers
-  one request at a time. (3) `03cbfc95`: in VPN mode a peer's global address passes only when
+  one request at a time. (3) `cdc83520`: in VPN mode a peer's global address passes only when
   `NetEnv::route_source_to` toward it returns the tunnel's source (`RemoteFilter.tunnel_route`;
   `local::remote_filter` takes `Option<RouteLookup>` in place of the `vpn` flag), so a split
   tunnel's excluded prefix gets nothing. The reviewers' alternative of recording residuals was
   not taken for any of the three.
 - The closing pass (2026-10-28; ledger section "Direct connections, closing the feature"): the
-  whole workspace's gates on `f7c52ef2` and again on the final code (`cargo xtask verify`, which
+  whole workspace's gates on `af9d71df` and again on the final code (`cargo xtask verify`, which
   stops at the app's tests under root by design; `cargo test --workspace --no-fail-fast`; the
   app's tests as `tester`, 880 passed; `cargo doc` with `-D warnings`; the Windows cross-clippy of
   the whole workspace), all green. The audit against the design's acceptance items found: (1) the
   step A12 gap of the second unique-local address, which B6 never took up although the B3 entry
-  above listed it as B6's: fixed in `6b7d91e3` (one ULA offered, `local::MAX_ULA` = 1, a deviation
+  above listed it as B6's: fixed in `446af445` (one ULA offered, `local::MAX_ULA` = 1, a deviation
   from design §7.1's two; `link::tests::offered`; decision M1-78 item (2)); (2) eleven ledger rows
   still OPEN on steps that had run (statuses corrected, evidence unchanged); (3) no
   `docs/DEPENDENCIES.md` row for the fuzz manifest's `tornect-net` path dependency (added).
@@ -466,7 +466,7 @@ and the crates below ring check here).
   routers sit on fixed ports) before calling an end-order test settled.
 - A public doc that links a `pub(crate)` item fails `cargo doc -D warnings`
   (`rustdoc::private-intra-doc-links`) while clippy and the tests pass: run the doc build before
-  committing (B10 found one, fixed in `a8cfd817`).
+  committing (B10 found one, fixed in `a6b15bbc`).
 - A dual-stack `MemUdp` refuses a plain IPv4 destination (`InvalidInput`, as the OS does), forged
   sends through `spoof_as` included: give it the v4-mapped form (`direct_nat::forge`).
 - The redaction e2e's fake routers sit on `127.0.0.171` (PCP) and `127.0.0.172` (UPnP-IGD), beside
