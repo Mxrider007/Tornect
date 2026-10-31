@@ -28,7 +28,10 @@ whether Google's and Nextcloud's lack of published terms for third-party use fai
 check is the owner's call. Until both are settled:
 
 1. **The owner decides the terms question** (`docs/research/nat-traversal.md` §2.7; ledger row
-   "Step B1: the default STUN servers' operators and published terms", OPEN).
+   "Step B1: the default STUN servers' operators and published terms"). **Decided 2026-10-31:**
+   for this pre-release the owner keeps the four default servers (Cloudflare, Google, Twilio,
+   Nextcloud) and accepts that Google and Nextcloud publish no terms for third-party use; no entry
+   is replaced.
 2. **The `live_stun` run is pasted** from the dev VM (`cargo test -p tornect-net --test live_stun
    -- --ignored --nocapture`; ledger row "Step B12: the live STUN check"): four lines, each
    `srflx` or `no-nat`.
