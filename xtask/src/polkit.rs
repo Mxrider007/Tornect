@@ -6,9 +6,19 @@
 //! stages, and both refuse anything but `auth_self` in every default of every
 //! action, any action Tornect does not ask for, and any annotation.
 //!
-//! The file is read with a small XML reader of its own: a comment is dropped,
-//! an internal DTD subset, an entity or a CDATA section is refused, so a value
-//! can only be the literal text between two tags.
+//! The file is read with a small XML reader of its own. Line ends are read
+//! as XML reads them (CR LF and a lone CR are LF), and the file must then
+//! begin with the committed XML declaration and DOCTYPE byte for byte
+//! ([`PROLOG`]): a DOCTYPE's quoted literal may hold `<`, `>` and `<!--`,
+//! which this reader would take for markup, so a DOCTYPE of the file's own
+//! choosing could show it one root element while polkit's parser (expat)
+//! reads another. After the prolog only elements, text and comments may
+//! follow: a comment is dropped; a second DOCTYPE, a processing
+//! instruction, an entity or a CDATA section is refused, and so are a second
+//! root element and text outside the root. Neither text nor an attribute
+//! value can hold a `<`, so past the prolog every `<` this reader sees is
+//! one expat reads as markup, and a value is the literal text between two
+//! tags.
 
 use std::collections::BTreeSet;
 
@@ -28,6 +38,13 @@ pub(crate) const ACTIONS: [&str; 5] = [
     "org.tornect.export",
     "org.tornect.settings",
 ];
+
+/// The committed file's XML declaration and DOCTYPE, which every file read
+/// must begin with, byte for byte (the module comment says why).
+const PROLOG: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                      <!DOCTYPE policyconfig PUBLIC\n \
+                      \"-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN\"\n \
+                      \"http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd\">\n";
 
 /// The three implicit authorizations of an action's `<defaults>`.
 const DEFAULTS: [&str; 3] = ["allow_any", "allow_inactive", "allow_active"];
@@ -71,7 +88,12 @@ struct Action {
 }
 
 fn check_inner(text: &str) -> anyhow::Result<()> {
-    let text = strip_comments(text)?;
+    // XML's end-of-line handling (XML 1.0 §2.11), which expat applies too.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let body = text.strip_prefix(PROLOG).context(
+        "the file does not begin with the committed XML declaration and DOCTYPE, byte for byte",
+    )?;
+    let text = strip_comments(body)?;
     for banned in ["_keep", "policykit.imply", "<![CDATA[", "<!ENTITY"] {
         ensure!(
             !text.contains(banned),
@@ -80,6 +102,7 @@ fn check_inner(text: &str) -> anyhow::Result<()> {
     }
     let mut stack: Vec<&str> = Vec::new();
     let mut actions: Vec<Action> = Vec::new();
+    let mut roots = 0;
     // The default being read, and its text so far.
     let mut value: Option<(usize, String)> = None;
     for node in nodes(&text)? {
@@ -88,6 +111,11 @@ fn check_inner(text: &str) -> anyhow::Result<()> {
                 if let Some((_, v)) = value.as_mut() {
                     v.push_str(t);
                 }
+                ensure!(
+                    !stack.is_empty() || t.trim_matches([' ', '\t', '\n']).is_empty(),
+                    "text outside the root element: `{}`",
+                    t.trim()
+                );
             }
             Node::Open { name, attrs, empty } => {
                 ensure!(value.is_none(), "<{name}> inside a default");
@@ -98,7 +126,11 @@ fn check_inner(text: &str) -> anyhow::Result<()> {
                 );
                 let path = stack.as_slice();
                 match name {
-                    "policyconfig" => ensure!(path.is_empty(), "a nested <policyconfig>"),
+                    "policyconfig" => {
+                        ensure!(path.is_empty(), "a nested <policyconfig>");
+                        roots += 1;
+                        ensure!(roots == 1, "a second root element <policyconfig>");
+                    }
                     "action" => {
                         ensure!(
                             path == ["policyconfig"],
@@ -214,9 +246,9 @@ enum Node<'a> {
     Text(&'a str),
 }
 
-/// The elements and text of a comment-free document; the XML declaration and
-/// a DOCTYPE without an internal subset are passed over, any other `<!` or
-/// `<?` is refused.
+/// The elements and text of the comment-free document after its prolog:
+/// any `<!` (a DOCTYPE, a CDATA section, a declaration) or `<?` (a
+/// processing instruction, a second XML declaration) is refused.
 fn nodes(text: &str) -> anyhow::Result<Vec<Node<'_>>> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -227,21 +259,10 @@ fn nodes(text: &str) -> anyhow::Result<Vec<Node<'_>>> {
             .with_context(|| format!("a tag is not closed: `{}`", &rest[at..]))?;
         let inner = &rest[at + 1..at + len];
         rest = &rest[at + len + 1..];
-        if let Some(pi) = inner.strip_prefix('?') {
-            ensure!(
-                pi.starts_with("xml ") && pi.ends_with('?'),
-                "`<{inner}>`: no processing instruction belongs here"
-            );
-            continue;
-        }
-        if let Some(doctype) = inner.strip_prefix("!DOCTYPE") {
-            ensure!(
-                !doctype.contains('['),
-                "the DOCTYPE has an internal subset, which can declare entities"
-            );
-            continue;
-        }
-        ensure!(!inner.starts_with('!'), "`<{inner}>` is refused");
+        ensure!(
+            !inner.starts_with(['!', '?']),
+            "`<{inner}>` is refused: after the prolog only elements and comments belong here"
+        );
         if let Some(name) = inner.strip_prefix('/') {
             out.push(Node::Close(name.trim_end()));
             continue;
@@ -422,6 +443,106 @@ mod tests {
         let end = start + good[start..].find("</action>").unwrap() + "</action>".len();
         let without = format!("{}{}", &good[..start], &good[end..]);
         assert!(check("P", &without).is_err());
+    }
+
+    /// The review of the last fixes (minor): a DOCTYPE whose quoted literal
+    /// holds a clean `<policyconfig>` and opens a `<!--` hid the root expat
+    /// reads (`yes` everywhere) from this reader, which passed the file. The
+    /// prolog is now fixed text; the same clean root behind the committed
+    /// prolog passes, so the refusal is the prolog's.
+    #[test]
+    fn a_doctype_literal_cannot_hide_the_root_polkit_reads() {
+        let root = |value: &str, q: char| {
+            let actions: String = ACTIONS
+                .iter()
+                .map(|id| {
+                    format!(
+                        "<action id={q}{id}{q}><description>d</description><message>m</message>\
+                         <defaults><allow_any>{value}</allow_any><allow_inactive>{value}\
+                         </allow_inactive><allow_active>{value}</allow_active></defaults>\
+                         </action>\n"
+                    )
+                })
+                .collect();
+            format!("<policyconfig>\n{actions}</policyconfig>")
+        };
+        check("P", &format!("{PROLOG}{}\n", root(VALUE, '"'))).unwrap();
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        // Either quote around the literal, the other one inside it.
+        for (q, inner) in [('\'', '"'), ('"', '\'')] {
+            let crafted = format!(
+                "{xml}<!DOCTYPE policyconfig SYSTEM {q}x>{}<!--{q}>\n{}<!-- -->\n",
+                root(VALUE, inner),
+                root("yes", '"')
+            );
+            let refused = check("P", &crafted).expect_err("a DOCTYPE literal hid the root");
+            assert!(
+                format!("{refused:#}").contains("the committed XML declaration and DOCTYPE"),
+                "{refused:#}"
+            );
+        }
+        let elsewhere = committed().replacen("policyconfig.dtd\">", "policyconfig.dtd\" >", 1);
+        assert!(check("P", &elsewhere).is_err());
+
+        // Past the committed prolog, the same trick in a second DOCTYPE, and
+        // whatever else could make expat read a root this reader does not.
+        let clean = root(VALUE, '"');
+        let markup = "after the prolog only elements and comments belong here";
+        let past: Vec<(&str, String, &str)> = vec![
+            (
+                "a second DOCTYPE",
+                format!(
+                    "{PROLOG}<!DOCTYPE policyconfig SYSTEM 'x>{clean}<!--'>\n{}<!-- -->\n",
+                    root("yes", '"')
+                ),
+                markup,
+            ),
+            (
+                "a processing instruction",
+                format!("{PROLOG}<?xml-stylesheet href='a'?>\n{clean}\n"),
+                markup,
+            ),
+            (
+                "a second XML declaration",
+                format!("{PROLOG}<?xml version=\"1.0\"?>\n{clean}\n"),
+                markup,
+            ),
+            (
+                "a second root",
+                format!("{PROLOG}{clean}\n{clean}\n"),
+                "a second root element",
+            ),
+            (
+                "text before the root",
+                format!("{PROLOG}x\n{clean}\n"),
+                "text outside the root element",
+            ),
+            (
+                "text after the root",
+                format!("{PROLOG}{clean}\nx\n"),
+                "text outside the root element",
+            ),
+        ];
+        for (what, text, why) in &past {
+            let refused = format!("{:#}", check("P", text).expect_err(what));
+            assert!(
+                refused.starts_with("P is not the policy Tornect may ship")
+                    && refused.contains(why),
+                "{what}: {refused}"
+            );
+        }
+    }
+
+    /// Line ends are read as XML reads them, so a checkout that writes
+    /// CR LF passes, and a CR cannot hide anything from either reader.
+    #[test]
+    fn line_ends_are_read_as_xml_reads_them() {
+        let good = committed();
+        check("P", &good.replace('\n', "\r\n")).unwrap();
+        check("P", &good.replace('\n', "\r")).unwrap();
+        let first = "<allow_active>auth_self</allow_active>";
+        let cr = good.replacen(first, "<allow_active>auth_self\r</allow_active>", 1);
+        assert!(check("P", &cr).is_err());
     }
 
     /// What is refused is refused for its content: the warnings the file
