@@ -1041,9 +1041,10 @@ fn glibc_needed(headers: &str) -> anyhow::Result<String> {
 /// Every glibc floor a README states, in either of the forms the release
 /// README uses: "glibc X.Y or newer" and the loader's "`GLIBC_X.Y' not
 /// found", in any case and with either apostrophe. Any other "glibc"
-/// followed by a number ("glibc 2.39+", "GLIBC 2.39 or later") is refused,
-/// so a floor stated another way cannot go unchecked. White space must
-/// already be one space per run.
+/// followed by a number ("glibc 2.39+", "GLIBC 2.39 or later"), or by a
+/// version within twenty characters ("glibc >= 2.39", "glibc version
+/// 2.39"), is refused, so a floor stated another way cannot go unchecked.
+/// White space must already be one space per run.
 fn glibc_claims(text: &str) -> anyhow::Result<Vec<String>> {
     // ASCII lowercasing keeps every byte offset.
     let lower = text.to_ascii_lowercase();
@@ -1059,6 +1060,18 @@ fn glibc_claims(text: &str) -> anyhow::Result<Vec<String>> {
             .sum();
         let after = &rest[sep..];
         if !after.starts_with(|c: char| c.is_ascii_digit()) {
+            // A version a little further on ("glibc >= 2.39", "glibc version
+            // 2.39") is a floor stated another way.
+            let near = &rest[..rest.char_indices().nth(20).map_or(rest.len(), |(i, _)| i)];
+            ensure!(
+                !near
+                    .as_bytes()
+                    .windows(3)
+                    .any(|w| { w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit() }),
+                "`{}` states a glibc floor in a form dist does not read: write \"glibc X.Y or \
+                 newer\" (or the loader's \"`GLIBC_X.Y' not found\")",
+                text[at..].chars().take(24).collect::<String>()
+            );
             continue;
         }
         let number: &str = &after[..after
@@ -1967,12 +1980,26 @@ tornect v0.1.0 (/w/apps/tornect) (*)
             "glibc-2.39 or newer",
             "needs glibc **2.39** or newer",
             "glibc2.39 or newer",
+            // The review of the last fixes: words or signs before the number.
+            "glibc >= 2.39",
+            "glibc version 2.39",
+            "GLIBC (2.39 or newer)",
         ] {
             let refused = glibc_claims(text).expect_err(text).to_string();
             assert!(refused.contains("form dist does not read"), "{refused}");
         }
         let both = "x86_64 Linux with glibc 2.43 or newer (glibc 2.39+ works too)";
         assert!(check_glibc_floor("R", both, "2.43").is_err());
+        for also in ["glibc >= 2.39", "glibc version 2.39"] {
+            let both = format!("x86_64 Linux with glibc 2.43 or newer ({also} works too)");
+            assert!(check_glibc_floor("R", &both, "2.43").is_err(), "{both}");
+        }
+        // "glibc" with no version near it is no floor.
+        assert!(
+            glibc_claims("beyond glibc and the GCC runtime (Linux), 2.43")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// `objdump -p` of a Linux executable, as the build hosts print it.

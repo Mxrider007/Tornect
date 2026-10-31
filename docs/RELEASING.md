@@ -92,7 +92,8 @@ a Linux x86_64 machine, and release notes written by hand from the release's tem
      The floor comes from the executable's version-needs table (`objdump -p`, "Version
      References"), which the loader checks entry by entry: `GLIBC_ABI_DT_RELR` counts as 2.36, and
      `GLIBC_PRIVATE` or another `GLIBC_` entry that names no release stops the run. A "glibc"
-     followed by a number in any other form in those READMEs stops it too;
+     followed by a number in any other form in those READMEs stops it too, and so does one with a
+     version within twenty characters after it ("glibc >= 2.39", "glibc version 2.39");
    - strips the debug info (symbols stay);
    - writes `THIRD_PARTY_LICENSES.txt` (`xtask/src/licences.rs`), offline: every crates.io package
      of `cargo tree -p tornect --target <triple> -e normal,build` with its version, licence expression

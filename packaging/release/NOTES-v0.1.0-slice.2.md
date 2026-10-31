@@ -128,14 +128,15 @@ over the real Tor network; no second machine was used.
   dialog on Linux").
 - **Windows:** Windows 10 (20H1 or later) or 11, 64-bit (x64).
 
-**How the glibc floor was measured.** A Linux executable needs the newest symbol version it was linked against,
-and it links against the glibc of the machine that builds it. `objdump -T` on the release executable that
-`cargo xtask dist` built on the build VM (Ubuntu 26.04, glibc 2.43) in September 2026 showed libm's `acosf`,
-`acoshf`, `asinf`, `atan2f`, `coshf` and `sinhf` at `GLIBC_2.43` and the standard library's `pidfd_spawnp` and
-`pidfd_getpid` at `GLIBC_2.39`, all required (`docs/VERIFICATION.md`, row "The Linux executable runs on older
-distributions"). On 2026-10-29 a debug build of this branch, made in a container with glibc 2.39, needed at most
-`GLIBC_2.39` and took those libm functions at `GLIBC_2.2.5`: so the floor follows the build machine, and the
-owner's `dist` run on the build VM decides it. Its `BUILD-INFO.txt` says, for this release:
+**How the glibc floor was measured.** A Linux executable needs every glibc version its version-needs table names
+(`objdump -p`, "Version References"; `cargo xtask dist` reads the floor there), and it links against the glibc of
+the machine that builds it. `objdump -T` on the release executable that `cargo xtask dist` built on the build VM
+(Ubuntu 26.04, glibc 2.43) in September 2026 showed libm's `acosf`, `acoshf`, `asinf`, `atan2f`, `coshf` and `sinhf`
+at `GLIBC_2.43` and the standard library's `pidfd_spawnp` and `pidfd_getpid` at `GLIBC_2.39`, all required
+(`docs/VERIFICATION.md`, row "The Linux executable runs on older distributions"). On 2026-10-29 a debug build of
+this branch, made in a container with glibc 2.39, needed at most `GLIBC_2.39` and took those libm functions at
+`GLIBC_2.2.5`: so the floor follows the build machine, and the owner's `dist` run on the build VM decides it. Its
+`BUILD-INFO.txt` says, for this release:
 
     @@NEWEST_VERSIONS_LINUX@@
 
