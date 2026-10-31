@@ -366,13 +366,18 @@ Critical or High issue; every Medium was fixed.
 - **The final pass's security review** (2026-10-29), of the final audit's fixes and the documentation up to
   `9f321b31`: eight minor findings, fixed in `2ed94086`, `4f4f9d58`, `e3edcd15`, `36ca36db`, `6aa3fc8b` and
   `ce17dee3`.
+- **The reviews of the final pass's fixes** (2026-10-29): a security review of the documentation pass's code
+  (`86996906`, `80b39b1e`, `6c2b2606`, `7ccea43a`, `d780b1da`, `9e005a1e`) and one of the review's fixes and W4
+  (`937a971c..2371f154`): one major finding (nothing read the polkit policy the Linux zip ships) and eleven minor
+  ones, fixed in `0d965ec7` to `f0f68f84`. A review of those fixes (`6cd03d8c..a0db7122`) found four minor ones,
+  fixed in `0339372f` (the policy check reads the file's prolog as fixed text), `36e15907` (a glibc version a few
+  words after "glibc" in a README stops `dist`), `5755ae42` (the READMEs' last claims that nothing asks the router
+  or a server) and `1baefa4d` (a Windows device recipe's expected message, with a test).
 
-**Not reviewed:** every commit after `9f321b31`, the last one the final pass's security review read. They are the
-fixes of the documentation findings of 2026-10-29 (`86996906`, polkit's policy file in the Linux zip, and
-`80b39b1e`, dist's glibc check, decision M1-89; `6c2b2606`, the refusal that names the policy file; `7ccea43a`,
-three `config.toml` keys nothing read no longer written, decision M1-90; `d780b1da`, the help text and the router
-line; `9e005a1e`, comments) and their documentation (`e104375a`, `686db830`, `2444aa47`, `937a971c`); the security
-review's fixes (`2ed94086`, `4f4f9d58`, `e3edcd15`, `36ca36db`, `6aa3fc8b`, `ce17dee3`); the Windows install's
-lyrebird, W4 (`780758c3`, `af39a319`), and its documentation (`1449d822`, `2371f154`); the closing gate's fix of two
-doc comments (`9a7c7580`) and the commit that wrote this list; and the commits between it and `@@COMMIT@@` that the
-owner's release run adds.
+**Not reviewed:** the code commits no security review has read: the fixes of the last review's four findings
+(`0339372f`, the policy file's prolog; `36e15907`, dist's glibc check; `5755ae42`, the READMEs and their drift test;
+`1baefa4d`, a test of the Windows uninstall), and any code among the commits that the owner's release run adds up to
+`@@COMMIT@@`. Every other code commit after `9f321b31`, the last one the final pass's security review read, was read
+by one of the reviews above. The commits after it that change only documentation or comments need no security
+review and had none: `e104375a`, `686db830`, `2444aa47`, `937a971c`, `9a7c7580` (two doc comments), `6cd03d8c` and
+the closing gate's commit that wrote this list.
